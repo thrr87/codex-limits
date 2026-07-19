@@ -11,8 +11,8 @@ final class ForecastEngineTests: XCTestCase {
             durationMinutes: 7 * 24 * 60
         )
         let samples = [
-            UsageSample(date: now.addingTimeInterval(-86_400), remainingPercent: 60, resetsAt: reset),
-            UsageSample(date: now, remainingPercent: 20, resetsAt: reset)
+            UsageSample(observedAt: now.addingTimeInterval(-86_400), remainingPercent: 60, resetsAt: reset),
+            UsageSample(observedAt: now, remainingPercent: 20, resetsAt: reset)
         ]
 
         let result = ForecastEngine.evaluate(
@@ -40,10 +40,10 @@ final class ForecastEngineTests: XCTestCase {
             durationMinutes: 7 * 24 * 60
         )
         let samples = [
-            UsageSample(date: earlierReset.addingTimeInterval(-5 * day), remainingPercent: 100, resetsAt: earlierReset),
-            UsageSample(date: earlierReset, remainingPercent: 75, resetsAt: earlierReset),
-            UsageSample(date: now.addingTimeInterval(-day), remainingPercent: 42, resetsAt: reset),
-            UsageSample(date: now, remainingPercent: 40, resetsAt: reset)
+            UsageSample(observedAt: earlierReset.addingTimeInterval(-5 * day), remainingPercent: 100, resetsAt: earlierReset),
+            UsageSample(observedAt: earlierReset, remainingPercent: 75, resetsAt: earlierReset),
+            UsageSample(observedAt: now.addingTimeInterval(-day), remainingPercent: 42, resetsAt: reset),
+            UsageSample(observedAt: now, remainingPercent: 40, resetsAt: reset)
         ]
 
         let result = ForecastEngine.evaluate(

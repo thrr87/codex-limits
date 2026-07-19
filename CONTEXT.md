@@ -51,3 +51,15 @@ _Avoid_: Worst case, guaranteed minimum
 **Burn-down chart**:
 A chart for the current usage window with time and remaining-budget axes. It shows the observed usage curve, a straight path from 100% to the safety buffer, the current projection, the historical projection, and the current point; earlier windows inform the historical projection but are not drawn individually.
 _Avoid_: Activity chart, task history
+
+**Usage sample**:
+A timestamped observation of the main limit's remaining budget and window reset. Its observation time is recorded locally; its remaining budget and window reset come from Codex.
+_Avoid_: Token bucket, activity event
+
+**Shared usage history**:
+The combined usage samples recorded by Macs connected through the same optional sync folder. It excludes preferences, launch settings, credentials, and raw Codex responses.
+_Avoid_: Shared app state, cloud backup
+
+**Sync folder**:
+An optional user-selected folder that connects the shared usage history of Macs signed in to the same Codex account. One sync folder represents one Codex account; the app does not identify or verify that account.
+_Avoid_: Account store, settings sync
