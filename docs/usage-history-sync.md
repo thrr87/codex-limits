@@ -43,9 +43,3 @@ The account invariant is presented as:
 Folder privacy is presented as:
 
 > Choose a private folder that isn’t shared with other people.
-
-## TDD seam
-
-Critical behavior is tested through the concrete `UsageHistory` module interface, using real temporary directories instead of filesystem mocks. The interface covers loading local history, recording a usage sample, connecting or disconnecting a sync folder, merging the replica during refresh, and returning history with nonblocking sync status.
-
-Tests cover lossless legacy migration, simultaneous writes by two installations, initial merge, idempotent repeated merge, malformed files, unsupported folder versions, nondestructive disconnect, and writer-owned retention. Tests do not target private functions, call order, or JSON implementation details.

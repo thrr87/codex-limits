@@ -107,7 +107,7 @@ enum ForecastEngine {
         let historicalAverage = Double(historyTokens) / Double(historyCount)
         guard currentAverage > 0, historicalAverage > 0 else { return nil }
 
-        // ponytail: Daily token buckets are a coarse bootstrap; local percentage windows replace it.
+        // Daily token buckets are a coarse bootstrap; percentage-based windows replace them.
         let relativePace = min(max(historicalAverage / currentAverage, 0.25), 4)
         return windowRate * relativePace
     }

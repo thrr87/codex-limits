@@ -260,7 +260,7 @@ private struct BurnDownChart: View {
             }
         }
 
-        // ponytail: Daily Codex buckets seed the curve; local percentage samples replace them over time.
+        // Daily token buckets seed the curve until percentage samples cover the window.
         return deduplicated(
             [BurnPoint(date: window.startsAt, remaining: 100)] + bootstrapped + local + [current]
         )

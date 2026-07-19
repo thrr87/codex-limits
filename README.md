@@ -13,6 +13,8 @@ The menu bar shows the current remaining percentage. The popover adds the reset 
 - Records local samples to show actual usage during the current window.
 - Compares actual usage with a straight target path ending at a configurable safety buffer.
 - Projects the current pace and compares it with recent historical usage.
+- Keeps up to 90 days of usage history in versioned daily JSON files.
+- Can optionally replicate usage history through a private folder selected by the user.
 - Refreshes on launch, wake, popover open, every ten minutes, or when requested manually.
 - Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.
 
@@ -24,7 +26,9 @@ Codex Limits is local-first:
 
 - It does not copy or store Codex credentials.
 - It starts the user-managed Codex CLI and reads usage through its local app-server interface.
-- It stores usage samples only in macOS `UserDefaults` for the app.
+- It stores main-limit usage samples as versioned daily JSON files in the app's Application Support directory.
+- If history sync is enabled, it replicates only those samples to the selected folder. Preferences, credentials, and raw Codex responses remain local.
+- Synced history is readable JSON and contains observation times, remaining percentages, and reset times. Choose a private folder that is not shared with other people.
 - It has no telemetry, analytics, notifications, or direct network client.
 - The Codex CLI may contact the Codex service as part of its normal operation.
 
@@ -33,7 +37,7 @@ Do not attach raw CLI output or screenshots containing account usage to public i
 ## Requirements
 
 - macOS 14 or later
-- Xcode 15.3 or later
+- Xcode 16.4 or later
 - a signed-in, Homebrew-managed Codex CLI at either `/opt/homebrew/bin/codex` or `/usr/local/bin/codex`
 
 Codex Limits deliberately does not use a Codex binary bundled inside another application. Install and update the standalone CLI yourself.
@@ -64,22 +68,6 @@ swift test
 
 The test suite intentionally uses synthetic usage data. Do not commit exported account data or local app state as fixtures.
 
-## Signed commits on another Mac
-
-Use a different SSH key pair on each computer. Never copy a private key between machines.
-
-After adding that Mac's public key to GitHub for authentication, add the same public key as a signing key and configure this clone:
-
-```sh
-gh auth refresh -h github.com -s admin:ssh_signing_key
-gh ssh-key add ~/.ssh/id_ed25519.pub --type signing --title "Mac signing key"
-git config gpg.format ssh
-git config user.signingkey ~/.ssh/id_ed25519.pub
-git config commit.gpgsign true
-```
-
-GitHub should show locally created commits as `Verified`.
-
 ## Current limitations
 
 - No prebuilt or notarized release is provided.
@@ -89,8 +77,6 @@ GitHub should show locally created commits as `Verified`.
 ## Security
 
 Please report vulnerabilities privately. See [SECURITY.md](.github/SECURITY.md) for instructions.
-
-Commits reaching `main` must be signed. Use a separate signing key on each development machine; never copy a private key between computers.
 
 ## License
 
