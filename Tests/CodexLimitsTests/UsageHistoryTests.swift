@@ -17,7 +17,7 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         _ = await history.load()
@@ -55,12 +55,12 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         _ = await history.load()
         _ = await history.record(sample)
-        let file = try XCTUnwrap(jsonFiles(for: "macbook", in: root).first)
+        let file = try XCTUnwrap(jsonFiles(for: "writer-a", in: root).first)
         try Data("broken".utf8).write(to: file)
 
         let state = await history.synchronize()
@@ -81,12 +81,12 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         _ = await history.load()
         _ = await history.record(sample)
-        let file = try XCTUnwrap(jsonFiles(for: "macbook", in: root).first)
+        let file = try XCTUnwrap(jsonFiles(for: "writer-a", in: root).first)
         let original = try XCTUnwrap(String(data: Data(contentsOf: file), encoding: .utf8))
         let oversized = original.replacingOccurrences(
             of: "{",
@@ -97,7 +97,7 @@ final class UsageHistoryTests: XCTestCase {
 
         let reloaded = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         let state = await reloaded.load()
@@ -120,7 +120,7 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
 
@@ -145,7 +145,7 @@ final class UsageHistoryTests: XCTestCase {
         try unsupportedMarker.write(to: marker)
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
-            installationID: "macbook"
+            installationID: "writer-a"
         )
         _ = await history.load()
 
@@ -181,7 +181,7 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         _ = await history.load()
@@ -211,7 +211,7 @@ final class UsageHistoryTests: XCTestCase {
         let missing = root.appendingPathComponent("missing", isDirectory: true)
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
-            installationID: "macbook"
+            installationID: "writer-a"
         )
         _ = await history.load()
 
@@ -273,38 +273,38 @@ final class UsageHistoryTests: XCTestCase {
         let currentDate = Date(timeIntervalSince1970: 10_000_000)
         let oldDate = currentDate.addingTimeInterval(-91 * 86_400)
         let oldReset = oldDate.addingTimeInterval(7 * 86_400)
-        let macBook = UsageHistory(
+        let firstWriter = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { oldDate }
         )
-        let macStudio = UsageHistory(
+        let secondWriter = UsageHistory(
             localDirectory: root,
-            installationID: "mac-studio",
+            installationID: "writer-b",
             now: { oldDate }
         )
 
-        _ = await macBook.load()
-        _ = await macBook.record(UsageSample(
+        _ = await firstWriter.load()
+        _ = await firstWriter.record(UsageSample(
             observedAt: oldDate,
             remainingPercent: 80,
             resetsAt: oldReset
         ))
-        _ = await macStudio.record(UsageSample(
+        _ = await secondWriter.record(UsageSample(
             observedAt: oldDate,
             remainingPercent: 79,
             resetsAt: oldReset
         ))
 
-        let currentMacBook = UsageHistory(
+        let currentFirstWriter = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { currentDate }
         )
-        _ = await currentMacBook.load()
+        _ = await currentFirstWriter.load()
 
-        XCTAssertTrue(jsonFiles(for: "macbook", in: root).isEmpty)
-        XCTAssertEqual(jsonFiles(for: "mac-studio", in: root).count, 1)
+        XCTAssertTrue(jsonFiles(for: "writer-a", in: root).isEmpty)
+        XCTAssertEqual(jsonFiles(for: "writer-b", in: root).count, 1)
     }
 
     func testMalformedFileKeepsValidHistoryAndReportsWarning() async throws {
@@ -319,21 +319,21 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         _ = await history.load()
         _ = await history.record(sample)
         let writerDirectory = root
             .appendingPathComponent("installations", isDirectory: true)
-            .appendingPathComponent("macbook", isDirectory: true)
+            .appendingPathComponent("writer-a", isDirectory: true)
         try Data("broken".utf8).write(
             to: writerDirectory.appendingPathComponent("broken.json")
         )
 
         let reloaded = UsageHistory(
             localDirectory: root,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
         let state = await reloaded.load()
@@ -357,7 +357,7 @@ final class UsageHistoryTests: XCTestCase {
         )
         let history = UsageHistory(
             localDirectory: unusableDirectory,
-            installationID: "macbook",
+            installationID: "writer-a",
             now: { now }
         )
 
@@ -375,48 +375,48 @@ final class UsageHistoryTests: XCTestCase {
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let now = Date(timeIntervalSince1970: 1_900_060)
-        let macBook = UsageHistory(
-            localDirectory: root.appendingPathComponent("macbook", isDirectory: true),
-            installationID: "macbook",
+        let firstWriter = UsageHistory(
+            localDirectory: root.appendingPathComponent("writer-a", isDirectory: true),
+            installationID: "writer-a",
             now: { now }
         )
-        let macStudio = UsageHistory(
-            localDirectory: root.appendingPathComponent("mac-studio", isDirectory: true),
-            installationID: "mac-studio",
+        let secondWriter = UsageHistory(
+            localDirectory: root.appendingPathComponent("writer-b", isDirectory: true),
+            installationID: "writer-b",
             now: { now }
         )
         let reset = Date(timeIntervalSince1970: 2_000_000)
-        let macBookSample = UsageSample(
+        let firstSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
             remainingPercent: 82,
             resetsAt: reset
         )
-        let macStudioSample = UsageSample(
+        let secondSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_060),
             remainingPercent: 81,
             resetsAt: reset
         )
 
-        _ = await macBook.load()
-        _ = await macStudio.load()
-        _ = await macBook.connect(to: shared)
-        _ = await macStudio.connect(to: shared)
+        _ = await firstWriter.load()
+        _ = await secondWriter.load()
+        _ = await firstWriter.connect(to: shared)
+        _ = await secondWriter.connect(to: shared)
 
-        async let macBookWrite = macBook.record(macBookSample)
-        async let macStudioWrite = macStudio.record(macStudioSample)
-        let writeStates = await (macBookWrite, macStudioWrite)
+        async let firstWrite = firstWriter.record(firstSample)
+        async let secondWrite = secondWriter.record(secondSample)
+        let writeStates = await (firstWrite, secondWrite)
         XCTAssertNil(writeStates.0.errorMessage)
         XCTAssertNil(writeStates.1.errorMessage)
-        XCTAssertEqual(jsonFiles(for: "macbook", in: shared).count, 1)
-        XCTAssertEqual(jsonFiles(for: "mac-studio", in: shared).count, 1)
+        XCTAssertEqual(jsonFiles(for: "writer-a", in: shared).count, 1)
+        XCTAssertEqual(jsonFiles(for: "writer-b", in: shared).count, 1)
 
-        let macBookState = await macBook.synchronize()
-        let macStudioState = await macStudio.synchronize()
+        let firstState = await firstWriter.synchronize()
+        let secondState = await secondWriter.synchronize()
 
-        XCTAssertEqual(macBookState.samples, [macBookSample, macStudioSample])
-        XCTAssertEqual(macStudioState.samples, [macBookSample, macStudioSample])
-        XCTAssertNil(macBookState.errorMessage)
-        XCTAssertNil(macStudioState.errorMessage)
+        XCTAssertEqual(firstState.samples, [firstSample, secondSample])
+        XCTAssertEqual(secondState.samples, [firstSample, secondSample])
+        XCTAssertNil(firstState.errorMessage)
+        XCTAssertNil(secondState.errorMessage)
     }
 
     private func jsonFiles(for installationID: String, in root: URL) -> [URL] {
