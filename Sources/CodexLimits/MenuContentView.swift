@@ -6,6 +6,7 @@ import SwiftUI
 struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Group {
@@ -111,7 +112,14 @@ struct MenuContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 Spacer()
-                SettingsLink {
+                Button {
+                    openSettings()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        NSApp.windows.first {
+                            $0.isVisible && $0.styleMask.contains(.titled)
+                        }?.orderFrontRegardless()
+                    }
+                } label: {
                     Image(systemName: "gearshape")
                 }
                 .buttonStyle(.borderless)
@@ -227,8 +235,8 @@ private struct BurnDownChart: View {
     private var observed: [BurnPoint] {
         let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
         let local = samples
-            .filter { $0.date > window.startsAt && $0.date < fetchedAt }
-            .map { BurnPoint(date: $0.date, remaining: $0.remainingPercent) }
+            .filter { $0.observedAt > window.startsAt && $0.observedAt < fetchedAt }
+            .map { BurnPoint(date: $0.observedAt, remaining: $0.remainingPercent) }
             .sorted { $0.date < $1.date }
         let firstKnown = local.first ?? current
         let buckets = tokenHistory
@@ -492,10 +500,37 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("History sync") {
+                Text("Keep usage history in a folder available on your other Macs.")
+                    .foregroundStyle(.secondary)
+
+                if let folderName = monitor.syncFolderName {
+                    LabeledContent("Folder", value: folderName)
+                    Button("Stop Syncing") {
+                        Task { await monitor.stopHistorySync() }
+                    }
+                } else {
+                    Button("Choose Folder…", action: chooseHistoryFolder)
+                }
+
+                Text("Use this folder only on Macs signed in to the same Codex account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Choose a private folder that isn’t shared with other people.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let syncErrorMessage = monitor.syncErrorMessage {
+                    Label(syncErrorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 320)
+        .frame(width: 380)
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
@@ -511,6 +546,17 @@ struct SettingsView: View {
             launchAtLogin = SMAppService.mainApp.status == .enabled
             loginItemError = "Couldn’t update the login setting."
         }
+    }
+
+    private func chooseHistoryFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        Task { await monitor.connectHistoryFolder(directory) }
     }
 }
 

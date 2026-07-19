@@ -11,16 +11,16 @@ enum ForecastEngine {
     ) -> Forecast {
         let daysLeft = max(window.resetsAt.timeIntervalSince(now) / 86_400, 0)
         let currentSamples = samples
-            .filter { $0.resetsAt == window.resetsAt && $0.date <= now }
-            .sorted { $0.date < $1.date }
+            .filter { $0.resetsAt == window.resetsAt && $0.observedAt <= now }
+            .sorted { $0.observedAt < $1.observedAt }
         let elapsedDays = max(now.timeIntervalSince(window.startsAt) / 86_400, 1 / 24)
         let windowRate = max((100 - window.remainingPercent) / elapsedDays, 0)
         let recentRate: Double
 
         if let first = currentSamples.first,
            let last = currentSamples.last,
-           last.date > first.date {
-            let days = last.date.timeIntervalSince(first.date) / 86_400
+           last.observedAt > first.observedAt {
+            let days = last.observedAt.timeIntervalSince(first.observedAt) / 86_400
             recentRate = max((first.remainingPercent - last.remainingPercent) / days, 0)
         } else {
             recentRate = windowRate
@@ -32,11 +32,11 @@ enum ForecastEngine {
         let historicalRates = Dictionary(grouping: samples.filter { $0.resetsAt != window.resetsAt }) {
             $0.resetsAt
         }.values.compactMap { windowSamples -> Double? in
-            let ordered = windowSamples.sorted { $0.date < $1.date }
+            let ordered = windowSamples.sorted { $0.observedAt < $1.observedAt }
             guard let first = ordered.first,
                   let last = ordered.last,
-                  last.date > first.date else { return nil }
-            let days = last.date.timeIntervalSince(first.date) / 86_400
+                  last.observedAt > first.observedAt else { return nil }
+            let days = last.observedAt.timeIntervalSince(first.observedAt) / 86_400
             return max((first.remainingPercent - last.remainingPercent) / days, 0)
         }
         let historicalRate: Double
