@@ -1,0 +1,23 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode and editors
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.idea/
+.vscode/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.p8
+*.p12
+*.pem
+
+# macOS and local logs
+.DS_Store
+*.log
