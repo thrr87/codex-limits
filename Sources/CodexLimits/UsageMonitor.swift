@@ -6,11 +6,18 @@ import Foundation
 final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
 
-    @Published private(set) var snapshot: UsageSnapshot?
-    @Published private(set) var forecast: Forecast?
+    @Published private(set) var readerSnapshot = UsageIntelligenceEngine.evaluate(
+        UsageIntelligenceInput(
+            account: nil,
+            samples: [],
+            safetyBuffer: 3,
+            sourceState: .available,
+            now: .distantPast,
+            previousStatus: nil
+        )
+    )
     @Published private(set) var samples: [UsageSample] = []
     @Published private(set) var isRefreshing = false
-    @Published private(set) var errorMessage: String?
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
 
@@ -18,6 +25,8 @@ final class UsageMonitor: ObservableObject {
     private static let historyInstallationIDKey = "historyInstallationID"
     private static let historySyncBookmarkKey = "historySyncBookmark"
     private let history: UsageHistory
+    private var accountSnapshot: UsageSnapshot?
+    private var sourceState: UsageSourceState = .available
     private var previousStatus: PaceStatus?
     private var cancellables: Set<AnyCancellable> = []
     private var started = false
@@ -30,7 +39,7 @@ final class UsageMonitor: ObservableObject {
         let defaults = UserDefaults.standard
         if let data = defaults.data(forKey: Self.stateKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
-            snapshot = state.snapshot
+            accountSnapshot = state.snapshot
             samples = state.samples
             previousStatus = state.previousStatus
         }
@@ -52,16 +61,6 @@ final class UsageMonitor: ObservableObject {
         Task { [weak self] in
             await self?.start()
         }
-    }
-
-    var menuBarText: String {
-        guard let remaining = snapshot?.mainLimit.window.remainingPercent else { return "—" }
-        return "\(Int(remaining.rounded()))%"
-    }
-
-    var currentWindowSamples: [UsageSample] {
-        guard let reset = snapshot?.mainLimit.window.resetsAt else { return [] }
-        return samples.filter { $0.resetsAt == reset }.sorted { $0.observedAt < $1.observedAt }
     }
 
     func start() async {
@@ -119,14 +118,18 @@ final class UsageMonitor: ObservableObject {
             if recordedState.errorMessage == nil {
                 syncErrorMessage = exchangeErrorMessage
             }
-            snapshot = newSnapshot
-            errorMessage = nil
-            recalculate()
+            accountSnapshot = newSnapshot
+            sourceState = .available
+            recalculate(now: newSnapshot.fetchedAt)
             persist()
         } catch let error as CodexClientError {
-            errorMessage = error.localizedDescription
+            sourceState = .failed(error.localizedDescription)
+            recalculate()
+            persist()
         } catch {
-            errorMessage = "Couldn’t read Codex usage. Try refreshing again."
+            sourceState = .failed("Couldn’t read Codex usage. Try refreshing again.")
+            recalculate()
+            persist()
         }
     }
 
@@ -167,25 +170,30 @@ final class UsageMonitor: ObservableObject {
         apply(await history.disconnect())
     }
 
-    private func recalculate(safetyBuffer: Double? = nil) {
-        guard let snapshot else { return }
+    private func recalculate(
+        safetyBuffer: Double? = nil,
+        now: Date = Date()
+    ) {
         let storedBuffer = UserDefaults.standard.object(forKey: Self.safetyBufferKey) as? Double
         let buffer = safetyBuffer ?? storedBuffer ?? 3
-        let result = ForecastEngine.evaluate(
-            window: snapshot.mainLimit.window,
-            samples: samples,
-            tokenHistory: snapshot.tokenHistory,
-            safetyBuffer: buffer,
-            now: snapshot.fetchedAt,
-            previousStatus: previousStatus
+        readerSnapshot = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: accountSnapshot,
+                samples: samples,
+                safetyBuffer: buffer,
+                sourceState: sourceState,
+                now: now,
+                previousStatus: previousStatus
+            )
         )
-        forecast = result
-        previousStatus = result.status
+        if let status = readerSnapshot.guidance?.status {
+            previousStatus = status
+        }
     }
 
     private func persist() {
         let state = StoredState(
-            snapshot: snapshot,
+            snapshot: accountSnapshot,
             samples: historyUsesFiles ? [] : samples,
             previousStatus: previousStatus
         )

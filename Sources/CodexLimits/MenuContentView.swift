@@ -5,13 +5,12 @@ import SwiftUI
 
 struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
-    @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Group {
-            if let snapshot = monitor.snapshot, let forecast = monitor.forecast {
-                dashboard(snapshot: snapshot, forecast: forecast)
+            if let account = monitor.readerSnapshot.account {
+                dashboard(reader: monitor.readerSnapshot, account: account)
             } else {
                 emptyState
             }
@@ -22,14 +21,20 @@ struct MenuContentView: View {
         .environment(\.locale, Locale(identifier: "en_US"))
     }
 
-    private func dashboard(snapshot: UsageSnapshot, forecast: Forecast) -> some View {
+    private func dashboard(
+        reader: UsageReaderSnapshot,
+        account: UsageSnapshot
+    ) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                Text(snapshot.mainLimit.window.remainingPercent, format: .number.precision(.fractionLength(0)))
+                Text(account.mainLimit.window.remainingPercent, format: .number.precision(.fractionLength(0)))
                     .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Text("% remaining")
                     .foregroundStyle(.secondary)
+                Text(reader.accountSource.rawValue)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
                 Spacer()
                 Button {
                     Task { await monitor.refresh() }
@@ -47,43 +52,66 @@ struct MenuContentView: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(statusTitle(forecast.status))
+                Text(reader.guidanceTitle)
                     .font(.headline)
-                    .foregroundStyle(statusColor(forecast.status))
-                Text(statusMessage(snapshot: snapshot, forecast: forecast))
+                    .foregroundStyle(
+                        reader.guidance.map { statusColor($0.status) } ?? .secondary
+                    )
+                Text(reader.guidanceMessage)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(reader.evidenceText)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                if let interval = reader.interval {
+                    Text(interval.text)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                if let caveat = reader.guidance?.caveat {
+                    Text(caveat)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             BurnDownChart(
-                window: snapshot.mainLimit.window,
-                samples: monitor.currentWindowSamples,
-                tokenHistory: snapshot.tokenHistory,
-                fetchedAt: snapshot.fetchedAt,
-                forecast: forecast,
-                safetyBuffer: safetyBuffer
+                window: account.mainLimit.window,
+                chart: reader.chart
             )
 
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
                 GridRow {
                     Text("Reset")
                         .foregroundStyle(.secondary)
-                    Text(snapshot.mainLimit.window.resetsAt.formatted(date: .abbreviated, time: .shortened))
+                    Text(account.mainLimit.window.resetsAt.formatted(date: .abbreviated, time: .shortened))
                 }
                 GridRow {
                     Text("Suggested pace")
                         .foregroundStyle(.secondary)
-                    Text(paceText(forecast: forecast, reset: snapshot.mainLimit.window.resetsAt))
+                    Text(reader.suggestedPaceText)
+                }
+                GridRow {
+                    Text("Runway")
+                        .foregroundStyle(.secondary)
+                    Text(reader.guidance?.runway.text ?? "Not enough data")
+                }
+                if let range = reader.guidance?.remainingAtResetRange {
+                    GridRow {
+                        Text("Range")
+                            .foregroundStyle(.secondary)
+                        Text(range.text)
+                    }
                 }
             }
             .font(.callout)
 
-            if !snapshot.otherLimits.isEmpty {
+            if !account.otherLimits.isEmpty {
                 Divider()
                 Text("Other limits")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                ForEach(snapshot.otherLimits) { limit in
+                ForEach(account.otherLimits) { limit in
                     HStack {
                         Text(limit.name)
                             .lineLimit(1)
@@ -97,17 +125,10 @@ struct MenuContentView: View {
                 }
             }
 
-            if let error = monitor.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
             Divider()
             HStack {
                 TimelineView(.periodic(from: .now, by: 60)) { context in
-                    Text(updatedText(snapshot.fetchedAt, now: context.date))
+                    Text(reader.updateStatusText(at: context.date))
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -142,7 +163,10 @@ struct MenuContentView: View {
             } else {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.title2)
-                Text(monitor.errorMessage ?? "Codex usage is not available.")
+                Text(
+                    monitor.readerSnapshot.sourceMessage
+                        ?? "Codex usage is not available."
+                )
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                 Button("Try Again") {
@@ -153,14 +177,6 @@ struct MenuContentView: View {
         .frame(maxWidth: .infinity, minHeight: 150)
     }
 
-    private func statusTitle(_ status: PaceStatus) -> String {
-        switch status {
-        case .slowDown: "Slow down"
-        case .onTrack: "On track"
-        case .roomToUseMore: "Room to use more"
-        }
-    }
-
     private func statusColor(_ status: PaceStatus) -> Color {
         switch status {
         case .slowDown: .red
@@ -169,113 +185,14 @@ struct MenuContentView: View {
         }
     }
 
-    private func statusMessage(snapshot: UsageSnapshot, forecast: Forecast) -> String {
-        switch forecast.status {
-        case .slowDown:
-            let window = snapshot.mainLimit.window
-            let timeLeft = window.resetsAt.timeIntervalSince(snapshot.fetchedAt)
-            let timeToEmpty = window.remainingPercent / max(forecast.safetyPercentPerDay, 0.01) * 86_400
-            let early = max(timeLeft - timeToEmpty, 0)
-            return early > 0
-                ? "At this pace, your limit may run out \(durationText(early)) early."
-                : "Your current pace is too close to the limit."
-        case .onTrack:
-            return "You’re on track to have \(Int(forecast.expectedRemainingAtReset.rounded()))% left at reset."
-        case .roomToUseMore:
-            let room = max(forecast.expectedRemainingAtReset - safetyBuffer, 0)
-            return "You can use about \(Int(room.rounded()))% more before the reset."
-        }
-    }
-
-    private func paceText(forecast: Forecast, reset: Date) -> String {
-        if reset.timeIntervalSinceNow <= 86_400 {
-            return "Up to \(oneDecimal(forecast.recommendedPercentPerDay / 24))% an hour"
-        }
-        return "Up to \(oneDecimal(forecast.recommendedPercentPerDay))% a day"
-    }
-
-    private func oneDecimal(_ value: Double) -> String {
-        value.formatted(
-            .number
-                .precision(.fractionLength(1))
-                .locale(Locale(identifier: "en_US"))
-        )
-    }
-
-    private func durationText(_ seconds: TimeInterval) -> String {
-        if seconds >= 86_400 {
-            let days = max(Int((seconds / 86_400).rounded()), 1)
-            return "\(days) \(days == 1 ? "day" : "days")"
-        }
-        let hours = max(Int((seconds / 3_600).rounded()), 1)
-        return "\(hours) \(hours == 1 ? "hour" : "hours")"
-    }
-
-    private func updatedText(_ date: Date, now: Date) -> String {
-        let seconds = max(now.timeIntervalSince(date), 0)
-        if seconds < 60 { return "Updated just now" }
-        if seconds < 3_600 { return "Updated \(Int(seconds / 60)) min ago" }
-        if seconds < 86_400 {
-            let hours = Int(seconds / 3_600)
-            return "Updated \(hours) \(hours == 1 ? "hr" : "hrs") ago"
-        }
-        let days = Int(seconds / 86_400)
-        return "Updated \(days) \(days == 1 ? "day" : "days") ago"
-    }
 }
 
 private struct BurnDownChart: View {
     let window: UsageWindow
-    let samples: [UsageSample]
-    let tokenHistory: [TokenDay]
-    let fetchedAt: Date
-    let forecast: Forecast
-    let safetyBuffer: Double
-
-    private var observed: [BurnPoint] {
-        let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
-        let local = samples
-            .filter { $0.observedAt > window.startsAt && $0.observedAt < fetchedAt }
-            .map { BurnPoint(date: $0.observedAt, remaining: $0.remainingPercent) }
-            .sorted { $0.date < $1.date }
-        let firstKnown = local.first ?? current
-        let buckets = tokenHistory
-            .filter {
-                $0.date.addingTimeInterval(86_400) > window.startsAt && $0.date < firstKnown.date
-            }
-            .sorted { $0.date < $1.date }
-        let totalTokens = buckets.reduce(Int64(0)) { $0 + $1.tokens }
-        var bootstrapped: [BurnPoint] = []
-
-        if totalTokens > 0 {
-            var cumulativeTokens: Int64 = 0
-            for bucket in buckets {
-                cumulativeTokens += bucket.tokens
-                let date = min(
-                    max(bucket.date.addingTimeInterval(86_400), window.startsAt),
-                    firstKnown.date
-                )
-                let used = (100 - firstKnown.remaining) * Double(cumulativeTokens) / Double(totalTokens)
-                bootstrapped.append(BurnPoint(date: date, remaining: 100 - used))
-            }
-        }
-
-        // Daily token buckets seed the curve until percentage samples cover the window.
-        return deduplicated(
-            [BurnPoint(date: window.startsAt, remaining: 100)] + bootstrapped + local + [current]
-        )
-    }
+    let chart: UsageChartSnapshot
 
     private var currentColor: Color {
-        forecast.currentPercentPerDay > forecast.historicalPercentPerDay ? .red : .blue
-    }
-
-    private var currentProjection: [BurnPoint] {
-        projection(rate: forecast.currentPercentPerDay, remainingAtReset: forecast.expectedRemainingAtReset)
-    }
-
-    private var historicalProjection: [BurnPoint] {
-        projection(rate: forecast.historicalPercentPerDay, remainingAtReset: forecast.historicalRemainingAtReset)
+        chart.currentRunsFaster ? .red : .blue
     }
 
     private var xAxisDates: [Date] {
@@ -294,16 +211,18 @@ private struct BurnDownChart: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 ChartLegendItem(label: "Target", color: .green, dash: [3, 3])
-                ChartLegendItem(label: "Actual", color: .blue)
-                ChartLegendItem(label: "Current", color: currentColor, dash: [7, 3])
-                ChartLegendItem(label: "Historical", color: .secondary, dash: [2, 3])
+                ChartLegendItem(
+                    label: "Actual · \(chart.observedSource.rawValue)",
+                    color: .blue
+                )
+                if !chart.currentProjection.isEmpty {
+                    ChartLegendItem(label: "Current estimate", color: currentColor, dash: [7, 3])
+                    ChartLegendItem(label: "Past estimate", color: .secondary, dash: [2, 3])
+                }
             }
 
             Chart {
-                ForEach([
-                    BurnPoint(date: window.startsAt, remaining: 100),
-                    BurnPoint(date: window.resetsAt, remaining: safetyBuffer)
-                ]) { point in
+                ForEach(chart.target) { point in
                     LineMark(
                         x: .value("Time", point.date),
                         y: .value("Target", point.remaining),
@@ -313,7 +232,7 @@ private struct BurnDownChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
                 }
 
-                ForEach(observed) { point in
+                ForEach(chart.observed) { point in
                     LineMark(
                         x: .value("Time", point.date),
                         y: .value("Actual", point.remaining),
@@ -324,7 +243,7 @@ private struct BurnDownChart: View {
                     .interpolationMethod(.stepEnd)
                 }
 
-                ForEach(currentProjection) { point in
+                ForEach(chart.currentProjection) { point in
                     LineMark(
                         x: .value("Time", point.date),
                         y: .value("Current", point.remaining),
@@ -334,7 +253,7 @@ private struct BurnDownChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [7, 3]))
                 }
 
-                ForEach(historicalProjection) { point in
+                ForEach(chart.historicalProjection) { point in
                     LineMark(
                         x: .value("Time", point.date),
                         y: .value("Historical", point.remaining),
@@ -344,32 +263,36 @@ private struct BurnDownChart: View {
                     .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [2, 3]))
                 }
 
-                RuleMark(x: .value("Now", fetchedAt))
-                    .foregroundStyle(Color.secondary.opacity(0.35))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                if let current = chart.observed.last {
+                    RuleMark(x: .value("Now", current.date))
+                        .foregroundStyle(Color.secondary.opacity(0.35))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
 
-                PointMark(
-                    x: .value("Now", fetchedAt),
-                    y: .value("Remaining now", window.remainingPercent)
-                )
-                .foregroundStyle(currentColor)
-                .symbolSize(55)
-                .annotation(position: .top, spacing: 5) {
-                    Text("Now")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(.regularMaterial, in: Capsule())
+                    PointMark(
+                        x: .value("Now", current.date),
+                        y: .value("Remaining now", current.remaining)
+                    )
+                    .foregroundStyle(currentColor)
+                    .symbolSize(55)
+                    .annotation(position: .top, spacing: 5) {
+                        Text("Now")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.regularMaterial, in: Capsule())
+                    }
                 }
 
-                PointMark(
-                    x: .value("Reset", window.resetsAt),
-                    y: .value("Target", safetyBuffer)
-                )
-                .foregroundStyle(Color.green)
-                .symbolSize(38)
+                if let target = chart.target.last {
+                    PointMark(
+                        x: .value("Reset", target.date),
+                        y: .value("Target", target.remaining)
+                    )
+                    .foregroundStyle(Color.green)
+                    .symbolSize(38)
+                }
 
-                if let endpoint = currentProjection.last {
+                if let endpoint = chart.currentProjection.last {
                     PointMark(
                         x: .value("Current endpoint", endpoint.date),
                         y: .value("Current endpoint", endpoint.remaining)
@@ -418,40 +341,9 @@ private struct BurnDownChart: View {
             .frame(height: 190)
             .padding(.horizontal, 8)
             .accessibilityLabel("Usage forecast")
-            .accessibilityValue(
-                "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent and the historical pace leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent."
-            )
+            .accessibilityValue(chart.accessibilityValue)
         }
     }
-
-    private func projection(rate: Double, remainingAtReset: Double) -> [BurnPoint] {
-        let current = BurnPoint(date: fetchedAt, remaining: window.remainingPercent)
-        guard rate > 0 else {
-            return [current, BurnPoint(date: window.resetsAt, remaining: window.remainingPercent)]
-        }
-        let exhaustion = fetchedAt.addingTimeInterval(window.remainingPercent / rate * 86_400)
-        let endpoint = exhaustion < window.resetsAt
-            ? BurnPoint(date: exhaustion, remaining: 0)
-            : BurnPoint(date: window.resetsAt, remaining: remainingAtReset)
-        return [current, endpoint]
-    }
-
-    private func deduplicated(_ points: [BurnPoint]) -> [BurnPoint] {
-        points.sorted { $0.date < $1.date }.reduce(into: []) { result, point in
-            if result.last?.date == point.date {
-                result[result.count - 1] = point
-            } else {
-                result.append(point)
-            }
-        }
-    }
-}
-
-private struct BurnPoint: Identifiable {
-    let date: Date
-    let remaining: Double
-
-    var id: Date { date }
 }
 
 private struct ChartLegendItem: View {

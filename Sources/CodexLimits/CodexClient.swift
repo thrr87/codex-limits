@@ -13,7 +13,7 @@ enum CodexClientError: LocalizedError {
         case .invalidResponse:
             "Codex returned data this app could not read. Update Codex CLI and try again."
         case .mainLimitMissing:
-            "Codex did not return a usable limit. Make sure Codex CLI is signed in."
+            "Weekly usage unavailable"
         case .timedOut:
             "Codex took too long to respond. Try refreshing again."
         }
@@ -21,6 +21,7 @@ enum CodexClientError: LocalizedError {
 }
 
 enum CodexClient {
+    private static let weeklyWindowDurationMinutes = 10_080
     private static let executablePaths = [
         "/opt/homebrew/bin/codex",
         "/usr/local/bin/codex"
@@ -92,8 +93,8 @@ enum CodexClient {
         let snapshots = rateResult.rateLimitsByLimitId ?? ["codex": rateResult.rateLimits]
         let mainSnapshot = snapshots["codex"] ?? rateResult.rateLimits
         let mainWindows = windows(from: mainSnapshot)
-        guard let mainWindow = mainWindows.min(by: {
-            $0.remainingPercent < $1.remainingPercent
+        guard let mainWindow = mainWindows.first(where: {
+            $0.durationMinutes == weeklyWindowDurationMinutes
         }) else {
             throw CodexClientError.mainLimitMissing
         }
@@ -151,7 +152,7 @@ enum CodexClient {
     }
 
     private static func windowName(_ minutes: Int) -> String {
-        if minutes == 10_080 { return "Weekly window" }
+        if minutes == weeklyWindowDurationMinutes { return "Weekly window" }
         if minutes.isMultiple(of: 60) { return "\(minutes / 60)-hour window" }
         return "Additional window"
     }

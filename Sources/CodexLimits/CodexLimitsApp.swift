@@ -15,7 +15,7 @@ struct CodexLimitsApp: App {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "gauge.with.dots.needle.50percent")
-                Text(monitor.menuBarText)
+                Text(monitor.readerSnapshot.menuBarText)
                     .monospacedDigit()
             }
         }
