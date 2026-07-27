@@ -10,6 +10,10 @@ let package = Package(
     ],
     targets: [
         .executableTarget(name: "CodexLimits"),
-        .testTarget(name: "CodexLimitsTests", dependencies: ["CodexLimits"])
+        .testTarget(
+            name: "CodexLimitsTests",
+            dependencies: ["CodexLimits"],
+            resources: [.copy("Fixtures")]
+        )
     ]
 )
