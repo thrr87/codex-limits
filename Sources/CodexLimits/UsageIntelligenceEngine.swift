@@ -375,6 +375,7 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let localActivityHistoryFacts: [LocalActivityFact]
     let localActivityObservation: LocalActivityObservation
     let localTaskProjections: [ThreadProjection]
+    let compatibleTokenSources: Set<LocalTokenDefinitionSource>
 
     init(
         account: UsageSnapshot?,
@@ -390,7 +391,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         localActivityObservation: LocalActivityObservation = .unavailable(
             "Codex local records are unavailable"
         ),
-        localTaskProjections: [ThreadProjection] = []
+        localTaskProjections: [ThreadProjection] = [],
+        compatibleTokenSources: Set<LocalTokenDefinitionSource> = []
     ) {
         self.account = account
         self.samples = samples
@@ -405,6 +407,7 @@ struct UsageIntelligenceInput: Equatable, Sendable {
             localActivityHistoryFacts ?? localActivityFacts
         self.localActivityObservation = localActivityObservation
         self.localTaskProjections = localTaskProjections
+        self.compatibleTokenSources = compatibleTokenSources
     }
 }
 
@@ -424,6 +427,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let usagePerToken: UsagePerTokenSnapshot
     let usageReceipts: UsageReceiptSnapshot
     let activityTimeline: ActivityTimelineSnapshot
+    let activeTimeAvailability: ActiveTimeAvailabilitySnapshot
     let localTaskProjections: [ThreadProjection]
 
     var fetchedAt: Date? { account?.fetchedAt }
@@ -624,7 +628,7 @@ enum UsageIntelligenceEngine {
                 accountPartitionID: partitionID,
                 limitID: weekly.limitId,
                 currentReset: weekly.window.resetsAt,
-                compatibleTokenSources: []
+                compatibleTokenSources: input.compatibleTokenSources
             )
             usagePerToken = UsagePerTokenEngine.evaluate(
                 current: evidence.current,
@@ -638,6 +642,27 @@ enum UsageIntelligenceEngine {
                 pinnedBaselineID: nil
             )
         }
+        let activeTimeSlice = activityTimeline.slice(
+            in: activityTimeline.interval,
+            filters: .all
+        )
+        let activeTimeHistory = ActiveTimeWeekEvidenceBuilder.build(
+            currentUsage: usagePerToken.current,
+            usage: usagePerToken.history,
+            facts: input.localActivityHistoryFacts,
+            projections: input.localTaskProjections,
+            observation: input.localActivityObservation
+        )
+        let activeTimeAvailability = ActiveTimeAvailabilityEngine.evaluate(
+            currentUsage: usagePerToken.current,
+            activeTimeThisWeek: activeTimeSlice.activeTime,
+            activeTimeCoverage: activeTimeSlice.coverage,
+            activeTimeReason: activeTimeSlice.reason,
+            history: activeTimeHistory.evidence,
+            historyUnavailableReason: activeTimeHistory.unavailableReason,
+            usageRemainingPercent:
+                input.account?.mainLimit?.window.remainingPercent ?? .nan
+        )
         return UsageReaderSnapshot(
             account: input.account,
             accountSource: .account,
@@ -669,6 +694,7 @@ enum UsageIntelligenceEngine {
             usagePerToken: usagePerToken,
             usageReceipts: usageReceipts,
             activityTimeline: activityTimeline,
+            activeTimeAvailability: activeTimeAvailability,
             localTaskProjections: input.localTaskProjections
         )
     }

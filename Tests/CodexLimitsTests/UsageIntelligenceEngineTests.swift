@@ -139,6 +139,267 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    func testReaderPublishesMeasuredActiveTimeWithoutInventingAnEstimate() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let start = now.addingTimeInterval(-3_600)
+        let end = now.addingTimeInterval(-1_800)
+        let fact = timingFact(
+            id: "turn-1",
+            taskID: "task-1",
+            start: start,
+            end: end,
+            observedAt: now
+        )
+        let projection = ThreadProjection(
+            taskID: "task-1",
+            parentTaskID: nil,
+            projectLabel: "atlas",
+            rolloutFileURL: nil,
+            createdAt: start,
+            updatedAt: end,
+            source: fact.source
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: [fact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localTaskProjections: [projection]
+            )
+        )
+
+        XCTAssertEqual(
+            reader.activeTimeAvailability.activeTimeThisWeek,
+            1_800
+        )
+        XCTAssertEqual(
+            reader.activeTimeAvailability.activeTimeCoverage,
+            .partial
+        )
+        XCTAssertNil(reader.activeTimeAvailability.estimate)
+        XCTAssertEqual(
+            reader.activeTimeAvailability.reason,
+            "Current weekly evidence is unavailable"
+        )
+
+        let updated = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: [
+                    fact,
+                    timingFact(
+                        id: "turn-2",
+                        taskID: "task-1",
+                        start: now.addingTimeInterval(-1_200),
+                        end: now.addingTimeInterval(-600),
+                        observedAt: now
+                    )
+                ],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localTaskProjections: [projection]
+            )
+        )
+
+        XCTAssertEqual(
+            updated.activeTimeAvailability.activeTimeThisWeek,
+            2_400
+        )
+    }
+
+    func testReaderEstimatesActiveTimeAndNamesChangedWorkload() throws {
+        let firstStart = Date(timeIntervalSince1970: 10_000)
+        let weekDuration = 7 * 86_400.0
+        let currentStart = firstStart.addingTimeInterval(4 * weekDuration)
+        let now = currentStart.addingTimeInterval(4 * 86_400)
+        let currentReset = currentStart.addingTimeInterval(weekDuration)
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "weekly",
+                name: "Weekly",
+                window: UsageWindow(
+                    remainingPercent: 60,
+                    resetsAt: currentReset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 46_000_000,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil,
+                lifetimeTokensObservedAt: now
+            )
+        )
+        var samples: [UsageSample] = []
+        var historyFacts: [LocalActivityFact] = []
+        var projections: [ThreadProjection] = []
+        for index in 0 ..< 5 {
+            let start = firstStart.addingTimeInterval(
+                Double(index) * weekDuration
+            )
+            let isCurrent = index == 4
+            let end = isCurrent ? now : start.addingTimeInterval(weekDuration)
+            let reset = start.addingTimeInterval(weekDuration)
+            let startTokens = Int64(1_000_000 + index * 10_000_000)
+            let endTokens = isCurrent
+                ? 46_000_000
+                : startTokens + 10_000_000
+            samples += weeklySamples(
+                start: start,
+                end: end,
+                reset: reset,
+                startRemaining: 100,
+                endRemaining: isCurrent ? 60 : 20,
+                startTokens: startTokens,
+                endTokens: endTokens
+            )
+            let taskID = "task-\(index)"
+            historyFacts.append(
+                tokenFact(
+                    tokens: isCurrent ? 4_500_000 : 9_000_000,
+                    date: start.addingTimeInterval(60),
+                    eventID: "tokens-\(index)"
+                )
+            )
+            historyFacts.append(
+                timingFact(
+                    id: "turn-\(index)",
+                    taskID: taskID,
+                    start: start.addingTimeInterval(3_600),
+                    end: start.addingTimeInterval(
+                        (isCurrent ? 6 : 11) * 3_600
+                    ),
+                    observedAt: end
+                )
+            )
+            projections.append(
+                ThreadProjection(
+                    taskID: taskID,
+                    parentTaskID: nil,
+                    projectLabel: "atlas",
+                    rolloutFileURL: nil,
+                    createdAt: start,
+                    updatedAt: end,
+                    source: historyFacts.last!.source
+                )
+            )
+        }
+        let currentFacts = historyFacts.filter {
+            guard let timestamp = $0.eventTimestamp,
+                  let date = ISO8601DateFormatter().date(from: timestamp) else {
+                return false
+            }
+            return date >= currentStart
+        }
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: currentFacts,
+                localActivityHistoryFacts: historyFacts,
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localTaskProjections: projections,
+                compatibleTokenSources: [
+                    LocalTokenDefinitionSource(
+                        sourceVersion: "0.145.0",
+                        schemaVersion: "rollout-jsonl-v1"
+                    )
+                ]
+            )
+        )
+        let estimate = try XCTUnwrap(
+            reader.activeTimeAvailability.estimate
+        )
+
+        XCTAssertEqual(estimate.lowerSeconds, 7.5 * 60 * 60)
+        XCTAssertEqual(estimate.upperSeconds, 7.5 * 60 * 60)
+        XCTAssertEqual(estimate.confidence, .medium)
+        XCTAssertEqual(estimate.referenceIntervalIDs.count, 4)
+
+        let changedHistoryFacts = historyFacts.map { fact in
+            guard fact.key == .token,
+                  let timestamp = fact.eventTimestamp,
+                  let date = ISO8601DateFormatter().date(from: timestamp),
+                  date < currentStart,
+                  let tokens = fact.tokenDelta?.totalTokens,
+                  let eventID = fact.eventID else {
+                return fact
+            }
+            return tokenFact(
+                tokens: tokens,
+                date: date,
+                eventID: eventID,
+                model: "gpt-5.6-luna"
+            )
+        }
+        let changedReader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: currentFacts,
+                localActivityHistoryFacts: changedHistoryFacts,
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localTaskProjections: projections,
+                compatibleTokenSources: [
+                    LocalTokenDefinitionSource(
+                        sourceVersion: "0.145.0",
+                        schemaVersion: "rollout-jsonl-v1"
+                    )
+                ]
+            )
+        )
+
+        XCTAssertNil(changedReader.activeTimeAvailability.estimate)
+        XCTAssertEqual(
+            changedReader.activeTimeAvailability.reason,
+            "Recent workload mix is not comparable"
+        )
+    }
+
     func testReaderUsesHistoricalFactsOnlyForHistoricalWeeklyEvidence() throws {
         let now = Date(timeIntervalSince1970: 8_000_000)
         let account = makeSnapshot(
@@ -1348,6 +1609,49 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    private func timingFact(
+        id: String,
+        taskID: String,
+        start: Date,
+        end: Date,
+        observedAt: Date
+    ) -> LocalActivityFact {
+        LocalActivityFact(
+            key: .time,
+            availability: .available,
+            value: .turnTiming(
+                LocalTurnTiming(
+                    startedAt: start,
+                    completedAt: end,
+                    durationMilliseconds: Int64(
+                        end.timeIntervalSince(start) * 1_000
+                    ),
+                    timeToFirstTokenMilliseconds: nil
+                )
+            ),
+            numericDelta: nil,
+            tokenSegment: nil,
+            reason: nil,
+            eventID: id,
+            eventTimestamp: ISO8601DateFormatter().string(from: start),
+            source: LocalActivitySourceMetadata(
+                source: .rolloutJSONL,
+                sourceVersion: "0.145.0",
+                schemaVersion: "rollout-v1",
+                sourceGeneration: 0,
+                historyMode: "paginated",
+                observedAt: observedAt
+            ),
+            context: LocalActivityContext(
+                taskID: taskID,
+                turnID: id,
+                agent: nil,
+                effectiveModel: "gpt-5.6-sol",
+                reasoning: "high"
+            )
+        )
+    }
+
     private func resetDetail(
         id: String,
         expiresAt: Date
@@ -1385,6 +1689,34 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         }
     }
 
+    private func weeklySamples(
+        start: Date,
+        end: Date,
+        reset: Date,
+        startRemaining: Double,
+        endRemaining: Double,
+        startTokens: Int64,
+        endTokens: Int64
+    ) -> [UsageSample] {
+        let step: TimeInterval = 30 * 60
+        let count = Int(end.timeIntervalSince(start) / step)
+        return (0 ... count).map { index in
+            let progress = count == 0 ? 0 : Double(index) / Double(count)
+            return UsageSample(
+                observedAt: start.addingTimeInterval(Double(index) * step),
+                remainingPercent: startRemaining
+                    + (endRemaining - startRemaining) * progress,
+                resetsAt: reset,
+                lifetimeTokens: startTokens
+                    + Int64(
+                        (
+                            Double(endTokens - startTokens) * progress
+                        ).rounded()
+                    )
+            )
+        }
+    }
+
     private func modelFacts(
         model: String,
         dates: [Date]
@@ -1415,7 +1747,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
     private func tokenFact(
         tokens: Int64,
         date: Date,
-        eventID: String
+        eventID: String,
+        model: String = "gpt-5.6-sol"
     ) -> LocalActivityFact {
         LocalActivityFact(
             key: .token,
@@ -1438,7 +1771,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 taskID: eventID,
                 turnID: eventID,
                 agent: nil,
-                effectiveModel: "gpt-5.6-sol",
+                effectiveModel: model,
                 reasoning: "high"
             ),
             tokenDelta: LocalTokenUsage(

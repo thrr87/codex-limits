@@ -2738,12 +2738,36 @@ private struct FactsWorkspace: View {
             in: reader.activityTimeline.interval,
             filters: store.state.filters
         )
+        let availability = reader.activeTimeAvailability
         return VStack(alignment: .leading, spacing: 9) {
             FactRow(
-                label: "Active Time",
-                value: activeTimeValue(slice),
-                detail: "Current weekly Allowance Window"
+                label: "Active time this week",
+                value: activeTimeValue(availability),
+                detail: activeTimeInterval(availability)
             )
+            FactRow(
+                label: "Estimated active time available",
+                value: availability.estimate.map(activeTimeRange)
+                    ?? "Not enough data",
+                detail: availability.reason
+                    ?? activeTimeInterval(availability)
+            )
+            if let estimate = availability.estimate {
+                FactRow(
+                    label: "Estimate coverage",
+                    value: estimate.coverage.displayName
+                )
+                FactRow(
+                    label: "Confidence",
+                    value: estimate.confidence.displayName,
+                    detail: estimate.caveat
+                )
+                FactRow(
+                    label: "Basis",
+                    value: "Current week + "
+                        + "\(estimate.referenceIntervalIDs.count) comparable weeks"
+                )
+            }
             FactRow(
                 label: "Peak concurrency",
                 value: "\(slice.maximumConcurrency)"
@@ -2766,21 +2790,78 @@ private struct FactsWorkspace: View {
                 value: "Codex local records"
             )
             FactRow(
-                label: "Coverage",
-                value: slice.coverage.displayName,
-                detail: slice.reason
+                label: "Active Time coverage",
+                value: availability.activeTimeCoverage.displayName,
+                detail: availability.activeTimeReason
             )
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Active Time facts")
+        .accessibilityValue(activeTimeAccessibilityValue(availability))
     }
 
-    private func activeTimeValue(_ slice: ActivityTimelineSlice) -> String {
-        if slice.points.isEmpty,
-           slice.coverage == .low || slice.coverage == .unavailable {
+    private func activeTimeRange(
+        _ estimate: ActiveTimeAvailableEstimate
+    ) -> String {
+        let lower = duration(Int64(estimate.lowerSeconds.rounded(.down)))
+        let upper = duration(Int64(estimate.upperSeconds.rounded(.down)))
+        return lower == upper ? lower : "\(lower)–\(upper)"
+    }
+
+    private func activeTimeInterval(
+        _ availability: ActiveTimeAvailabilitySnapshot
+    ) -> String {
+        guard let interval = availability.observedInterval else {
+            return "Weekly interval unavailable"
+        }
+        let start = interval.start.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        let end = interval.end.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        return "Observed \(start)–\(end)"
+    }
+
+    private func activeTimeValue(
+        _ availability: ActiveTimeAvailabilitySnapshot
+    ) -> String {
+        if availability.activeTimeCoverage == .unavailable
+            || (
+                availability.activeTimeThisWeek == 0
+                    && availability.activeTimeCoverage == .low
+            ) {
             return "Not available"
         }
-        return duration(Int64(slice.activeTime.rounded(.down)))
+        return duration(
+            Int64(availability.activeTimeThisWeek.rounded(.down))
+        )
+    }
+
+    private func activeTimeAccessibilityValue(
+        _ availability: ActiveTimeAvailabilitySnapshot
+    ) -> String {
+        var parts = [
+            "Active time this week \(activeTimeValue(availability))",
+            activeTimeInterval(availability)
+        ]
+        if let estimate = availability.estimate {
+            parts.append(
+                estimate.accessibilityValue {
+                    duration(Int64($0.rounded(.down)))
+                }
+            )
+        } else {
+            parts.append(
+                "Estimated active time available, not enough data"
+            )
+            if let reason = availability.reason {
+                parts.append(reason)
+            }
+        }
+        return parts.joined(separator: ". ")
     }
 
     @ViewBuilder
@@ -3557,6 +3638,7 @@ private struct FactRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
+        .accessibilityElement(children: .combine)
     }
 }
 

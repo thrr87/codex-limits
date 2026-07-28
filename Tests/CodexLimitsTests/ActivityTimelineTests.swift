@@ -585,6 +585,10 @@ final class ActivityTimelineTests: XCTestCase {
 
         XCTAssertEqual(slice.activeTime, 200)
         XCTAssertEqual(slice.maximumConcurrency, 1)
+        XCTAssertEqual(
+            reader.activeTimeAvailability.activeTimeThisWeek,
+            200
+        )
     }
 
     private func accountSnapshot(

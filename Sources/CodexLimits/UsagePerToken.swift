@@ -241,7 +241,7 @@ enum WeeklyUsageEvidenceBuilder {
         compatibleTokenSources: Set<LocalTokenDefinitionSource>
     ) -> WeeklyUsageEvidenceSet {
         let grouped = Dictionary(grouping: samples, by: \.resetsAt)
-        let localFactIndex = LocalFactIndex(localFacts)
+        let localFactIndex = LocalActivityFactIndex(localFacts)
         let latestComparisonBreak = samples
             .lazy
             .filter(\.comparisonBreak)
@@ -273,7 +273,7 @@ enum WeeklyUsageEvidenceBuilder {
 
     private static func buildInterval(
         samples: [UsageSample],
-        localFactIndex: LocalFactIndex,
+        localFactIndex: LocalActivityFactIndex,
         localObservation: LocalActivityObservation,
         accountPartitionID: String,
         limitID: String,
@@ -473,47 +473,6 @@ enum WeeklyUsageEvidenceBuilder {
         reset: Date
     ) -> String {
         "\(limitID)|\(Int64(reset.timeIntervalSince1970.rounded()))"
-    }
-
-    private struct LocalFactIndex {
-        private struct Entry {
-            let date: Date
-            let fact: LocalActivityFact
-        }
-
-        private let entries: [Entry]
-
-        init(_ facts: [LocalActivityFact]) {
-            let parser = LocalEventTimestampParser()
-            entries = facts.compactMap { fact in
-                guard let timestamp = fact.eventTimestamp,
-                      let date = parser.date(from: timestamp) else {
-                    return nil
-                }
-                return Entry(date: date, fact: fact)
-            }
-            .sorted { $0.date < $1.date }
-        }
-
-        func facts(in interval: DateInterval) -> [LocalActivityFact] {
-            let start = lowerBound(for: interval.start)
-            let end = lowerBound(for: interval.end)
-            return entries[start ..< end].map(\.fact)
-        }
-
-        private func lowerBound(for date: Date) -> Int {
-            var lower = 0
-            var upper = entries.count
-            while lower < upper {
-                let middle = lower + (upper - lower) / 2
-                if entries[middle].date < date {
-                    lower = middle + 1
-                } else {
-                    upper = middle
-                }
-            }
-            return lower
-        }
     }
 
     private static func tokenDefinitionsAlign(
