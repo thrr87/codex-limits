@@ -3,6 +3,121 @@ import XCTest
 @testable import CodexLimits
 
 final class LocalActivityNormalizerTests: XCTestCase {
+    func testTokenComponentsUseIncrementalDeltasAndContextSample() {
+        let normalizer = LocalActivityNormalizer()
+        let first = normalizer.normalize(
+            records: [
+                record(
+                    id: "baseline",
+                    type: "event_msg",
+                    threadID: "task-root",
+                    turnID: "turn-1",
+                    tokenUsage: LocalTokenUsage(
+                        inputTokens: 1_000,
+                        cachedInputTokens: 400,
+                        cacheWriteInputTokens: 20,
+                        outputTokens: 200,
+                        reasoningOutputTokens: 80,
+                        totalTokens: 1_200
+                    ),
+                    contextTokenUsage: LocalTokenUsage(
+                        inputTokens: 600,
+                        cachedInputTokens: 250,
+                        cacheWriteInputTokens: 10,
+                        outputTokens: 100,
+                        reasoningOutputTokens: 40,
+                        totalTokens: 700
+                    ),
+                    modelContextWindow: 272_000
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_100)
+        )
+        let second = normalizer.normalize(
+            records: [
+                record(
+                    id: "delta",
+                    type: "event_msg",
+                    threadID: "task-root",
+                    tokenUsage: LocalTokenUsage(
+                        inputTokens: 1_300,
+                        cachedInputTokens: 500,
+                        cacheWriteInputTokens: 30,
+                        outputTokens: 260,
+                        reasoningOutputTokens: 100,
+                        totalTokens: 1_560
+                    ),
+                    contextTokenUsage: LocalTokenUsage(
+                        inputTokens: 800,
+                        cachedInputTokens: 300,
+                        cacheWriteInputTokens: 15,
+                        outputTokens: 140,
+                        reasoningOutputTokens: 60,
+                        totalTokens: 940
+                    )
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_200),
+            previousState: first.state
+        )
+
+        XCTAssertEqual(
+            second.facts(.token).last?.tokenDelta,
+            LocalTokenUsage(
+                inputTokens: 300,
+                cachedInputTokens: 100,
+                cacheWriteInputTokens: 10,
+                outputTokens: 60,
+                reasoningOutputTokens: 20,
+                totalTokens: 360
+            )
+        )
+        XCTAssertEqual(
+            second.facts(.context).last?.value,
+            .tokens(
+                LocalTokenUsage(
+                    inputTokens: 800,
+                    cachedInputTokens: 300,
+                    cacheWriteInputTokens: 15,
+                    outputTokens: 140,
+                    reasoningOutputTokens: 60,
+                    totalTokens: 940
+                )
+            )
+        )
+        XCTAssertEqual(
+            second.facts(.context).last?.context?.modelContextWindow,
+            272_000
+        )
+    }
+
+    func testCompactionKeepsTurnContext() {
+        let result = LocalActivityNormalizer().normalize(
+            records: [
+                record(
+                    id: "context",
+                    type: "turn_context",
+                    threadID: "task-root",
+                    turnID: "turn-1"
+                ),
+                record(
+                    id: "compaction",
+                    type: "compacted",
+                    threadID: "task-root"
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_100)
+        )
+
+        XCTAssertEqual(
+            result.facts(.compaction).last?.context?.turnID,
+            "turn-1"
+        )
+    }
+
     func testIncrementalNormalizationKeepsTaskAndTurnContext() {
         let normalizer = LocalActivityNormalizer()
         let first = normalizer.normalize(
@@ -229,6 +344,9 @@ final class LocalActivityNormalizerTests: XCTestCase {
         model: String? = nil,
         reasoning: String? = nil,
         tokens: Int64? = nil,
+        tokenUsage: LocalTokenUsage? = nil,
+        contextTokenUsage: LocalTokenUsage? = nil,
+        modelContextWindow: Int64? = nil,
         startedAt: Int64? = nil,
         completedAt: Int64? = nil,
         durationMilliseconds: Int64? = nil
@@ -248,7 +366,7 @@ final class LocalActivityNormalizerTests: XCTestCase {
             turnID: turnID,
             model: model,
             reasoning: reasoning,
-            tokenUsage: tokens.map {
+            tokenUsage: tokenUsage ?? tokens.map {
                 LocalTokenUsage(
                     inputTokens: $0,
                     cachedInputTokens: 0,
@@ -258,6 +376,8 @@ final class LocalActivityNormalizerTests: XCTestCase {
                     totalTokens: $0
                 )
             },
+            contextTokenUsage: contextTokenUsage,
+            modelContextWindow: modelContextWindow,
             startedAt: startedAt,
             completedAt: completedAt,
             durationMilliseconds: durationMilliseconds,

@@ -28,6 +28,15 @@ struct RolloutCursor: Codable, Equatable, Sendable {
     let checkpoint: RolloutCheckpoint?
 }
 
+enum LocalTokenComponent: String, Codable, CaseIterable, Sendable {
+    case input
+    case cachedInput
+    case cacheWriteInput
+    case output
+    case reasoningOutput
+    case total
+}
+
 struct LocalTokenUsage: Codable, Equatable, Sendable {
     let inputTokens: Int64
     let cachedInputTokens: Int64
@@ -35,6 +44,82 @@ struct LocalTokenUsage: Codable, Equatable, Sendable {
     let outputTokens: Int64
     let reasoningOutputTokens: Int64
     let totalTokens: Int64
+    var observedComponents: Set<LocalTokenComponent> = Set(
+        LocalTokenComponent.allCases
+    )
+
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens
+        case cachedInputTokens
+        case cacheWriteInputTokens
+        case outputTokens
+        case reasoningOutputTokens
+        case totalTokens
+        case observedComponents
+    }
+
+    init(
+        inputTokens: Int64,
+        cachedInputTokens: Int64,
+        cacheWriteInputTokens: Int64,
+        outputTokens: Int64,
+        reasoningOutputTokens: Int64,
+        totalTokens: Int64,
+        observedComponents: Set<LocalTokenComponent> = Set(
+            LocalTokenComponent.allCases
+        )
+    ) {
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.outputTokens = outputTokens
+        self.reasoningOutputTokens = reasoningOutputTokens
+        self.totalTokens = totalTokens
+        self.observedComponents = observedComponents
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        inputTokens = try values.decode(Int64.self, forKey: .inputTokens)
+        cachedInputTokens = try values.decode(
+            Int64.self,
+            forKey: .cachedInputTokens
+        )
+        cacheWriteInputTokens = try values.decode(
+            Int64.self,
+            forKey: .cacheWriteInputTokens
+        )
+        outputTokens = try values.decode(Int64.self, forKey: .outputTokens)
+        reasoningOutputTokens = try values.decode(
+            Int64.self,
+            forKey: .reasoningOutputTokens
+        )
+        totalTokens = try values.decode(Int64.self, forKey: .totalTokens)
+        observedComponents = try values.decodeIfPresent(
+            [LocalTokenComponent].self,
+            forKey: .observedComponents
+        ).map(Set.init) ?? [.total]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(inputTokens, forKey: .inputTokens)
+        try values.encode(cachedInputTokens, forKey: .cachedInputTokens)
+        try values.encode(
+            cacheWriteInputTokens,
+            forKey: .cacheWriteInputTokens
+        )
+        try values.encode(outputTokens, forKey: .outputTokens)
+        try values.encode(
+            reasoningOutputTokens,
+            forKey: .reasoningOutputTokens
+        )
+        try values.encode(totalTokens, forKey: .totalTokens)
+        try values.encode(
+            observedComponents.sorted { $0.rawValue < $1.rawValue },
+            forKey: .observedComponents
+        )
+    }
 }
 
 struct RolloutRecord: Equatable, Sendable {
@@ -53,6 +138,8 @@ struct RolloutRecord: Equatable, Sendable {
     let model: String?
     let reasoning: String?
     let tokenUsage: LocalTokenUsage?
+    let contextTokenUsage: LocalTokenUsage?
+    let modelContextWindow: Int64?
     let startedAt: Int64?
     let completedAt: Int64?
     let durationMilliseconds: Int64?
@@ -67,6 +154,7 @@ struct RolloutTailBatch: Equatable, Sendable {
     let cursor: RolloutCursor
     let bytesRead: UInt64
     let unsupportedRecordCount: Int
+    let malformedRecordCount: Int
     let requiresRebuild: Bool
 }
 
@@ -158,6 +246,7 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
                 ),
                 bytesRead: bytesRead,
                 unsupportedRecordCount: 0,
+                malformedRecordCount: 0,
                 requiresRebuild: requiresRebuild
             )
         }
@@ -168,6 +257,7 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
         var records: [RolloutRecord] = []
         var lastObservedOrdinal = continuesSource ? cursor?.lastOrdinal : nil
         var unsupportedRecordCount = 0
+        var malformedRecordCount = 0
         var processedPrefixFingerprint = startOffset == 0
             ? Self.fingerprintOffsetBasis
             : cursor?.processedPrefixFingerprint
@@ -189,6 +279,7 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
             let absoluteLineOffset = startOffset + UInt64(relativeLineOffset)
             guard let wire = try? decoder.decode(RolloutWire.self, from: Data(line)) else {
                 unsupportedRecordCount += 1
+                malformedRecordCount += 1
                 continue
             }
             let type = wire.type
@@ -212,16 +303,10 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
             let eventType = payload.type
             let turnID = payload.turnId
             let totalUsage = payload.info?.totalTokenUsage
-            let tokenUsage = totalUsage?.totalTokens.map {
-                LocalTokenUsage(
-                    inputTokens: totalUsage?.inputTokens ?? 0,
-                    cachedInputTokens: totalUsage?.cachedInputTokens ?? 0,
-                    cacheWriteInputTokens: totalUsage?.cacheWriteInputTokens ?? 0,
-                    outputTokens: totalUsage?.outputTokens ?? 0,
-                    reasoningOutputTokens: totalUsage?.reasoningOutputTokens ?? 0,
-                    totalTokens: $0
-                )
-            }
+            let tokenUsage = localTokenUsage(totalUsage)
+            let contextTokenUsage = localTokenUsage(
+                payload.info?.lastTokenUsage
+            )
             let eventKey: String
             if let ordinal {
                 eventKey = "\(threadID ?? "unknown")|ordinal|\(ordinal)"
@@ -276,6 +361,9 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
                     model: payload.model,
                     reasoning: payload.effort,
                     tokenUsage: tokenUsage,
+                    contextTokenUsage: contextTokenUsage,
+                    modelContextWindow: payload.modelContextWindow
+                        ?? payload.info?.modelContextWindow,
                     startedAt: payload.startedAt,
                     completedAt: payload.completedAt,
                     durationMilliseconds: payload.durationMs,
@@ -311,6 +399,7 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
             ),
             bytesRead: bytesRead,
             unsupportedRecordCount: unsupportedRecordCount,
+            malformedRecordCount: malformedRecordCount,
             requiresRebuild: requiresRebuild
         )
     }
@@ -428,6 +517,12 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
         components.append(payload.turnId ?? "none")
         components.append(payload.model ?? "none")
         components.append(payload.effort ?? "none")
+        components.append(
+            integerString(
+                payload.modelContextWindow
+                    ?? payload.info?.modelContextWindow
+            )
+        )
         components.append(contentsOf: [
             integerString(payload.startedAt),
             integerString(payload.completedAt),
@@ -442,8 +537,45 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
             integerString(tokenUsage?.reasoningOutputTokens),
             integerString(tokenUsage?.totalTokens)
         ])
+        let contextTokenUsage = payload.info?.lastTokenUsage
+        components.append(contentsOf: [
+            integerString(contextTokenUsage?.inputTokens),
+            integerString(contextTokenUsage?.cachedInputTokens),
+            integerString(contextTokenUsage?.cacheWriteInputTokens),
+            integerString(contextTokenUsage?.outputTokens),
+            integerString(contextTokenUsage?.reasoningOutputTokens),
+            integerString(contextTokenUsage?.totalTokens)
+        ])
         components.append(payload.item?.type ?? "none")
         return components.joined(separator: "|")
+    }
+
+    private func localTokenUsage(
+        _ usage: RolloutWire.TokenUsage?
+    ) -> LocalTokenUsage? {
+        usage?.totalTokens.map {
+            var observed: Set<LocalTokenComponent> = [.total]
+            if usage?.inputTokens != nil { observed.insert(.input) }
+            if usage?.cachedInputTokens != nil {
+                observed.insert(.cachedInput)
+            }
+            if usage?.cacheWriteInputTokens != nil {
+                observed.insert(.cacheWriteInput)
+            }
+            if usage?.outputTokens != nil { observed.insert(.output) }
+            if usage?.reasoningOutputTokens != nil {
+                observed.insert(.reasoningOutput)
+            }
+            return LocalTokenUsage(
+                inputTokens: usage?.inputTokens ?? 0,
+                cachedInputTokens: usage?.cachedInputTokens ?? 0,
+                cacheWriteInputTokens: usage?.cacheWriteInputTokens ?? 0,
+                outputTokens: usage?.outputTokens ?? 0,
+                reasoningOutputTokens: usage?.reasoningOutputTokens ?? 0,
+                totalTokens: $0,
+                observedComponents: observed
+            )
+        }
     }
 
     private func integerString(_ value: Int64?) -> String {
@@ -526,6 +658,7 @@ private struct RolloutWire: Decodable {
         let turnId: String?
         let model: String?
         let effort: String?
+        let modelContextWindow: Int64?
         let startedAt: Int64?
         let completedAt: Int64?
         let durationMs: Int64?
@@ -536,6 +669,8 @@ private struct RolloutWire: Decodable {
 
     struct TokenInfo: Decodable {
         let totalTokenUsage: TokenUsage?
+        let lastTokenUsage: TokenUsage?
+        let modelContextWindow: Int64?
     }
 
     struct TokenUsage: Decodable {

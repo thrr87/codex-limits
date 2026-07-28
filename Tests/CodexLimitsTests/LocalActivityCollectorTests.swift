@@ -350,6 +350,77 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
     }
 
+    func testRestartedCollectorKeepsCursorAfterRolloutRename() async throws {
+        let fixture = try CollectorFixture()
+        let rollout = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let interval = try fixture.interval()
+        let firstCollector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await firstCollector.selectPartition("stable-account")
+        _ = await firstCollector.refresh(interval: interval)
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let renamed = rollout.deletingLastPathComponent()
+            .appendingPathComponent("rollout-renamed-task-1.jsonl")
+        try FileManager.default.moveItem(at: rollout, to: renamed)
+
+        let restored = await restarted.refresh(interval: interval)
+
+        XCTAssertEqual(restored.bytesRead, 0)
+        XCTAssertEqual(
+            restored.facts.filter {
+                $0.key == .token
+            }.compactMap(\.numericDelta),
+            [500]
+        )
+        try fixture.append(
+            fixture.tokens(total: 800, ordinal: 3, minute: 3),
+            to: renamed
+        )
+        let updated = await restarted.refresh(interval: interval)
+        XCTAssertGreaterThan(updated.bytesRead, 0)
+        XCTAssertEqual(
+            updated.facts.filter {
+                $0.key == .token
+            }.compactMap(\.numericDelta),
+            [500, 200]
+        )
+
+        let restartedAgain = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restartedAgain.selectPartition("stable-account")
+
+        let restoredAgain = await restartedAgain.refresh(interval: interval)
+
+        XCTAssertEqual(restoredAgain.bytesRead, 0)
+        XCTAssertEqual(
+            restoredAgain.facts.filter {
+                $0.key == .token
+            }.compactMap(\.numericDelta),
+            [500, 200]
+        )
+    }
+
     func testThreadListFindsAResumedTaskFromAnOlderRolloutFolder() async throws {
         let fixture = try CollectorFixture()
         let file = try fixture.rollout(
@@ -848,7 +919,9 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
         XCTAssertEqual(receiptSlice.receipts.first?.rootTaskID, "task-1")
         XCTAssertEqual(receiptSlice.receipts.first?.tokens, 500)
-        XCTAssertEqual(migrated["version"] as? Int, 5)
+        XCTAssertEqual(migrated["version"] as? Int, 6)
+        XCTAssertNil(migrated["path"])
+        XCTAssertNotNil(migrated["pathFingerprint"])
     }
 
     func testAncestorFoundByLaterListSurvivesRestart() async throws {
@@ -902,15 +975,127 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(restored.bytesRead, 0)
     }
 
-    func testPersistedStateUsesPathsRelativeToTheTrustedRoot() async throws {
+    func testMalformedRecordLowersCoverageAndKeepsValidFacts() async throws {
         let fixture = try CollectorFixture()
         _ = try fixture.rollout(
             day: "2026/07/28",
             threadID: "task-1",
             lines: [
                 fixture.session(threadID: "task-1", ordinal: 0),
+                #"{"timestamp":"2026-07-28T10:00:30.000Z","type":"event_msg""#,
                 fixture.tokens(total: 100, ordinal: 1, minute: 1),
                 fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+
+        let first = await collector.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+        let second = await collector.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+
+        XCTAssertTrue(first.facts.contains { $0.key == .token })
+        XCTAssertEqual(
+            first.observation,
+            .gap(
+                sourceVersion: "0.145.0",
+                observedAt: interval.end,
+                reason: "Some local diagnostic records could not be read"
+            )
+        )
+        if case let .gap(_, _, reason) = second.observation {
+            XCTAssertEqual(
+                reason,
+                "Some local diagnostic records could not be read"
+            )
+        } else {
+            XCTFail("Expected persisted malformed-record Coverage gap")
+        }
+    }
+
+    func testMalformedOnlyAppendKeepsCoverageGapAcrossRefreshAndRestart() async throws {
+        let fixture = try CollectorFixture()
+        let rollout = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let interval = try fixture.interval()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        _ = await collector.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+        try fixture.append(
+            #"{"timestamp":"2026-07-28T10:03:00.000Z","type":"event_msg""#,
+            to: rollout
+        )
+
+        let malformed = await collector.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+        let idle = await collector.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(
+            interval: interval,
+            observedAt: interval.end
+        )
+
+        for collection in [malformed, idle, restored] {
+            guard case let .gap(_, _, reason) = collection.observation else {
+                XCTFail("Expected a durable malformed-record Coverage gap")
+                continue
+            }
+            XCTAssertEqual(
+                reason,
+                "Some local diagnostic records could not be read"
+            )
+        }
+    }
+
+    func testPersistedStateStoresOnlyARolloutPathFingerprint() async throws {
+        let fixture = try CollectorFixture()
+        let rollout = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2),
+                #"{"timestamp":"2026-07-28T10:03:00.000Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"CommandExecution","command":"PRIVATE_COMMAND","output":"PRIVATE_OUTPUT","status":"completed"}}}"#
             ]
         )
         let stateDirectory = fixture.root.appendingPathComponent(
@@ -937,7 +1122,13 @@ final class LocalActivityCollectorTests: XCTestCase {
             try String(contentsOf: $0, encoding: .utf8)
         }.joined()
         XCTAssertFalse(persistedText.contains(fixture.root.path))
-        XCTAssertTrue(persistedText.contains("rollout-"))
+        XCTAssertFalse(
+            persistedText.contains(rollout.lastPathComponent)
+        )
+        XCTAssertFalse(persistedText.contains("\"path\":"))
+        XCTAssertTrue(persistedText.contains("\"pathFingerprint\":"))
+        XCTAssertFalse(persistedText.contains("PRIVATE_COMMAND"))
+        XCTAssertFalse(persistedText.contains("PRIVATE_OUTPUT"))
     }
 
     func testIncrementalRefreshAppendsFactsWithoutRewritingHistory() async throws {

@@ -2308,6 +2308,9 @@ private struct FactsWorkspace: View {
                     label: "Range",
                     value: receipt.intervalText
                 )
+                UsageReceiptDiagnosticsView(
+                    diagnostics: receipt.diagnostics
+                )
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Task Tree")
@@ -2588,6 +2591,9 @@ private struct UsageReceiptTurnView: View {
                     title: "Reasoning",
                     values: turn.reasoningLevels
                 )
+                UsageReceiptDiagnosticsView(
+                    diagnostics: turn.diagnostics
+                )
                 FactRow(
                     label: "Coverage",
                     value: turn.coverage.displayName,
@@ -2608,10 +2614,266 @@ private struct UsageReceiptTurnView: View {
             .contentShape(Rectangle())
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(turn.accessibilityValue)
-            .accessibilityHint("Open to show effective model and reasoning")
+            .accessibilityHint(
+                "Open to show token, context, time, tool, and compaction facts"
+            )
         }
     }
 
+}
+
+private struct UsageReceiptDiagnosticsView: View {
+    let diagnostics: UsageReceiptDiagnostics
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 7) {
+                tokenFacts
+                Divider()
+                contextFacts
+                Divider()
+                timeFacts
+                Divider()
+                toolFacts
+                Divider()
+                compactionFacts
+                FactRow(
+                    label: "Source",
+                    value: sourceNames(diagnostics.sources) ?? "Unavailable"
+                )
+                FactRow(
+                    label: "Coverage",
+                    value: diagnostics.coverage.displayName,
+                    detail: diagnostics.reason
+                )
+            }
+            .padding(.leading, 6)
+            .padding(.top, 4)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Local diagnostics")
+        } label: {
+            HStack {
+                Label("Diagnostics", systemImage: "waveform.path.ecg")
+                Spacer()
+                Text(diagnostics.coverage.displayName)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .combine)
+            .accessibilityHint(
+                "Open to show local token, context, time, tool, and compaction facts"
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var tokenFacts: some View {
+        Text("Token activity")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+        if let tokens = diagnostics.tokens {
+            FactRow(
+                label: "Input",
+                value: tokenValue(tokens.inputTokens)
+            )
+            FactRow(
+                label: "Cached input",
+                value: tokenValue(tokens.cachedInputTokens),
+                detail: "Included in input"
+            )
+            FactRow(
+                label: "Cache write input",
+                value: tokenValue(tokens.cacheWriteInputTokens),
+                detail: "Included in input"
+            )
+            FactRow(
+                label: "Output",
+                value: tokenValue(tokens.outputTokens)
+            )
+            FactRow(
+                label: "Reasoning output",
+                value: tokenValue(tokens.reasoningOutputTokens),
+                detail: "Included in output"
+            )
+            FactRow(
+                label: "Total",
+                value: compactTokenCount(tokens.totalTokens),
+                detail: tokenTotalDetail(tokens.reconciles)
+            )
+        } else {
+            FactRow(
+                label: "Token breakdown",
+                value: "Unavailable",
+                detail: "No bounded token change was observed"
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var contextFacts: some View {
+        Text("Context")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+        if let context = diagnostics.context {
+            FactRow(
+                label: "Last sample",
+                value: context.windowTokens.map {
+                    "\(compactTokenCount(context.usedTokens)) of \(compactTokenCount($0))"
+                } ?? compactTokenCount(context.usedTokens),
+                detail: context.observedAt.formatted(
+                    date: .abbreviated,
+                    time: .shortened
+                )
+            )
+            FactRow(
+                label: "Peak",
+                value: compactTokenCount(context.peakTokens)
+            )
+            if let change = context.changeTokens {
+                FactRow(
+                    label: "Change",
+                    value: change.formatted(.number.sign(strategy: .always())),
+                    detail: "\(context.sampleCount) local samples"
+                )
+            }
+        } else {
+            FactRow(
+                label: "Last sample",
+                value: "Unavailable"
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var timeFacts: some View {
+        Text("Time")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+        FactRow(
+            label: "Elapsed",
+            value: durationText(
+                diagnostics.duration.elapsedMilliseconds
+            )
+        )
+        FactRow(
+            label: "Execution",
+            value: durationText(
+                diagnostics.duration.executionMilliseconds
+            )
+        )
+        FactRow(
+            label: "Tool activity",
+            value: durationText(
+                diagnostics.duration.toolMilliseconds
+            )
+        )
+        FactRow(
+            label: "Waiting",
+            value: durationText(
+                diagnostics.duration.waitingMilliseconds
+            )
+        )
+        FactRow(
+            label: "Polling",
+            value: durationText(
+                diagnostics.duration.pollingMilliseconds
+            )
+        )
+        if let unclassified = diagnostics.duration.unclassifiedMilliseconds {
+            FactRow(
+                label: "Not classified",
+                value: durationText(unclassified),
+                detail: "Observed Turn time not covered by the facts above"
+            )
+        }
+        if diagnostics.duration.reconciles == false {
+            Text("Recorded activity exceeds observed Turn time.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(
+                    "Time facts do not match. Recorded activity exceeds observed Turn time."
+                )
+        }
+    }
+
+    @ViewBuilder
+    private var toolFacts: some View {
+        Text("Tool activity")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+        if diagnostics.tools.isEmpty {
+            FactRow(
+                label: "Recorded tools",
+                value: "None observed",
+                detail: "Coverage may be partial"
+            )
+        } else {
+            ForEach(diagnostics.tools) { tool in
+                FactRow(
+                    label: toolName(tool.toolClass),
+                    value: "\(tool.count)"
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var compactionFacts: some View {
+        Text("Compaction")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+        if diagnostics.compactions.isEmpty {
+            FactRow(
+                label: "Events",
+                value: "None observed"
+            )
+        } else {
+            ForEach(diagnostics.compactions) { event in
+                FactRow(
+                    label: "Compaction",
+                    value: event.date.formatted(
+                        date: .abbreviated,
+                        time: .standard
+                    )
+                )
+            }
+        }
+    }
+
+    private func durationText(_ milliseconds: Int64?) -> String {
+        guard let milliseconds else { return "Unavailable" }
+        if milliseconds < 60_000 {
+            let seconds = Double(milliseconds) / 1_000
+            return seconds.formatted(
+                .number.precision(.fractionLength(seconds < 10 ? 1 : 0))
+            ) + " sec"
+        }
+        let totalSeconds = milliseconds / 1_000
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return "\(minutes) min \(seconds) sec"
+    }
+
+    private func tokenValue(_ value: Int64?) -> String {
+        value.map(compactTokenCount) ?? "Unavailable"
+    }
+
+    private func tokenTotalDetail(_ reconciles: Bool?) -> String {
+        switch reconciles {
+        case true:
+            "Input plus output"
+        case false:
+            "Input and output do not match total"
+        case nil:
+            "Input or output is unavailable"
+        }
+    }
+
+    private func toolName(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ")
+            .capitalized
+    }
 }
 
 private struct UsageReceiptBreakdownView: View {

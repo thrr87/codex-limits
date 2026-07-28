@@ -21,11 +21,15 @@ enum LocalActivityFactKey: String, Codable, CaseIterable, Equatable, Sendable {
     case turn
     case agent
     case token
+    case context
     case time
     case effectiveModel
     case reasoning
     case tool
+    case execution
+    case toolTime
     case wait
+    case poll
     case compaction
 }
 
@@ -42,6 +46,7 @@ enum LocalActivityFactValue: Codable, Equatable, Sendable {
     case tokens(LocalTokenUsage)
     case agent(LocalAgentIdentity)
     case turnTiming(LocalTurnTiming)
+    case duration(LocalActivityDuration)
 }
 
 struct LocalAgentIdentity: Codable, Equatable, Sendable {
@@ -56,12 +61,18 @@ struct LocalTurnTiming: Codable, Equatable, Sendable {
     let timeToFirstTokenMilliseconds: Int64?
 }
 
+struct LocalActivityDuration: Codable, Equatable, Sendable {
+    let startedAt: Date
+    let completedAt: Date
+}
+
 struct LocalActivityContext: Codable, Equatable, Sendable {
     let taskID: String?
     let turnID: String?
     let agent: LocalAgentIdentity?
     let effectiveModel: String?
     let reasoning: String?
+    var modelContextWindow: Int64? = nil
 }
 
 struct LocalActivityFact: Codable, Equatable, Sendable {
@@ -75,6 +86,7 @@ struct LocalActivityFact: Codable, Equatable, Sendable {
     let eventTimestamp: String?
     let source: LocalActivitySourceMetadata
     var context: LocalActivityContext? = nil
+    var tokenDelta: LocalTokenUsage? = nil
 }
 
 struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
@@ -82,6 +94,7 @@ struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
     var sourceVersion: String
     var historyMode: String?
     var lastTotalTokens: Int64?
+    var lastTokenUsage: LocalTokenUsage? = nil
     var tokenSegment: UInt64
     var context: LocalActivityContext? = nil
 }
@@ -124,6 +137,7 @@ struct LocalActivityNormalizer {
         } ?? false
         if sourceChanged {
             state.lastTotalTokens = nil
+            state.lastTokenUsage = nil
             state.tokenSegment += 1
             state.context = nil
         }
@@ -148,6 +162,7 @@ struct LocalActivityNormalizer {
         var currentAgent = state.context?.agent
         var currentModel = state.context?.effectiveModel
         var currentReasoning = state.context?.reasoning
+        var currentModelContextWindow = state.context?.modelContextWindow
 
         for record in records {
             if let taskID = record.threadID {
@@ -168,12 +183,16 @@ struct LocalActivityNormalizer {
             if let reasoning = record.reasoning {
                 currentReasoning = reasoning
             }
+            if let modelContextWindow = record.modelContextWindow {
+                currentModelContextWindow = modelContextWindow
+            }
             let context = LocalActivityContext(
                 taskID: currentTaskID,
                 turnID: currentTurnID,
                 agent: currentAgent,
                 effectiveModel: currentModel,
-                reasoning: currentReasoning
+                reasoning: currentReasoning,
+                modelContextWindow: currentModelContextWindow
             )
             state.context = context
 
@@ -287,10 +306,30 @@ struct LocalActivityNormalizer {
                         eventID: record.eventID,
                         eventTimestamp: record.timestamp,
                         source: source,
-                        context: context
+                        context: context,
+                        tokenDelta: state.lastTokenUsage.flatMap {
+                            tokenDelta(from: $0, to: tokenUsage)
+                        }
                     )
                 )
                 state.lastTotalTokens = totalTokens
+                state.lastTokenUsage = tokenUsage
+            }
+            if let contextTokenUsage = record.contextTokenUsage {
+                facts.append(
+                    LocalActivityFact(
+                        key: .context,
+                        availability: .available,
+                        value: .tokens(contextTokenUsage),
+                        numericDelta: nil,
+                        tokenSegment: nil,
+                        reason: nil,
+                        eventID: record.eventID,
+                        eventTimestamp: record.timestamp,
+                        source: source,
+                        context: context
+                    )
+                )
             }
             if record.startedAt != nil
                 || record.completedAt != nil
@@ -346,12 +385,17 @@ struct LocalActivityNormalizer {
             }
             if record.type == "compacted" {
                 facts.append(
-                    available(
-                        .compaction,
-                        .count(1),
+                    LocalActivityFact(
+                        key: .compaction,
+                        availability: .available,
+                        value: .count(1),
+                        numericDelta: nil,
+                        tokenSegment: nil,
+                        reason: nil,
                         eventID: record.eventID,
                         eventTimestamp: record.timestamp,
-                        source: source
+                        source: source,
+                        context: context
                     )
                 )
             }
@@ -364,6 +408,75 @@ struct LocalActivityNormalizer {
         )
     }
 
+    private func tokenDelta(
+        from previous: LocalTokenUsage,
+        to current: LocalTokenUsage
+    ) -> LocalTokenUsage? {
+        let observed = previous.observedComponents.intersection(
+            current.observedComponents
+        )
+        guard observed.contains(.total),
+              let total = difference(
+                  current.totalTokens,
+                  previous.totalTokens
+              ) else {
+            return nil
+        }
+        func component(
+            _ key: LocalTokenComponent,
+            _ currentValue: Int64,
+            _ previousValue: Int64
+        ) -> Int64? {
+            guard observed.contains(key) else { return 0 }
+            return difference(currentValue, previousValue)
+        }
+        guard
+            let input = component(
+                .input,
+                current.inputTokens,
+                previous.inputTokens
+            ),
+            let cached = component(
+                .cachedInput,
+                current.cachedInputTokens,
+                previous.cachedInputTokens
+            ),
+            let cacheWrite = component(
+                .cacheWriteInput,
+                current.cacheWriteInputTokens,
+                previous.cacheWriteInputTokens
+            ),
+            let output = component(
+                .output,
+                current.outputTokens,
+                previous.outputTokens
+            ),
+            let reasoning = component(
+                .reasoningOutput,
+                current.reasoningOutputTokens,
+                previous.reasoningOutputTokens
+            )
+        else {
+            return nil
+        }
+        return LocalTokenUsage(
+            inputTokens: input,
+            cachedInputTokens: cached,
+            cacheWriteInputTokens: cacheWrite,
+            outputTokens: output,
+            reasoningOutputTokens: reasoning,
+            totalTokens: total,
+            observedComponents: observed
+        )
+    }
+
+    private func difference(_ current: Int64, _ previous: Int64) -> Int64? {
+        let result = current.subtractingReportingOverflow(previous)
+        return result.overflow || result.partialValue < 0
+            ? nil
+            : result.partialValue
+    }
+
     private func unavailableFacts(
         source: LocalActivitySourceMetadata
     ) -> [LocalActivityFact] {
@@ -374,10 +487,12 @@ struct LocalActivityNormalizer {
 
     private func unavailableReason(for key: LocalActivityFactKey) -> String {
         switch key {
-        case .wait:
+        case .wait, .poll:
             "no-universal-durable-wait-pair"
-        case .tool:
+        case .tool, .toolTime:
             "durable-tool-events-are-incomplete"
+        case .execution:
+            "no-universal-durable-execution-pair"
         default:
             "not-observed"
         }

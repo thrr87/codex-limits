@@ -3,6 +3,86 @@ import XCTest
 @testable import CodexLimits
 
 final class RolloutTailSourceTests: XCTestCase {
+    func testTokenRecordKeepsContextAndTokenComponentsWithoutSourceContent() throws {
+        let fixture = try TemporaryRollout()
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","model_context_window":272000,"info":{"model_context_window":272000,"total_token_usage":{"input_tokens":1200,"cached_input_tokens":400,"cache_write_input_tokens":50,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":1500},"last_token_usage":{"input_tokens":700,"cached_input_tokens":250,"cache_write_input_tokens":25,"output_tokens":200,"reasoning_output_tokens":80,"total_tokens":900}},"message":"must not be retained","command":"must not be retained"}}"#
+                + "\n"
+        )
+
+        let batch = try IncrementalRolloutTailSource().read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let record = try XCTUnwrap(batch.records.first)
+
+        XCTAssertEqual(record.modelContextWindow, 272_000)
+        XCTAssertEqual(
+            record.tokenUsage,
+            LocalTokenUsage(
+                inputTokens: 1_200,
+                cachedInputTokens: 400,
+                cacheWriteInputTokens: 50,
+                outputTokens: 300,
+                reasoningOutputTokens: 100,
+                totalTokens: 1_500
+            )
+        )
+        XCTAssertEqual(
+            record.contextTokenUsage,
+            LocalTokenUsage(
+                inputTokens: 700,
+                cachedInputTokens: 250,
+                cacheWriteInputTokens: 25,
+                outputTokens: 200,
+                reasoningOutputTokens: 80,
+                totalTokens: 900
+            )
+        )
+        let mirrorLabels = Set(
+            Mirror(reflecting: record).children.compactMap(\.label)
+        )
+        XCTAssertFalse(mirrorLabels.contains("message"))
+        XCTAssertFalse(mirrorLabels.contains("command"))
+    }
+
+    func testMissingTokenComponentsStayUnobservedInsteadOfBecomingZeroFacts() throws {
+        let fixture = try TemporaryRollout()
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1500},"last_token_usage":{"total_tokens":500}}}}"#
+                + "\n"
+        )
+
+        let record = try XCTUnwrap(
+            IncrementalRolloutTailSource().read(
+                fileURL: fixture.url,
+                cursor: nil,
+                observedAt: Date(timeIntervalSince1970: 100)
+            ).records.first
+        )
+
+        XCTAssertEqual(record.tokenUsage?.observedComponents, [.total])
+        XCTAssertEqual(
+            record.contextTokenUsage?.observedComponents,
+            [.total]
+        )
+    }
+
+    func testLegacyPersistedTokenUsageDoesNotInventComponentPresence() throws {
+        let data = Data(
+            #"{"inputTokens":0,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":500}"#.utf8
+        )
+
+        let usage = try JSONDecoder().decode(
+            LocalTokenUsage.self,
+            from: data
+        )
+
+        XCTAssertEqual(usage.totalTokens, 500)
+        XCTAssertEqual(usage.observedComponents, [.total])
+    }
+
     func testTailKeepsCursorBeforePartialFinalLine() throws {
         let fixture = try TemporaryRollout()
         let completeLine =

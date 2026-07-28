@@ -49,18 +49,22 @@ actor LocalActivityCollector {
         var activityStart: Date?
         var activityEnd: Date?
         var discontinuityAt: Date?
+        var hasMalformedRecords: Bool
+        var storageFingerprint: String?
         var factsLoaded: Bool
         var requiresContextRebuild: Bool
     }
 
     private struct PersistedFile: Codable {
         let version: Int
-        let path: String
+        let path: String?
+        let pathFingerprint: String?
         let cursor: RolloutCursor
         let normalization: LocalActivityNormalizationState
         let activityStart: Date?
         let activityEnd: Date?
         let discontinuityAt: Date?
+        let hasMalformedRecords: Bool?
         let projection: ThreadProjection?
         let ancestorProjections: [ThreadProjection]?
     }
@@ -89,6 +93,8 @@ actor LocalActivityCollector {
     private let tail = IncrementalRolloutTailSource()
     private let normalizer = LocalActivityNormalizer()
     private var files: [String: FileState] = [:]
+    private var restoredFilesByFingerprint: [String: FileState] = [:]
+    private var restoredFingerprintByIdentity: [RolloutFileIdentity: String] = [:]
     private var projections: [String: ThreadProjection] = [:]
     private var partitionID: String?
     private var changedPaths = Set<String>()
@@ -142,6 +148,8 @@ actor LocalActivityCollector {
         persist()
         partitionID = id
         files.removeAll()
+        restoredFilesByFingerprint.removeAll()
+        restoredFingerprintByIdentity.removeAll()
         projections.removeAll()
         changedPaths.removeAll()
         pendingFactWrites.removeAll()
@@ -200,6 +208,7 @@ actor LocalActivityCollector {
         } ? "Local rollout path is unavailable" : nil)
 
         for path in candidatePaths.sorted() {
+            bindRestoredStateIfNeeded(to: path)
             let file = fileURL(path)
             loadFactsIfNeeded(for: path)
             guard FileManager.default.fileExists(atPath: file.path) else {
@@ -208,6 +217,10 @@ actor LocalActivityCollector {
             }
             do {
                 let previous = files[path]
+                if previous?.hasMalformedRecords == true {
+                    gapReason = gapReason
+                        ?? "Some local diagnostic records could not be read"
+                }
                 let requiresContextRebuild =
                     previous?.requiresContextRebuild == true
                 let batch = try tail.read(
@@ -218,6 +231,10 @@ actor LocalActivityCollector {
                     observedAt: observedAt
                 )
                 bytesRead += batch.bytesRead
+                if batch.malformedRecordCount > 0 {
+                    gapReason = gapReason
+                        ?? "Some local diagnostic records could not be read"
+                }
                 if batch.requiresRebuild, previous != nil {
                     gapReason = gapReason
                         ?? "Local task record continuity changed"
@@ -226,8 +243,13 @@ actor LocalActivityCollector {
                    !batch.requiresRebuild,
                    previous != nil,
                    !requiresContextRebuild {
+                    if batch.malformedRecordCount > 0 {
+                        files[path]?.hasMalformedRecords = true
+                    }
                     if previous?.cursor != batch.cursor {
                         files[path]?.cursor = batch.cursor
+                        changedPaths.insert(path)
+                    } else if batch.malformedRecordCount > 0 {
                         changedPaths.insert(path)
                     }
                     continue
@@ -273,6 +295,11 @@ actor LocalActivityCollector {
                     activityStart: activityBounds?.start,
                     activityEnd: activityBounds?.end,
                     discontinuityAt: discontinuityAt,
+                    hasMalformedRecords: batch.requiresRebuild
+                        ? batch.malformedRecordCount > 0
+                        : previous?.hasMalformedRecords == true
+                            || batch.malformedRecordCount > 0,
+                    storageFingerprint: previous?.storageFingerprint,
                     factsLoaded: true,
                     requiresContextRebuild: false
                 )
@@ -410,6 +437,8 @@ actor LocalActivityCollector {
         }
         stateGeneration &+= 1
         files.removeAll()
+        restoredFilesByFingerprint.removeAll()
+        restoredFingerprintByIdentity.removeAll()
         projections.removeAll()
         changedPaths.removeAll()
         pendingFactWrites.removeAll()
@@ -452,6 +481,8 @@ actor LocalActivityCollector {
         deletionMarkerInvalid = false
         stateGeneration &+= 1
         files.removeAll()
+        restoredFilesByFingerprint.removeAll()
+        restoredFingerprintByIdentity.removeAll()
         projections.removeAll()
         changedPaths.removeAll()
         pendingFactWrites.removeAll()
@@ -486,6 +517,8 @@ actor LocalActivityCollector {
         }
         stateGeneration &+= 1
         files.removeAll()
+        restoredFilesByFingerprint.removeAll()
+        restoredFingerprintByIdentity.removeAll()
         projections.removeAll()
         changedPaths.removeAll()
         pendingFactWrites.removeAll()
@@ -784,21 +817,28 @@ actor LocalActivityCollector {
             )
             for path in Array(changedPaths) {
                 guard let state = files[path] else { continue }
+                let storageFingerprint = state.storageFingerprint
+                    ?? stateFileName(for: path)
                 if let write = pendingFactWrites[path] {
                     try persistFacts(
                         write,
-                        to: factsURL(for: path, in: directory)
+                        to: factsURL(
+                            forFingerprint: storageFingerprint,
+                            in: directory
+                        )
                     )
                 }
                 let data = try JSONEncoder().encode(
                     PersistedFile(
-                        version: 5,
-                        path: path,
+                        version: 6,
+                        path: nil,
+                        pathFingerprint: storageFingerprint,
                         cursor: state.cursor,
                         normalization: state.normalization,
                         activityStart: state.activityStart,
                         activityEnd: state.activityEnd,
                         discontinuityAt: state.discontinuityAt,
+                        hasMalformedRecords: state.hasMalformedRecords,
                         projection: state.normalization.context?.taskID.flatMap {
                             projections[$0]?.withoutRolloutFileURL
                         },
@@ -815,7 +855,10 @@ actor LocalActivityCollector {
                     )
                 )
                 try data.write(
-                    to: metadataURL(for: path, in: directory),
+                    to: metadataURL(
+                        forFingerprint: storageFingerprint,
+                        in: directory
+                    ),
                     options: .atomic
                 )
                 changedPaths.remove(path)
@@ -842,18 +885,18 @@ actor LocalActivityCollector {
         restoreWarning = deletionMarkerInvalid
             ? "Saved deletion state could not be read"
             : nil
+        var legacyPaths = Set<String>()
         for entry in entries where entry.pathExtension == "json" {
             guard let data = try? Data(contentsOf: entry),
                   let file = try? JSONDecoder().decode(
                       PersistedFile.self,
                       from: data
                   ),
-                  [4, 5].contains(file.version),
-                  isSafeRelativePath(file.path) else {
+                  [4, 5, 6].contains(file.version) else {
                 restoreWarning = "Saved local activity could not be read"
                 continue
             }
-            files[file.path] = FileState(
+            let restoredState = FileState(
                 cursor: file.cursor,
                 normalization: file.normalization,
                 facts: [],
@@ -861,9 +904,31 @@ actor LocalActivityCollector {
                 activityStart: file.activityStart,
                 activityEnd: file.activityEnd,
                 discontinuityAt: file.discontinuityAt,
+                hasMalformedRecords: file.hasMalformedRecords ?? false,
+                storageFingerprint: entry.deletingPathExtension()
+                    .lastPathComponent,
                 factsLoaded: false,
                 requiresContextRebuild: file.version == 4
             )
+            if file.version == 6 {
+                let fingerprint = entry.deletingPathExtension()
+                    .lastPathComponent
+                guard file.path == nil,
+                      file.pathFingerprint == fingerprint else {
+                    restoreWarning = "Saved local activity could not be read"
+                    continue
+                }
+                restoredFilesByFingerprint[fingerprint] = restoredState
+                restoredFingerprintByIdentity[file.cursor.fileIdentity] =
+                    fingerprint
+            } else if let path = file.path,
+                      isSafeRelativePath(path) {
+                files[path] = restoredState
+                legacyPaths.insert(path)
+            } else {
+                restoreWarning = "Saved local activity could not be read"
+                continue
+            }
             if let projection = file.projection {
                 projections[projection.taskID] = projection
             }
@@ -871,8 +936,50 @@ actor LocalActivityCollector {
                 projections[projection.taskID] = projection
             }
         }
-        changedPaths.removeAll()
+        changedPaths = legacyPaths
         pendingFactWrites.removeAll()
+    }
+
+    private func bindRestoredStateIfNeeded(to path: String) {
+        guard files[path] == nil else { return }
+        let currentFingerprint = stateFileName(for: path)
+        let fingerprint: String
+        if restoredFilesByFingerprint[currentFingerprint] != nil {
+            fingerprint = currentFingerprint
+        } else if let identity = fileIdentity(fileURL(path)),
+                  let identityFingerprint =
+                      restoredFingerprintByIdentity[identity] {
+            fingerprint = identityFingerprint
+        } else {
+            return
+        }
+        guard let restored = restoredFilesByFingerprint.removeValue(
+            forKey: fingerprint
+        ) else {
+            return
+        }
+        restoredFingerprintByIdentity[restored.cursor.fileIdentity] = nil
+        files[path] = restored
+    }
+
+    private func fileIdentity(_ file: URL) -> RolloutFileIdentity? {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(
+                atPath: file.path
+            ),
+            let systemNumber = (
+                attributes[.systemNumber] as? NSNumber
+            )?.uint64Value,
+            let fileNumber = (
+                attributes[.systemFileNumber] as? NSNumber
+            )?.uint64Value
+        else {
+            return nil
+        }
+        return RolloutFileIdentity(
+            systemNumber: systemNumber,
+            fileNumber: fileNumber
+        )
     }
 
     private var stateURL: URL? {
@@ -900,13 +1007,19 @@ actor LocalActivityCollector {
             .joined()
     }
 
-    private func metadataURL(for path: String, in directory: URL) -> URL {
-        directory.appendingPathComponent(stateFileName(for: path) + ".json")
+    private func metadataURL(
+        forFingerprint fingerprint: String,
+        in directory: URL
+    ) -> URL {
+        directory.appendingPathComponent(fingerprint + ".json")
     }
 
-    private func factsURL(for path: String, in directory: URL) -> URL {
+    private func factsURL(
+        forFingerprint fingerprint: String,
+        in directory: URL
+    ) -> URL {
         directory.appendingPathComponent(
-            stateFileName(for: path) + ".facts.jsonl"
+            fingerprint + ".facts.jsonl"
         )
     }
 
@@ -978,7 +1091,11 @@ actor LocalActivityCollector {
             return
         }
         guard let restoredFacts = restoreFacts(
-            from: factsURL(for: path, in: directory)
+            from: factsURL(
+                forFingerprint: state.storageFingerprint
+                    ?? stateFileName(for: path),
+                in: directory
+            )
         ) else {
             files[path] = nil
             return
