@@ -2452,6 +2452,16 @@ private func compactTokenCount(_ value: Int64) -> String {
     )
 }
 
+func usageReceiptTokenTotalDetail(_ reconciles: Bool?) -> String {
+    if reconciles == true {
+        return "Input plus output"
+    }
+    if reconciles == false {
+        return "Input and output do not match total"
+    }
+    return "Input or output is unavailable"
+}
+
 private func steppedPoint<Point: Equatable>(
     in points: [Point],
     from selected: Point?,
@@ -2699,7 +2709,7 @@ private struct UsageReceiptDiagnosticsView: View {
             FactRow(
                 label: "Total",
                 value: compactTokenCount(tokens.totalTokens),
-                detail: tokenTotalDetail(tokens.reconciles)
+                detail: usageReceiptTokenTotalDetail(tokens.reconciles)
             )
         } else {
             FactRow(
@@ -2857,17 +2867,6 @@ private struct UsageReceiptDiagnosticsView: View {
 
     private func tokenValue(_ value: Int64?) -> String {
         value.map(compactTokenCount) ?? "Unavailable"
-    }
-
-    private func tokenTotalDetail(_ reconciles: Bool?) -> String {
-        switch reconciles {
-        case true:
-            "Input plus output"
-        case false:
-            "Input and output do not match total"
-        case nil:
-            "Input or output is unavailable"
-        }
     }
 
     private func toolName(_ value: String) -> String {

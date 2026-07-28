@@ -5,6 +5,21 @@ import XCTest
 
 @MainActor
 final class AnalyticsWorkspaceTests: XCTestCase {
+    func testUsageReceiptTokenTotalCopyCoversEveryOptionalBooleanState() {
+        XCTAssertEqual(
+            usageReceiptTokenTotalDetail(true),
+            "Input plus output"
+        )
+        XCTAssertEqual(
+            usageReceiptTokenTotalDetail(false),
+            "Input and output do not match total"
+        )
+        XCTAssertEqual(
+            usageReceiptTokenTotalDetail(nil),
+            "Input or output is unavailable"
+        )
+    }
+
     func testExplorationStatePersistsAcrossStores() {
         let suiteName = "AnalyticsWorkspaceTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
