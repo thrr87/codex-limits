@@ -430,10 +430,7 @@ private struct GraphsWorkspace: View {
                     message: "Usage per token is not available for this range."
                 )
             case .concurrency:
-                UnavailableGraph(
-                    title: "Concurrency",
-                    message: "Concurrency is not available for this range."
-                )
+                ConcurrencyWorkspace(reader: reader, store: store)
             }
         }
     }
@@ -558,6 +555,358 @@ private struct GraphsWorkspace: View {
                 message: "Try refreshing to check again."
             )
         }
+    }
+}
+
+private struct ConcurrencyWorkspace: View {
+    let reader: UsageReaderSnapshot
+    @ObservedObject var store: AnalyticsWorkspaceStore
+
+    @State private var selectedPoint: ConcurrencyPoint?
+
+    private var bounds: DateInterval {
+        reader.activityTimeline.interval
+    }
+
+    private var visibleRange: DateInterval {
+        store.effectiveRange(
+            within: bounds,
+            endingAt: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
+        )
+    }
+
+    private var slice: ActivityTimelineSlice {
+        reader.activityTimeline.slice(
+            in: visibleRange,
+            filters: store.state.filters
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Concurrency")
+                    .font(.title3.weight(.semibold))
+                Text("Active Task Trees over time")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    ChartLegendItem(
+                        label: "Active Task Trees · Codex local records",
+                        color: .purple
+                    )
+                    Spacer()
+                    intervalLabel
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    ChartLegendItem(
+                        label: "Active Task Trees · Codex local records",
+                        color: .purple
+                    )
+                    intervalLabel
+                }
+            }
+
+            if slice.points.isEmpty {
+                WorkspaceMessage(
+                    icon: "chart.xyaxis.line",
+                    title: "No Concurrency data",
+                    message: slice.reason
+                        ?? "No completed Active Turns were observed."
+                ) {
+                    EmptyView()
+                }
+                .frame(minHeight: 190)
+            } else {
+                chart
+                selectedPointDetail
+                zoomControls
+            }
+
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+                GridRow {
+                    Text("Active Time")
+                        .foregroundStyle(.secondary)
+                    Text(duration(slice.activeTime))
+                }
+                GridRow {
+                    Text("Peak concurrency")
+                        .foregroundStyle(.secondary)
+                    Text("\(slice.maximumConcurrency)")
+                        .monospacedDigit()
+                }
+                GridRow {
+                    Text("Coverage")
+                        .foregroundStyle(.secondary)
+                    Text(slice.coverage.displayName)
+                }
+            }
+            .font(.callout)
+
+            if let reason = slice.reason {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .onChange(of: visibleRange) { _, range in
+            if let selectedPoint, !range.contains(selectedPoint.date) {
+                self.selectedPoint = nil
+            }
+        }
+        .onChange(of: store.state.filters) { _, _ in
+            selectedPoint = nil
+        }
+    }
+
+    private var intervalLabel: some View {
+        Text(
+            "\(visibleRange.start.formatted(date: .abbreviated, time: .shortened))–\(visibleRange.end.formatted(date: .abbreviated, time: .shortened))"
+        )
+        .font(.caption)
+        .foregroundStyle(.tertiary)
+    }
+
+    private var chart: some View {
+        Chart {
+            ForEach(slice.points) { point in
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value("Active Task Trees", point.count)
+                )
+                .foregroundStyle(Color.purple)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                .interpolationMethod(.stepEnd)
+            }
+            if let selectedPoint {
+                RuleMark(x: .value("Selected time", selectedPoint.date))
+                    .foregroundStyle(Color.primary.opacity(0.45))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                PointMark(
+                    x: .value("Selected time", selectedPoint.date),
+                    y: .value("Active Task Trees", selectedPoint.count)
+                )
+                .foregroundStyle(Color.purple)
+                .symbolSize(52)
+            }
+        }
+        .chartXScale(domain: visibleRange.start ... visibleRange.end)
+        .chartYScale(domain: 0 ... max(1, slice.maximumConcurrency))
+        .chartYAxis {
+            AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) {
+                value in
+                AxisGridLine()
+                    .foregroundStyle(Color.secondary.opacity(0.16))
+                AxisValueLabel {
+                    if let count = value.as(Int.self) {
+                        Text("\(count)")
+                    }
+                }
+            }
+        }
+        .chartLegend(.hidden)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case let .active(location):
+                            selectNearestPoint(
+                                at: location,
+                                proxy: proxy,
+                                geometry: geometry
+                            )
+                        case .ended:
+                            selectedPoint = nil
+                        }
+                    }
+            }
+        }
+        .frame(height: 260)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Concurrency")
+        .accessibilityValue(accessibilityValue)
+        .accessibilityHint(
+            "Use Previous point and Next point for exact values."
+        )
+    }
+
+    private var accessibilityValue: String {
+        if let selectedPoint {
+            return pointSummary(selectedPoint)
+        }
+        let trees = slice.maximumConcurrency == 1
+            ? "Active Task Tree"
+            : "Active Task Trees"
+        return "\(duration(slice.activeTime)) Active Time, peak \(slice.maximumConcurrency) \(trees), \(slice.coverage.displayName) coverage"
+    }
+
+    private var selectedPointDetail: some View {
+        HStack(spacing: 10) {
+            if let selectedPoint {
+                let taskTrees = taskTreeLabels(selectedPoint)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(
+                            "\(selectedPoint.count) \(selectedPoint.count == 1 ? "Active Task Tree" : "Active Task Trees")"
+                        )
+                        .fontWeight(.semibold)
+                        Text(
+                            selectedPoint.date.formatted(
+                                date: .abbreviated,
+                                time: .shortened
+                            )
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                    Text(
+                        taskTrees.isEmpty
+                            ? "No Active Task Trees"
+                            : taskTrees.joined(separator: " · ")
+                    )
+                        .foregroundStyle(.secondary)
+                    Text(
+                        "Codex local records · \(slice.coverage.displayName) coverage"
+                    )
+                    .foregroundStyle(.tertiary)
+                }
+            } else {
+                Text("Choose a point for exact details.")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                moveSelection(by: -1)
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .accessibilityLabel("Previous point")
+            Button {
+                moveSelection(by: 1)
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .accessibilityLabel("Next point")
+        }
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            .quaternary.opacity(0.7),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
+
+    private var zoomControls: some View {
+        HStack(spacing: 10) {
+            Button {
+                zoom(by: 1.5)
+            } label: {
+                Label("Zoom in", systemImage: "plus.magnifyingglass")
+            }
+            .help("Show a shorter range")
+
+            Button {
+                zoom(by: 1 / 1.5)
+            } label: {
+                Label("Zoom out", systemImage: "minus.magnifyingglass")
+            }
+            .help("Show a longer range")
+
+            if store.state.timeRange == .selected {
+                Button("Reset range") {
+                    store.resetVisibleRange()
+                }
+            }
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+    }
+
+    private func taskTreeLabels(_ point: ConcurrencyPoint) -> [String] {
+        let projects = Dictionary(
+            reader.localTaskProjections.map {
+                ($0.taskID, $0.projectLabel)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        return point.taskTreeIDs.map { taskID in
+            let task = "Task \(taskID.prefix(8))"
+            return projects[taskID].flatMap { $0 }.map {
+                "\($0) · \(task)"
+            } ?? task
+        }
+    }
+
+    private func pointSummary(_ point: ConcurrencyPoint) -> String {
+        let trees = taskTreeLabels(point).joined(separator: ", ")
+        let countLabel = point.count == 1
+            ? "Active Task Tree"
+            : "Active Task Trees"
+        let treeDetail = trees.isEmpty ? "No Active Task Trees" : trees
+        return "\(point.count) \(countLabel) at \(point.date.formatted(date: .abbreviated, time: .shortened)). \(treeDetail). Codex local records. \(slice.coverage.displayName) coverage."
+    }
+
+    private func moveSelection(by offset: Int) {
+        selectedPoint = steppedPoint(
+            in: slice.points,
+            from: selectedPoint,
+            by: offset
+        )
+    }
+
+    private func selectNearestPoint(
+        at location: CGPoint,
+        proxy: ChartProxy,
+        geometry: GeometryProxy
+    ) {
+        guard let plotFrame = proxy.plotFrame else { return }
+        let frame = geometry[plotFrame]
+        guard frame.contains(location),
+              let date = proxy.value(
+                  atX: location.x - frame.origin.x,
+                  as: Date.self
+              ) else {
+            return
+        }
+        selectedPoint = nearestPoint(
+            in: slice.points,
+            to: date,
+            date: \.date
+        )
+    }
+
+    private func zoom(by factor: CGFloat) {
+        let anchor = selectedPoint?.date ?? Date(
+            timeIntervalSince1970:
+                (visibleRange.start.timeIntervalSince1970
+                    + visibleRange.end.timeIntervalSince1970) / 2
+        )
+        store.zoom(
+            factor: Double(factor),
+            anchor: anchor,
+            currentRange: visibleRange,
+            within: bounds
+        )
+    }
+
+    private func duration(_ seconds: TimeInterval) -> String {
+        Duration.seconds(seconds).formatted(
+            .units(
+                allowed: [.hours, .minutes, .seconds],
+                width: .abbreviated,
+                maximumUnitCount: 2,
+                zeroValueUnits: .hide
+            )
+        )
     }
 }
 
@@ -924,18 +1273,11 @@ private struct TokenActivityWorkspace: View {
     }
 
     private func moveSelection(by offset: Int) {
-        let points = localSlice.points
-        guard !points.isEmpty else {
-            selectedPoint = nil
-            return
-        }
-        guard let selectedPoint,
-              let index = points.firstIndex(of: selectedPoint) else {
-            self.selectedPoint = offset < 0 ? points.last : points.first
-            return
-        }
-        let next = min(max(index + offset, 0), points.count - 1)
-        self.selectedPoint = points[next]
+        selectedPoint = steppedPoint(
+            in: localSlice.points,
+            from: selectedPoint,
+            by: offset
+        )
     }
 
     private func readerFacingLocalReason(_ reason: String) -> String {
@@ -981,10 +1323,11 @@ private struct TokenActivityWorkspace: View {
               ) else {
             return
         }
-        selectedPoint = localSlice.points.min {
-            abs($0.date.timeIntervalSince(date))
-                < abs($1.date.timeIntervalSince(date))
-        }
+        selectedPoint = nearestPoint(
+            in: localSlice.points,
+            to: date,
+            date: \.date
+        )
     }
 
     private func coverageName(_ coverage: CoverageLevel) -> String {
@@ -1818,10 +2161,64 @@ private struct FactsWorkspace: View {
                 }
             }
 
+            WorkspaceCard(title: "Active Time") {
+                activeTimeContent
+            }
+
             WorkspaceCard(title: "Usage Receipts") {
                 receiptContent
             }
         }
+    }
+
+    private var activeTimeContent: some View {
+        let slice = reader.activityTimeline.slice(
+            in: reader.activityTimeline.interval,
+            filters: store.state.filters
+        )
+        return VStack(alignment: .leading, spacing: 9) {
+            FactRow(
+                label: "Active Time",
+                value: activeTimeValue(slice),
+                detail: "Current weekly Allowance Window"
+            )
+            FactRow(
+                label: "Peak concurrency",
+                value: "\(slice.maximumConcurrency)"
+            )
+            FactRow(
+                label: "Waiting",
+                value: slice.waitingTime.map {
+                    duration(Int64($0.rounded(.down)))
+                } ?? "Unavailable"
+            )
+            FactRow(
+                label: "Polling",
+                value: slice.pollingTime.map {
+                    duration(Int64($0.rounded(.down)))
+                } ?? "Unavailable",
+                detail: slice.activityBreakdownReason
+            )
+            FactRow(
+                label: "Source",
+                value: "Codex local records"
+            )
+            FactRow(
+                label: "Coverage",
+                value: slice.coverage.displayName,
+                detail: slice.reason
+            )
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Active Time facts")
+    }
+
+    private func activeTimeValue(_ slice: ActivityTimelineSlice) -> String {
+        if slice.points.isEmpty,
+           slice.coverage == .low || slice.coverage == .unavailable {
+            return "Not available"
+        }
+        return duration(Int64(slice.activeTime.rounded(.down)))
     }
 
     @ViewBuilder
@@ -2050,6 +2447,29 @@ private func compactTokenCount(_ value: Int64) -> String {
     value.formatted(
         .number.notation(.compactName).precision(.fractionLength(0 ... 1))
     )
+}
+
+private func steppedPoint<Point: Equatable>(
+    in points: [Point],
+    from selected: Point?,
+    by offset: Int
+) -> Point? {
+    guard !points.isEmpty else { return nil }
+    guard let selected, let index = points.firstIndex(of: selected) else {
+        return offset < 0 ? points.last : points.first
+    }
+    return points[min(max(index + offset, 0), points.count - 1)]
+}
+
+private func nearestPoint<Point>(
+    in points: [Point],
+    to target: Date,
+    date: KeyPath<Point, Date>
+) -> Point? {
+    points.min {
+        abs($0[keyPath: date].timeIntervalSince(target))
+            < abs($1[keyPath: date].timeIntervalSince(target))
+    }
 }
 
 private struct UsageReceiptTaskTreeView: View {

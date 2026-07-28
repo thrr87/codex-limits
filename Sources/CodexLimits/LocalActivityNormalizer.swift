@@ -306,8 +306,13 @@ struct LocalActivityNormalizer {
                     durationMilliseconds: record.durationMilliseconds,
                     timeToFirstTokenMilliseconds: record.timeToFirstTokenMilliseconds
                 )
-                let isComplete = timing.completedAt != nil
-                    && (timing.startedAt != nil || timing.durationMilliseconds != nil)
+                let isComplete = timing.startedAt != nil
+                    && timing.completedAt != nil
+                let reason = timing.startedAt == nil
+                    ? "turn-start-not-observed"
+                    : timing.completedAt == nil
+                        ? "turn-end-not-observed"
+                        : nil
                 facts.append(
                     LocalActivityFact(
                         key: .time,
@@ -315,10 +320,11 @@ struct LocalActivityNormalizer {
                         value: .turnTiming(timing),
                         numericDelta: nil,
                         tokenSegment: nil,
-                        reason: isComplete ? nil : "turn-end-not-observed",
+                        reason: reason,
                         eventID: record.eventID,
                         eventTimestamp: record.timestamp,
-                        source: source
+                        source: source,
+                        context: context
                     )
                 )
             }

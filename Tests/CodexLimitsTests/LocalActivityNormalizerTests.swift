@@ -136,6 +136,19 @@ final class LocalActivityNormalizerTests: XCTestCase {
                 )
             )
         )
+        XCTAssertEqual(
+            result.fact(.time)?.context,
+            LocalActivityContext(
+                taskID: "task-root",
+                turnID: "turn-1",
+                agent: LocalAgentIdentity(
+                    nickname: "Luna",
+                    role: "default"
+                ),
+                effectiveModel: "gpt-5.6",
+                reasoning: "high"
+            )
+        )
         XCTAssertEqual(result.fact(.tool)?.availability, .partial)
         XCTAssertEqual(result.fact(.tool)?.value, .text("command_execution"))
         XCTAssertEqual(result.fact(.wait)?.availability, .unavailable)
@@ -187,6 +200,26 @@ final class LocalActivityNormalizerTests: XCTestCase {
         )
     }
 
+    func testCompletionAndDurationDoNotReplaceAnUnobservedTurnStart() {
+        let result = LocalActivityNormalizer().normalize(
+            records: [
+                record(
+                    id: "complete-without-start",
+                    type: "event_msg",
+                    threadID: "task-root",
+                    turnID: "turn-1",
+                    completedAt: 1_100,
+                    durationMilliseconds: 5_000
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_200)
+        )
+
+        XCTAssertEqual(result.fact(.time)?.availability, .partial)
+        XCTAssertEqual(result.fact(.time)?.reason, "turn-start-not-observed")
+    }
+
     private func record(
         id: String,
         type: String,
@@ -195,7 +228,10 @@ final class LocalActivityNormalizerTests: XCTestCase {
         agent: LocalAgentIdentity? = nil,
         model: String? = nil,
         reasoning: String? = nil,
-        tokens: Int64? = nil
+        tokens: Int64? = nil,
+        startedAt: Int64? = nil,
+        completedAt: Int64? = nil,
+        durationMilliseconds: Int64? = nil
     ) -> RolloutRecord {
         RolloutRecord(
             eventID: id,
@@ -222,9 +258,9 @@ final class LocalActivityNormalizerTests: XCTestCase {
                     totalTokens: $0
                 )
             },
-            startedAt: nil,
-            completedAt: nil,
-            durationMilliseconds: nil,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            durationMilliseconds: durationMilliseconds,
             timeToFirstTokenMilliseconds: nil,
             toolClass: nil
         )
