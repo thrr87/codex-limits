@@ -16,7 +16,12 @@ final class ThreadProjectionSourceTests: XCTestCase {
         XCTAssertEqual(
             requests,
             [
-                .list(cursor: nil, limit: 25, useStateDBOnly: true),
+                .list(
+                    cursor: nil,
+                    limit: 25,
+                    useStateDBOnly: true,
+                    sortKey: "updated_at"
+                ),
                 .read(threadID: "task-child", includeTurns: false)
             ]
         )
@@ -24,6 +29,10 @@ final class ThreadProjectionSourceTests: XCTestCase {
         XCTAssertEqual(page.tasks[0].taskID, "task-child")
         XCTAssertEqual(page.tasks[0].parentTaskID, "task-root")
         XCTAssertEqual(page.tasks[0].projectLabel, "atlas")
+        XCTAssertEqual(
+            page.tasks[0].rolloutFileURL?.path,
+            "/synthetic/private/rollout.jsonl"
+        )
         XCTAssertEqual(page.tasks[0].source.source, .appServerThreadList)
         XCTAssertEqual(page.tasks[0].source.sourceVersion, "0.145.0")
         XCTAssertEqual(detail?.taskID, "task-child")

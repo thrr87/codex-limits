@@ -32,9 +32,12 @@ final class UsageMonitor: ObservableObject {
     private static let historyAccountEpochStartedAtKey = "historyAccountEpochStartedAt"
     private static let historySyncSelectedKey = "historySyncSelected"
     private static let historySyncAccountBindingKey = "historySyncAccountBinding"
+    private static let localHistoryDeletionCutoffKey =
+        "localHistoryDeletionCutoff"
     private let defaults: UserDefaults
     private let history: UsageHistory
     private let fetchUsage: () async throws -> CodexFetchResult
+    private let localActivityCollector: LocalActivityCollector?
     private var historyPartition: AccountHistoryPartition
     private var accountSnapshot: UsageSnapshot?
     private var sourceState: UsageSourceState = .available
@@ -52,15 +55,36 @@ final class UsageMonitor: ObservableObject {
     private var accountEpochStartedAt: Date?
     private var historyMatchesCurrentSnapshot = false
     private var legacySamplesAwaitingMigration: [UsageSample] = []
+    private var localActivityCollection = LocalActivityCollection.unavailable(
+        "Codex local records are unavailable"
+    )
+
+    convenience init() {
+        self.init(
+            defaults: .standard,
+            localActivityCollector: LocalActivityCollector(
+                projectionSource: ReadOnlyThreadProjectionSource { request in
+                    try await CodexClient.shared.threadProjectionResponse(
+                        for: request
+                    )
+                },
+                installedCLIVersion: {
+                    try? await CodexClient.shared.installedCLIVersion()
+                }
+            )
+        )
+    }
 
     init(
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults,
         historyDirectory: URL? = nil,
         startsAutomatically: Bool = true,
+        localActivityCollector: LocalActivityCollector? = nil,
         fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch
     ) {
         self.defaults = defaults
         self.fetchUsage = fetchUsage
+        self.localActivityCollector = localActivityCollector
         accountEpochStartedAt = defaults.object(
             forKey: Self.historyAccountEpochStartedAtKey
         ) as? Date
@@ -90,6 +114,9 @@ final class UsageMonitor: ObservableObject {
             installationID: installationID,
             partition: historyPartition
         )
+        if defaults.object(forKey: Self.localHistoryDeletionCutoffKey) != nil {
+            historyDeletionStatus = .pendingLocal
+        }
         recalculate()
 
         if startsAutomatically {
@@ -102,6 +129,13 @@ final class UsageMonitor: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        if let cutoff = defaults.object(
+            forKey: Self.localHistoryDeletionCutoffKey
+        ) as? Date {
+            await localActivityCollector?.restorePendingHistoryDeletion(
+                at: cutoff
+            )
+        }
 
         Timer.publish(every: 600, on: .main, in: .common)
             .autoconnect()
@@ -135,6 +169,14 @@ final class UsageMonitor: ObservableObject {
                 await exchangeRestoredHistoryIfAvailable()
                 accountSnapshot = result.snapshot
                 sourceState = .available
+                await localActivityCollector?.selectPartition(
+                    historyPartition.id
+                )
+                await refreshLocalActivity(
+                    for: result.snapshot,
+                    observedAt: result.snapshot.fetchedAt,
+                    identityVerified: false
+                )
                 recalculate(now: result.snapshot.fetchedAt)
                 persist()
                 return
@@ -176,16 +218,28 @@ final class UsageMonitor: ObservableObject {
             }
             accountSnapshot = newSnapshot
             sourceState = .available
+            await refreshLocalActivity(
+                for: newSnapshot,
+                observedAt: newSnapshot.fetchedAt
+            )
             recalculate(now: newSnapshot.fetchedAt)
-            persist()
-        } catch let error as CodexClientError {
-            await exchangeRestoredHistoryIfAvailable()
-            sourceState = .failed(error.localizedDescription)
-            recalculate()
             persist()
         } catch {
             await exchangeRestoredHistoryIfAvailable()
-            sourceState = .failed("Couldn’t read Codex usage. Try refreshing again.")
+            sourceState = .failed(
+                (error as? CodexClientError)?.localizedDescription
+                    ?? "Couldn’t read Codex usage. Try refreshing again."
+            )
+            if let accountSnapshot {
+                await localActivityCollector?.selectPartition(
+                    historyPartition.id
+                )
+                await refreshLocalActivity(
+                    for: accountSnapshot,
+                    observedAt: Date(),
+                    identityVerified: false
+                )
+            }
             recalculate()
             persist()
         }
@@ -290,6 +344,7 @@ final class UsageMonitor: ObservableObject {
             )
         }
         defaults.set(authState, forKey: Self.historyAuthStateKey)
+        await localActivityCollector?.selectPartition(partition.id)
         guard partition != historyPartition else { return }
         historyPartition = partition
         historyConnectionActive = false
@@ -305,6 +360,9 @@ final class UsageMonitor: ObservableObject {
             historyConnectionActive = false
         }
         apply(await history.selectPartition(partition))
+        localActivityCollection = .unavailable(
+            "Codex local records are unavailable"
+        )
         recalculate()
         if historyPrepared {
             persist()
@@ -320,6 +378,22 @@ final class UsageMonitor: ObservableObject {
             syncTarget: configuredSyncDirectory,
             expectsSyncTarget: defaults.bool(forKey: Self.historySyncSelectedKey)
         ))
+        let localDeletedAt = Date()
+        do {
+            try await localActivityCollector?.deleteHistory(at: localDeletedAt)
+            defaults.removeObject(
+                forKey: Self.localHistoryDeletionCutoffKey
+            )
+        } catch {
+            defaults.set(
+                localDeletedAt,
+                forKey: Self.localHistoryDeletionCutoffKey
+            )
+            historyDeletionStatus = .pendingLocal
+        }
+        localActivityCollection = .unavailable(
+            "Codex local records are unavailable"
+        )
         previousStatus = nil
         if let snapshot = accountSnapshot {
             accountSnapshot = UsageSnapshot(
@@ -339,6 +413,11 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        let wasLocalPending = historyDeletionStatus == .pendingLocal
+            || defaults.object(
+                forKey: Self.localHistoryDeletionCutoffKey
+            ) != nil
+        await prepareHistory()
         let bookmarkedTarget = resolveHistoryBookmark()
         if configuredSyncDirectory == nil {
             configuredSyncDirectory = bookmarkedTarget
@@ -349,6 +428,22 @@ final class UsageMonitor: ObservableObject {
             syncTarget: configuredSyncDirectory,
             bindsUnresolvedDeletionTarget: bindsUnresolvedTarget
         )
+        var localDeletionFailed = false
+        do {
+            if let cutoff = defaults.object(
+                forKey: Self.localHistoryDeletionCutoffKey
+            ) as? Date {
+                await localActivityCollector?.restorePendingHistoryDeletion(
+                    at: cutoff
+                )
+            }
+            try await localActivityCollector?.retryHistoryDeletion()
+            defaults.removeObject(
+                forKey: Self.localHistoryDeletionCutoffKey
+            )
+        } catch {
+            localDeletionFailed = true
+        }
         if state.deletionStatus == .complete,
            let configuredSyncDirectory {
             state = await history.connect(
@@ -372,6 +467,11 @@ final class UsageMonitor: ObservableObject {
                 ? configuredSyncDirectory?.lastPathComponent
                 : nil
         )
+        if localDeletionFailed {
+            historyDeletionStatus = .pendingLocal
+        } else if wasLocalPending, historyDeletionStatus == .none {
+            historyDeletionStatus = .complete
+        }
         historyConnectionActive = if let configuredSyncDirectory {
             await history.isConnected(to: configuredSyncDirectory)
         } else {
@@ -413,6 +513,11 @@ final class UsageMonitor: ObservableObject {
             }
             accountSnapshot = snapshot
             sourceState = .available
+            try await localActivityCollector?.rebuildHistory()
+            await refreshLocalActivity(
+                for: snapshot,
+                observedAt: snapshot.fetchedAt
+            )
             recalculate(now: snapshot.fetchedAt)
             persist()
         } catch let error as CodexClientError {
@@ -440,7 +545,10 @@ final class UsageMonitor: ObservableObject {
                 sourceState: sourceState,
                 now: now,
                 previousStatus: previousStatus,
-                accountEpochStartedAt: accountEpochStartedAt
+                accountEpochStartedAt: accountEpochStartedAt,
+                localActivityFacts: localActivityCollection.facts,
+                localActivityObservation: localActivityCollection.observation,
+                localTaskProjections: localActivityCollection.projections
             )
         )
         if let status = readerSnapshot.guidance?.status {
@@ -454,6 +562,41 @@ final class UsageMonitor: ObservableObject {
             return nil
         }
         return facts.lifetimeTokens
+    }
+
+    private func refreshLocalActivity(
+        for snapshot: UsageSnapshot,
+        observedAt: Date,
+        identityVerified: Bool = true
+    ) async {
+        guard let interval = UsageIntelligenceEngine.tokenActivityInterval(
+            account: snapshot,
+            samples: historyMatchesCurrentSnapshot ? samples : [],
+            accountEpochStartedAt: accountEpochStartedAt
+        ) else {
+            localActivityCollection = .unavailable(
+                "Weekly token interval is unavailable"
+            )
+            return
+        }
+        guard let localActivityCollector else {
+            localActivityCollection = .unavailable(
+                "Codex local records are unavailable"
+            )
+            return
+        }
+        let collection = await localActivityCollector.refresh(
+            interval: interval,
+            observedAt: observedAt
+        )
+        if await localActivityCollector.hasPendingHistoryDeletion() {
+            historyDeletionStatus = .pendingLocal
+        }
+        localActivityCollection = identityVerified
+            ? collection
+            : collection.loweringCoverage(
+                "Codex account identity could not be checked"
+            )
     }
 
     private func persist() {

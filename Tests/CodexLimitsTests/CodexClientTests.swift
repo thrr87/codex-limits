@@ -22,6 +22,66 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.initializationCount, 1)
     }
 
+    func testThreadProjectionReadsReuseTheInitializedAccountSession() async throws {
+        let server = PersistentAppServerFixture()
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+        _ = try await client.fetch(
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+        let source = ReadOnlyThreadProjectionSource { request in
+            try await client.threadProjectionResponse(for: request)
+        }
+
+        let page = try await source.list(cursor: nil, limit: 25)
+        let detail = try await source.read(threadID: "task-child")
+
+        XCTAssertEqual(page.tasks.map(\.taskID), ["task-child"])
+        XCTAssertEqual(detail?.projectLabel, "atlas")
+        XCTAssertEqual(server.connectionCount, 1)
+        XCTAssertEqual(server.initializationCount, 1)
+        XCTAssertEqual(server.threadListReadCount, 1)
+        XCTAssertEqual(server.threadReadCount, 1)
+    }
+
+    func testReadsInstalledCLIVersionFromTheInitializedSession() async throws {
+        let server = PersistentAppServerFixture(
+            initializeUserAgent: "Codex Desktop/0.145.0 (Mac OS 15.5)"
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+
+        let version = try await client.installedCLIVersion()
+
+        XCTAssertEqual(version, "0.145.0")
+        XCTAssertEqual(server.connectionCount, 1)
+        XCTAssertEqual(server.initializationCount, 1)
+    }
+
+    func testInstalledCLIChangeReplacesThePersistentSession() async throws {
+        let server = PersistentAppServerFixture(
+            initializeUserAgent: "Codex Desktop/0.145.0 (Mac OS 15.5)"
+        )
+        let identity = ExecutableIdentityFixture("first")
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            executableIdentity: identity.current,
+            timeout: 1
+        )
+
+        _ = try await client.installedCLIVersion()
+        identity.set("second")
+        let version = try await client.installedCLIVersion()
+
+        XCTAssertEqual(version, "0.145.0")
+        XCTAssertEqual(server.connectionCount, 2)
+        XCTAssertEqual(server.initializationCount, 2)
+    }
+
     func testConcurrentClientFetchesShareOneProtocolTransaction() async throws {
         let server = PersistentAppServerFixture(
             delaysFirstRateLimitResponse: true
@@ -47,6 +107,37 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.rateLimitReadCount, 1)
         XCTAssertEqual(server.accountReadCount, 1)
         XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testFetchProjectionAndVersionShareOneProtocolReader() async throws {
+        let server = PersistentAppServerFixture(
+            delaysFirstRateLimitResponse: true,
+            initializeUserAgent: "Codex Desktop/0.145.0 (Mac OS 15.5)"
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+        let source = ReadOnlyThreadProjectionSource { request in
+            try await client.threadProjectionResponse(for: request)
+        }
+
+        async let fetch = client.fetch(
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+        async let page = source.list(cursor: nil, limit: 25)
+        async let version = client.installedCLIVersion()
+        let results = try await (fetch, page, version)
+
+        XCTAssertEqual(
+            results.0.snapshot.mainLimit?.window.remainingPercent,
+            80
+        )
+        XCTAssertEqual(results.1.tasks.map(\.taskID), ["task-child"])
+        XCTAssertEqual(results.2, "0.145.0")
+        XCTAssertEqual(server.connectionCount, 1)
+        XCTAssertEqual(server.initializationCount, 1)
+        XCTAssertEqual(server.threadListReadCount, 1)
     }
 
     func testBrokenConnectionReconnectsWithoutLosingTheRefresh() async throws {
@@ -608,6 +699,23 @@ final class CodexClientTests: XCTestCase {
 
 }
 
+private final class ExecutableIdentityFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String
+
+    init(_ value: String) {
+        self.value = value
+    }
+
+    func current() -> String? {
+        lock.withLock { value }
+    }
+
+    func set(_ value: String) {
+        lock.withLock { self.value = value }
+    }
+}
+
 private final class PersistentAppServerFixture: @unchecked Sendable {
     private let lock = NSLock()
     private let dropsFirstConnection: Bool
@@ -620,11 +728,14 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
     private let sendsMalformedRateLimitLine: Bool
     private let omitsWeeklyWindow: Bool
     private let delaysFirstRateLimitResponse: Bool
+    private let initializeUserAgent: String?
     private var connections = 0
     private var initializations = 0
     private var rateLimitReads = 0
     private var usageReads = 0
     private var accountReads = 0
+    private var threadListReads = 0
+    private var threadReads = 0
 
     var connectionCount: Int {
         lock.withLock { connections }
@@ -646,6 +757,14 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         lock.withLock { usageReads }
     }
 
+    var threadListReadCount: Int {
+        lock.withLock { threadListReads }
+    }
+
+    var threadReadCount: Int {
+        lock.withLock { threadReads }
+    }
+
     init(
         dropsFirstConnection: Bool = false,
         stallsFirstConnection: Bool = false,
@@ -656,7 +775,8 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         omitsLifetimeTokensOnSecondRead: Bool = false,
         sendsMalformedRateLimitLine: Bool = false,
         omitsWeeklyWindow: Bool = false,
-        delaysFirstRateLimitResponse: Bool = false
+        delaysFirstRateLimitResponse: Bool = false,
+        initializeUserAgent: String? = nil
     ) {
         self.dropsFirstConnection = dropsFirstConnection
         self.stallsFirstConnection = stallsFirstConnection
@@ -668,6 +788,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         self.sendsMalformedRateLimitLine = sendsMalformedRateLimitLine
         self.omitsWeeklyWindow = omitsWeeklyWindow
         self.delaysFirstRateLimitResponse = delaysFirstRateLimitResponse
+        self.initializeUserAgent = initializeUserAgent
     }
 
     func makeConnection() throws -> CodexAppServerConnection {
@@ -690,7 +811,11 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                 switch method {
                 case "initialize":
                     lock.withLock { initializations += 1 }
-                    response = #"{"id":\#(id),"result":{}}"#
+                    if let initializeUserAgent {
+                        response = #"{"id":\#(id),"result":{"userAgent":"\#(initializeUserAgent)"}}"#
+                    } else {
+                        response = #"{"id":\#(id),"result":{}}"#
+                    }
                 case "account/rateLimits/read":
                     if dropsFirstConnection, connectionNumber == 1 {
                         try? responses.fileHandleForWriting.close()
@@ -755,6 +880,12 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                         ? "updated@example.com"
                         : "user@example.com"
                     response = #"{"id":\#(id),"result":{"account":{"type":"chatgpt","email":"\#(email)","planType":"pro"},"requiresOpenaiAuth":true}}"#
+                case "thread/list":
+                    lock.withLock { threadListReads += 1 }
+                    response = #"{"id":\#(id),"result":{"data":[{"id":"task-child","parentThreadId":"task-root","cliVersion":"0.145.0","cwd":"/synthetic/projects/atlas","createdAt":1785146400,"updatedAt":1785146460}],"nextCursor":null}}"#
+                case "thread/read":
+                    lock.withLock { threadReads += 1 }
+                    response = #"{"id":\#(id),"result":{"thread":{"id":"task-child","parentThreadId":"task-root","cliVersion":"0.145.0","cwd":"/synthetic/projects/atlas","createdAt":1785146400,"updatedAt":1785146460}}}"#
                 default:
                     continue
                 }

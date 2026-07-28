@@ -72,6 +72,15 @@ struct SettingsView: View {
                         Task { await monitor.retryHistoryDeletion() }
                     }
                     .disabled(monitor.isUpdatingHistory)
+                } else if monitor.historyDeletionStatus == .pendingLocal {
+                    Label("Deletion pending", systemImage: "exclamationmark.triangle")
+                    Text("Codex Limits couldn’t remove local history.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Retry deletion") {
+                        Task { await monitor.retryHistoryDeletion() }
+                    }
+                    .disabled(monitor.isUpdatingHistory)
                 } else if monitor.historyDeletionStatus == .complete {
                     Label("Analytics history deleted", systemImage: "checkmark.circle")
 

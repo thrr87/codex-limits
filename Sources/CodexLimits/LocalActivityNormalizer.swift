@@ -35,7 +35,7 @@ enum LocalActivityAvailability: String, Codable, Equatable, Sendable {
     case unavailable
 }
 
-enum LocalActivityFactValue: Equatable, Sendable {
+enum LocalActivityFactValue: Codable, Equatable, Sendable {
     case identifier(String)
     case text(String)
     case count(Int64)
@@ -44,19 +44,19 @@ enum LocalActivityFactValue: Equatable, Sendable {
     case turnTiming(LocalTurnTiming)
 }
 
-struct LocalAgentIdentity: Equatable, Sendable {
+struct LocalAgentIdentity: Codable, Equatable, Sendable {
     let nickname: String?
     let role: String?
 }
 
-struct LocalTurnTiming: Equatable, Sendable {
+struct LocalTurnTiming: Codable, Equatable, Sendable {
     let startedAt: Date?
     let completedAt: Date?
     let durationMilliseconds: Int64?
     let timeToFirstTokenMilliseconds: Int64?
 }
 
-struct LocalActivityFact: Equatable, Sendable {
+struct LocalActivityFact: Codable, Equatable, Sendable {
     let key: LocalActivityFactKey
     let availability: LocalActivityAvailability
     let value: LocalActivityFactValue?

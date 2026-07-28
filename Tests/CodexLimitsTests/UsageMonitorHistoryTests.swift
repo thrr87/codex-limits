@@ -85,6 +85,93 @@ final class UsageMonitorHistoryTests: XCTestCase {
         XCTAssertTrue(restarted.samples.isEmpty)
     }
 
+    func testLocalDeletionFailureIsReportedAsPending() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        let blockedParent = root.appendingPathComponent("blocked")
+        try Data("not a directory".utf8).write(to: blockedParent)
+        let collector = LocalActivityCollector(
+            rootDirectory: root,
+            stateDirectory: blockedParent.appendingPathComponent("state")
+        )
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: collector
+        )
+
+        await monitor.deleteAnalyticsHistory()
+
+        XCTAssertEqual(monitor.historyDeletionStatus, .pendingLocal)
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(
+            at: blockedParent,
+            withIntermediateDirectories: true
+        )
+
+        await monitor.retryHistoryDeletion()
+
+        XCTAssertEqual(monitor.historyDeletionStatus, .complete)
+        XCTAssertNil(defaults.object(forKey: "localHistoryDeletionCutoff"))
+    }
+
+    func testLocalDeletionIntentSurvivesRestart() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        let blockedParent = root.appendingPathComponent("blocked")
+        try Data("not a directory".utf8).write(to: blockedParent)
+        let failedCollector = LocalActivityCollector(
+            rootDirectory: root,
+            stateDirectory: blockedParent.appendingPathComponent("state")
+        )
+        let first = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: failedCollector
+        )
+        await first.deleteAnalyticsHistory()
+
+        let restartedCollector = LocalActivityCollector(
+            rootDirectory: root,
+            stateDirectory: blockedParent.appendingPathComponent("state")
+        )
+        let restarted = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: restartedCollector
+        )
+
+        XCTAssertEqual(restarted.historyDeletionStatus, .pendingLocal)
+        try FileManager.default.removeItem(at: blockedParent)
+        try FileManager.default.createDirectory(
+            at: blockedParent,
+            withIntermediateDirectories: true
+        )
+        await restarted.retryHistoryDeletion()
+
+        XCTAssertEqual(restarted.historyDeletionStatus, .complete)
+        XCTAssertNil(defaults.object(forKey: "localHistoryDeletionCutoff"))
+    }
+
     func testRefreshSelectsTheObservedAccountBeforeRecording() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -285,6 +372,120 @@ final class UsageMonitorHistoryTests: XCTestCase {
         XCTAssertEqual(
             monitor.readerSnapshot.sourceMessage,
             "Codex returned data this app could not read. Update Codex CLI and try again."
+        )
+    }
+
+    func testRestartCanRestoreLocalFactsWhenAccountRefreshFails() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let localRoot = root.appendingPathComponent(
+            "rollouts",
+            isDirectory: true
+        )
+        let stateRoot = root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let historyRoot = root.appendingPathComponent(
+            "history",
+            isDirectory: true
+        )
+        let firstAt = Date(timeIntervalSince1970: 1_700_000)
+        let secondAt = Date(timeIntervalSince1970: 1_800_000)
+        let tokenAt = Date(timeIntervalSince1970: 1_750_000)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let parts = calendar.dateComponents(
+            [.year, .month, .day],
+            from: tokenAt
+        )
+        let directory = localRoot
+            .appendingPathComponent(
+                String(format: "%04d", parts.year!),
+                isDirectory: true
+            )
+            .appendingPathComponent(
+                String(format: "%02d", parts.month!),
+                isDirectory: true
+            )
+            .appendingPathComponent(
+                String(format: "%02d", parts.day!),
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds
+        ]
+        let timestamps = [
+            formatter.string(from: tokenAt.addingTimeInterval(-120)),
+            formatter.string(from: tokenAt.addingTimeInterval(-60)),
+            formatter.string(from: tokenAt)
+        ]
+        let lines = [
+            #"{"timestamp":"\#(timestamps[0])","ordinal":0,"type":"session_meta","payload":{"id":"task-1","cli_version":"0.145.0"}}"#,
+            #"{"timestamp":"\#(timestamps[1])","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#,
+            #"{"timestamp":"\#(timestamps[2])","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":500}}}}"#
+        ]
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(
+            to: directory.appendingPathComponent(
+                "rollout-1970-01-21T00-00-00-task-1.jsonl"
+            )
+        )
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: firstAt,
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: secondAt,
+                remaining: 80
+            )
+        ])
+        let firstMonitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: historyRoot,
+            startsAutomatically: false,
+            localActivityCollector: LocalActivityCollector(
+                rootDirectory: localRoot,
+                stateDirectory: stateRoot
+            ),
+            fetchUsage: { try await source.next() }
+        )
+        await firstMonitor.refresh()
+        await firstMonitor.refresh()
+        XCTAssertEqual(
+            firstMonitor.readerSnapshot.localTokenActivity.tokens,
+            400
+        )
+
+        let restarted = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: historyRoot,
+            startsAutomatically: false,
+            localActivityCollector: LocalActivityCollector(
+                rootDirectory: localRoot,
+                stateDirectory: stateRoot
+            ),
+            fetchUsage: { throw CodexClientError.invalidResponse }
+        )
+        await restarted.refresh()
+
+        XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.tokens, 400)
+        XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.coverage, .low)
+        XCTAssertEqual(
+            restarted.readerSnapshot.localTokenActivity.reason,
+            "Codex account identity could not be checked"
         )
     }
 

@@ -1,17 +1,35 @@
 import Foundation
 
 enum ThreadProjectionReadRequest: Equatable, Sendable {
-    case list(cursor: String?, limit: Int, useStateDBOnly: Bool)
+    case list(
+        cursor: String?,
+        limit: Int,
+        useStateDBOnly: Bool,
+        sortKey: String
+    )
     case read(threadID: String, includeTurns: Bool)
 }
 
-struct ThreadProjection: Equatable, Sendable {
+struct ThreadProjection: Codable, Equatable, Sendable {
     let taskID: String
     let parentTaskID: String?
     let projectLabel: String?
+    let rolloutFileURL: URL?
     let createdAt: Date?
     let updatedAt: Date?
     let source: LocalActivitySourceMetadata
+
+    var withoutRolloutFileURL: ThreadProjection {
+        ThreadProjection(
+            taskID: taskID,
+            parentTaskID: parentTaskID,
+            projectLabel: projectLabel,
+            rolloutFileURL: nil,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            source: source
+        )
+    }
 }
 
 struct ThreadProjectionPage: Equatable, Sendable {
@@ -19,7 +37,7 @@ struct ThreadProjectionPage: Equatable, Sendable {
     let nextCursor: String?
 }
 
-protocol ThreadProjectionSource {
+protocol ThreadProjectionSource: Sendable {
     func list(cursor: String?, limit: Int) async throws -> ThreadProjectionPage
     func read(threadID: String) async throws -> ThreadProjection?
 }
@@ -40,7 +58,12 @@ struct ReadOnlyThreadProjectionSource: ThreadProjectionSource {
 
     func list(cursor: String?, limit: Int) async throws -> ThreadProjectionPage {
         let data = try await request(
-            .list(cursor: cursor, limit: limit, useStateDBOnly: true)
+            .list(
+                cursor: cursor,
+                limit: limit,
+                useStateDBOnly: true,
+                sortKey: "updated_at"
+            )
         )
         let response = try JSONDecoder().decode(
             ThreadListRPCResponse.self,
@@ -68,6 +91,9 @@ struct ReadOnlyThreadProjectionSource: ThreadProjectionSource {
             taskID: thread.id,
             parentTaskID: thread.parentThreadId,
             projectLabel: projectLabel(from: thread.cwd),
+            rolloutFileURL: thread.path.map {
+                URL(fileURLWithPath: $0)
+            },
             createdAt: thread.createdAt.map {
                 Date(timeIntervalSince1970: TimeInterval($0))
             },
@@ -114,6 +140,7 @@ private struct ThreadProjectionWire: Decodable {
     let parentThreadId: String?
     let cliVersion: String?
     let cwd: String?
+    let path: String?
     let createdAt: Int64?
     let updatedAt: Int64?
 }

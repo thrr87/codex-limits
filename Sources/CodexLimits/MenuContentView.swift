@@ -331,10 +331,7 @@ private struct GraphsWorkspace: View {
             case .usageRemaining:
                 usageRemaining
             case .tokenActivity:
-                UnavailableGraph(
-                    title: "Token activity",
-                    message: "Token activity is not available for this range."
-                )
+                TokenActivityWorkspace(reader: reader, store: store)
             case .usagePerToken:
                 UnavailableGraph(
                     title: "Usage per token",
@@ -409,6 +406,12 @@ private struct GraphsWorkspace: View {
                 .foregroundStyle(.secondary)
                 .help("Project, Task Tree, model, and reasoning filters do not change Usage remaining.")
                 .accessibilityLabel("Account scope")
+        } else if store.state.graph == .tokenActivity {
+            Label("All local activity", systemImage: "laptopcomputer")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("This total includes all supported local activity.")
+                .accessibilityLabel("All local activity")
         } else {
             WorkspaceFilterMenu(store: store)
         }
@@ -461,6 +464,499 @@ private struct GraphsWorkspace: View {
                 message: "Try refreshing to check again."
             )
         }
+    }
+}
+
+private struct TokenActivityWorkspace: View {
+    let reader: UsageReaderSnapshot
+    @ObservedObject var store: AnalyticsWorkspaceStore
+
+    @State private var selectedPoint: LocalTokenActivityPoint?
+
+    private var bounds: DateInterval {
+        reader.localTokenActivity.interval
+    }
+
+    private var visibleRange: DateInterval {
+        store.effectiveRange(
+            within: bounds,
+            endingAt: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
+        )
+    }
+
+    private var localSlice: LocalTokenActivitySlice {
+        reader.localTokenActivity.slice(in: visibleRange)
+    }
+
+    private var accountCoversVisibleRange: Bool {
+        guard let interval = reader.accountTokenActivity.interval else {
+            return false
+        }
+        return abs(interval.start.timeIntervalSince(visibleRange.start)) < 1
+            && abs(interval.end.timeIntervalSince(visibleRange.end)) < 1
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Token activity")
+                    .font(.title3.weight(.semibold))
+                Text(
+                    "Account and local token counts may differ, so we show them separately."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    accountCard
+                    localCard
+                }
+                VStack(spacing: 12) {
+                    accountCard
+                    localCard
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        chartSourceLabel
+                        Spacer()
+                        chartIntervalLabel
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        chartSourceLabel
+                        chartIntervalLabel
+                    }
+                }
+
+                if localSlice.points.isEmpty {
+                    WorkspaceMessage(
+                        icon: "chart.xyaxis.line",
+                        title: "No local token activity",
+                        message: localEmptyMessage
+                    ) {
+                        EmptyView()
+                    }
+                    .frame(minHeight: 170)
+                } else {
+                    localChart
+                }
+
+                selectedPointDetail
+            }
+        }
+        .onChange(of: visibleRange) { _, range in
+            if let selectedPoint, !range.contains(selectedPoint.date) {
+                self.selectedPoint = nil
+            }
+        }
+    }
+
+    private var chartSourceLabel: some View {
+        ChartLegendItem(
+            label: "Local Codex records",
+            color: .purple
+        )
+    }
+
+    private var chartIntervalLabel: some View {
+        Text(intervalText(visibleRange))
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+    }
+
+    private var accountCard: some View {
+        TokenSourceCard(
+            title: "Account",
+            source: accountSource,
+            value: accountValue,
+            detail: accountDetail,
+            coverage: accountCoverage,
+            freshness: reader.accountTokenActivity.interval?.end,
+            freshnessLabel: "Through",
+            color: .blue
+        )
+    }
+
+    private var localCard: some View {
+        TokenSourceCard(
+            title: "Local",
+            source: "Local Codex records",
+            value: reader.localTokenActivity.tokens == nil
+                ? "Not available"
+                : compactTokenCount(localSlice.tokens),
+            detail: localDetail,
+            coverage: coverageName(localSlice.coverage),
+            freshness: reader.localTokenActivity.observedAt,
+            freshnessLabel: "Updated",
+            color: .purple
+        )
+    }
+
+    private var accountValue: String {
+        guard accountCoversVisibleRange,
+              let tokens = reader.accountTokenActivity.tokens else {
+            return "Not available"
+        }
+        return compactTokenCount(tokens)
+    }
+
+    private var accountSource: String {
+        switch reader.accountTokenActivity.method {
+        case .lifetimeDelta:
+            "Codex account summary"
+        case .dailyBuckets:
+            "Codex daily token totals"
+        case nil:
+            "Codex account"
+        }
+    }
+
+    private var accountDetail: String {
+        guard accountCoversVisibleRange else {
+            if reader.accountTokenActivity.tokens != nil {
+                return "No account total for this selected range"
+            }
+            return reader.accountTokenActivity.reason
+                ?? "Account token activity is unavailable"
+        }
+        switch reader.accountTokenActivity.method {
+        case .lifetimeDelta:
+            return "Change between two account readings"
+        case .dailyBuckets:
+            return reader.accountTokenActivity.state == .partial
+                ? "Sum of complete days"
+                : "Complete daily totals"
+        case nil:
+            return reader.accountTokenActivity.reason
+                ?? "Account token activity is unavailable"
+        }
+    }
+
+    private var accountCoverage: String {
+        guard accountCoversVisibleRange else { return "Unavailable" }
+        switch reader.accountTokenActivity.state {
+        case .exact: return "Complete"
+        case .partial: return "Partial"
+        case .unavailable: return "Unavailable"
+        }
+    }
+
+    private var localDetail: String {
+        var details: [String] = []
+        if let version = reader.localTokenActivity.sourceVersion {
+            details.append("Codex \(version)")
+        }
+        if let reason = localSlice.reason {
+            details.append(readerFacingLocalReason(reason))
+        }
+        return details.isEmpty
+            ? "Local Codex records are unavailable"
+            : details.joined(separator: " · ")
+    }
+
+    private var localEmptyMessage: String {
+        localSlice.reason.map(readerFacingLocalReason)
+            ?? "No local token events were found in this range."
+    }
+
+    private var chartPoints: [LocalTokenActivityPoint] {
+        if localSlice.points.first?.date == visibleRange.start {
+            return localSlice.points
+        }
+        return [LocalTokenActivityPoint(date: visibleRange.start, tokens: 0)]
+            + localSlice.points
+    }
+
+    private var localChart: some View {
+        Chart {
+            ForEach(chartPoints) { point in
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value("Local tokens", point.tokens),
+                    series: .value("Source", "Local Codex records")
+                )
+                .foregroundStyle(Color.purple)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                .interpolationMethod(.stepEnd)
+            }
+
+            if let selectedPoint {
+                RuleMark(x: .value("Selected time", selectedPoint.date))
+                    .foregroundStyle(Color.primary.opacity(0.45))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                PointMark(
+                    x: .value("Selected time", selectedPoint.date),
+                    y: .value("Local tokens", selectedPoint.tokens)
+                )
+                .foregroundStyle(Color.purple)
+                .symbolSize(52)
+            }
+        }
+        .chartXScale(domain: visibleRange.start ... visibleRange.end)
+        .chartYAxis {
+            AxisMarks(position: .leading) { value in
+                AxisGridLine()
+                    .foregroundStyle(Color.secondary.opacity(0.16))
+                AxisValueLabel {
+                    if let tokens = value.as(Int64.self) {
+                        Text(compactTokenCount(tokens))
+                    }
+                }
+            }
+        }
+        .chartLegend(.hidden)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case let .active(location):
+                            selectNearestPoint(
+                                at: location,
+                                proxy: proxy,
+                                geometry: geometry
+                            )
+                        case .ended:
+                            selectedPoint = nil
+                        }
+                    }
+            }
+        }
+        .frame(height: 220)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Local token activity")
+        .accessibilityValue(
+            selectedPoint.map {
+                "\(compactTokenCount($0.tokens)) local tokens, \($0.date.formatted(date: .abbreviated, time: .shortened))"
+            } ?? "\(compactTokenCount(localSlice.tokens)) local tokens in the selected range"
+        )
+        .accessibilityHint(
+            "Use Previous point and Next point for exact values."
+        )
+    }
+
+    @ViewBuilder
+    private var selectedPointDetail: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                if let selectedPoint {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 10) {
+                            Text("Local Codex records")
+                                .fontWeight(.semibold)
+                            Text(compactTokenCount(selectedPoint.tokens))
+                                .monospacedDigit()
+                            Text(
+                                selectedPoint.date.formatted(
+                                    date: .abbreviated,
+                                    time: .shortened
+                                )
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 8) {
+                                Text("Local Codex records")
+                                    .fontWeight(.semibold)
+                                Text(compactTokenCount(selectedPoint.tokens))
+                                    .monospacedDigit()
+                            }
+                            Text(
+                                selectedPoint.date.formatted(
+                                    date: .abbreviated,
+                                    time: .shortened
+                                )
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    Text("Choose a point for exact details.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    moveSelection(by: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .accessibilityLabel("Previous point")
+                Button {
+                    moveSelection(by: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .accessibilityLabel("Next point")
+            }
+            if selectedPoint != nil {
+                HStack(spacing: 10) {
+                    Text("Account · \(accountSource)")
+                        .fontWeight(.semibold)
+                    Text(accountValue)
+                        .monospacedDigit()
+                    Text("selected range")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            .quaternary.opacity(0.7),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
+
+    private func moveSelection(by offset: Int) {
+        let points = localSlice.points
+        guard !points.isEmpty else {
+            selectedPoint = nil
+            return
+        }
+        guard let selectedPoint,
+              let index = points.firstIndex(of: selectedPoint) else {
+            self.selectedPoint = offset < 0 ? points.last : points.first
+            return
+        }
+        let next = min(max(index + offset, 0), points.count - 1)
+        self.selectedPoint = points[next]
+    }
+
+    private func readerFacingLocalReason(_ reason: String) -> String {
+        switch reason {
+        case "Local token activity starts from an unbounded counter":
+            "The first local reading has no earlier reading"
+        case "Local rollout path is unavailable",
+             "Local task records are missing":
+            "Some local Codex records could not be found"
+        case "Local task discovery is incomplete",
+             "Local task metadata is incomplete",
+             "Local task identity is missing":
+            "Some local tasks could not be checked"
+        case "This Codex CLI version has not been checked":
+            "This Codex version has not been checked"
+        case "Installed Codex CLI version is unavailable",
+             "Codex CLI version is unavailable":
+            "The installed Codex version could not be checked"
+        case "Only local activity on this Mac is observed":
+            "Only activity on this Mac is included"
+        case "Saved local activity could not be read":
+            "Saved local activity could not be read"
+        case "Local activity could not be saved":
+            "Local activity could not be saved"
+        case "Local task record continuity changed":
+            "A local task record changed"
+        default:
+            reason
+        }
+    }
+
+    private func selectNearestPoint(
+        at location: CGPoint,
+        proxy: ChartProxy,
+        geometry: GeometryProxy
+    ) {
+        guard let plotFrame = proxy.plotFrame else { return }
+        let frame = geometry[plotFrame]
+        guard frame.contains(location),
+              let date = proxy.value(
+                  atX: location.x - frame.origin.x,
+                  as: Date.self
+              ) else {
+            return
+        }
+        selectedPoint = localSlice.points.min {
+            abs($0.date.timeIntervalSince(date))
+                < abs($1.date.timeIntervalSince(date))
+        }
+    }
+
+    private func coverageName(_ coverage: CoverageLevel) -> String {
+        switch coverage {
+        case .complete: "Complete"
+        case .high: "High"
+        case .partial: "Partial"
+        case .low: "Low"
+        case .unavailable: "Unavailable"
+        case .notApplicable: "Not applicable"
+        }
+    }
+
+    private func intervalText(_ interval: DateInterval) -> String {
+        let start = interval.start.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        let end = interval.end.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        return "\(start)–\(end)"
+    }
+}
+
+private struct TokenSourceCard: View {
+    let title: String
+    let source: String
+    let value: String
+    let detail: String
+    let coverage: String
+    let freshness: Date?
+    let freshnessLabel: String
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label(title, systemImage: title == "Account"
+                ? "person.crop.circle"
+                : "laptopcomputer")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(color)
+            Text(source)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 26, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            HStack(spacing: 12) {
+                Text("Coverage \(coverage)")
+                if let freshness {
+                    Text(freshnessLabel + " " + freshness.formatted(
+                        date: .abbreviated,
+                        time: .shortened
+                    ))
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 155, alignment: .topLeading)
+        .background(
+            color.opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(color.opacity(0.16))
+        }
+        .help(
+            "\(title), \(source). \(value) tokens. Coverage \(coverage). \(detail)"
+        )
     }
 }
 
@@ -1021,14 +1517,14 @@ private struct FactsWorkspace: View {
         if let value = facts.lifetimeTokens {
             FactRow(
                 label: "Lifetime tokens",
-                value: compact(value),
+                value: compactTokenCount(value),
                 detail: observationDetail(facts.lifetimeTokensObservedAt)
             )
         }
         if let value = facts.peakDailyTokens {
             FactRow(
                 label: "Peak daily tokens",
-                value: compact(value),
+                value: compactTokenCount(value),
                 detail: observationDetail(facts.peakDailyTokensObservedAt)
             )
         }
@@ -1083,12 +1579,6 @@ private struct FactsWorkspace: View {
         }
     }
 
-    private func compact(_ value: Int64) -> String {
-        value.formatted(
-            .number.notation(.compactName).precision(.fractionLength(0 ... 1))
-        )
-    }
-
     private func duration(_ seconds: Int64) -> String {
         let hours = seconds / 3_600
         let minutes = (seconds % 3_600) / 60
@@ -1101,6 +1591,12 @@ private struct FactsWorkspace: View {
     private func days(_ value: Int64) -> String {
         "\(value) \(value == 1 ? "day" : "days")"
     }
+}
+
+private func compactTokenCount(_ value: Int64) -> String {
+    value.formatted(
+        .number.notation(.compactName).precision(.fractionLength(0 ... 1))
+    )
 }
 
 private struct InsightsWorkspace: View {

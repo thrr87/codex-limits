@@ -151,6 +151,9 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let now: Date
     let previousStatus: PaceStatus?
     let accountEpochStartedAt: Date?
+    let localActivityFacts: [LocalActivityFact]
+    let localActivityObservation: LocalActivityObservation
+    let localTaskProjections: [ThreadProjection]
 
     init(
         account: UsageSnapshot?,
@@ -159,7 +162,12 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         sourceState: UsageSourceState,
         now: Date,
         previousStatus: PaceStatus?,
-        accountEpochStartedAt: Date? = nil
+        accountEpochStartedAt: Date? = nil,
+        localActivityFacts: [LocalActivityFact] = [],
+        localActivityObservation: LocalActivityObservation = .unavailable(
+            "Codex local records are unavailable"
+        ),
+        localTaskProjections: [ThreadProjection] = []
     ) {
         self.account = account
         self.samples = samples
@@ -168,6 +176,9 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         self.now = now
         self.previousStatus = previousStatus
         self.accountEpochStartedAt = accountEpochStartedAt
+        self.localActivityFacts = localActivityFacts
+        self.localActivityObservation = localActivityObservation
+        self.localTaskProjections = localTaskProjections
     }
 }
 
@@ -182,6 +193,8 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let guidance: UsageGuidance?
     let chart: UsageChartSnapshot
     let accountTokenActivity: AccountTokenActivitySnapshot
+    let localTokenActivity: LocalTokenActivitySnapshot
+    let localTaskProjections: [ThreadProjection]
 
     var fetchedAt: Date? { account?.fetchedAt }
 
@@ -336,6 +349,27 @@ enum UsageIntelligenceEngine {
             guidance: guidance,
             safetyBuffer: input.safetyBuffer
         )
+        let accountTokenActivity = accountTokenActivity(
+            account: input.account,
+            samples: currentSamples
+        )
+        let localTokenActivity: LocalTokenActivitySnapshot
+        if let interval = tokenActivityInterval(
+            account: input.account,
+            accountActivity: accountTokenActivity,
+            accountEpochStartedAt: input.accountEpochStartedAt
+        ) {
+            localTokenActivity = LocalTokenActivityAggregator.evaluate(
+                facts: input.localActivityFacts,
+                interval: interval,
+                observation: input.localActivityObservation
+            )
+        } else {
+            localTokenActivity = .unavailable(
+                "Weekly token interval is unavailable",
+                interval: DateInterval(start: input.now, end: input.now)
+            )
+        }
         return UsageReaderSnapshot(
             account: input.account,
             accountSource: .account,
@@ -361,11 +395,51 @@ enum UsageIntelligenceEngine {
             evidence: evidence,
             guidance: guidance,
             chart: chart,
-            accountTokenActivity: accountTokenActivity(
-                account: input.account,
-                samples: currentSamples
-            )
+            accountTokenActivity: accountTokenActivity,
+            localTokenActivity: localTokenActivity,
+            localTaskProjections: input.localTaskProjections
         )
+    }
+
+    static func tokenActivityInterval(
+        account: UsageSnapshot?,
+        samples: [UsageSample],
+        accountEpochStartedAt: Date? = nil
+    ) -> DateInterval? {
+        tokenActivityInterval(
+            account: account,
+            accountActivity: accountTokenActivity(
+                account: account,
+                samples: samples
+            ),
+            accountEpochStartedAt: accountEpochStartedAt
+        )
+    }
+
+    private static func tokenActivityInterval(
+        account: UsageSnapshot?,
+        accountActivity: AccountTokenActivitySnapshot,
+        accountEpochStartedAt: Date?
+    ) -> DateInterval? {
+        if let interval = accountActivity.interval {
+            let start = max(
+                interval.start,
+                accountEpochStartedAt ?? interval.start
+            )
+            guard interval.end >= start else { return nil }
+            return DateInterval(start: start, end: interval.end)
+        }
+        guard let account,
+              let window = account.mainLimit?.window else {
+            return nil
+        }
+        let start = max(
+            window.startsAt,
+            accountEpochStartedAt ?? window.startsAt
+        )
+        let end = min(account.fetchedAt, window.resetsAt)
+        guard end >= start else { return nil }
+        return DateInterval(start: start, end: end)
     }
 
     private static func accountTokenActivity(

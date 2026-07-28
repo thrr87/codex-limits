@@ -1,5 +1,28 @@
 import Foundation
 
+private actor CodexProtocolGate {
+    private var isAvailable = true
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        if isAvailable {
+            isAvailable = false
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func leave() {
+        guard !waiters.isEmpty else {
+            isAvailable = true
+            return
+        }
+        waiters.removeFirst().resume()
+    }
+}
+
 enum CodexAccountObservation: Equatable, Sendable {
     case stable(identity: String)
     case unknown(state: String)
@@ -73,7 +96,10 @@ final class CodexAppServerConnection: @unchecked Sendable {
 }
 
 actor CodexClient {
-    static let shared = CodexClient()
+    static let shared = CodexClient(
+        makeConnection: CodexClient.liveConnection,
+        executableIdentity: CodexClient.liveExecutableIdentity
+    )
 
     private static let weeklyWindowDurationMinutes = 10_080
     private static let executablePaths = [
@@ -81,9 +107,13 @@ actor CodexClient {
         "/usr/local/bin/codex"
     ]
     private let makeConnection: () throws -> CodexAppServerConnection
+    private let executableIdentity: () -> String?
+    private let protocolGate = CodexProtocolGate()
     private let timeoutNanoseconds: UInt64
     private var connection: CodexAppServerConnection?
     private var initialized = false
+    private var serverCLIVersion: String?
+    private var connectionExecutableIdentity: String?
     private var nextRequestID = 1
     private var lastResult: CodexFetchResult?
     private var inFlightFetch: Task<CodexFetchResult, Error>?
@@ -108,9 +138,11 @@ actor CodexClient {
 
     init(
         makeConnection: @escaping () throws -> CodexAppServerConnection = CodexClient.liveConnection,
+        executableIdentity: @escaping () -> String? = { nil },
         timeout: TimeInterval = 15
     ) {
         self.makeConnection = makeConnection
+        self.executableIdentity = executableIdentity
         timeoutNanoseconds = UInt64(max(timeout, 0.001) * 1_000_000_000)
     }
 
@@ -123,11 +155,43 @@ actor CodexClient {
             return try await inFlightFetch.value
         }
         let task = Task {
-            try await self.fetchWithReconnect(fetchedAt: fetchedAt)
+            try await self.withProtocolAccess {
+                try await self.fetchWithReconnect(fetchedAt: fetchedAt)
+            }
         }
         inFlightFetch = task
         defer { inFlightFetch = nil }
         return try await task.value
+    }
+
+    func threadProjectionResponse(
+        for request: ThreadProjectionReadRequest
+    ) async throws -> Data {
+        try await withProtocolAccess {
+            try await self.threadProjectionResponseWithReconnect(for: request)
+        }
+    }
+
+    func installedCLIVersion() async throws -> String? {
+        try await withProtocolAccess {
+            let connection = try self.activeConnection()
+            try await self.ensureInitialized(connection)
+            return self.serverCLIVersion
+        }
+    }
+
+    private func withProtocolAccess<T: Sendable>(
+        _ operation: () async throws -> T
+    ) async throws -> T {
+        await protocolGate.enter()
+        do {
+            let result = try await operation()
+            await protocolGate.leave()
+            return result
+        } catch {
+            await protocolGate.leave()
+            throw error
+        }
     }
 
     private func fetchWithReconnect(
@@ -152,26 +216,7 @@ actor CodexClient {
 
     private func fetchOnce(fetchedAt: Date) async throws -> CodexFetchResult {
         let connection = try activeConnection()
-        if !initialized {
-            let initializeID = requestID()
-            try Self.write(
-                #"{"id":\#(initializeID),"method":"initialize","params":{"clientInfo":{"name":"codex-limits","title":"Codex Limits","version":"\#(Self.version)"},"capabilities":{"experimentalApi":true}}}"#,
-                to: connection.input
-            )
-            let response = try await responses(
-                for: [initializeID],
-                from: connection
-            ).values[initializeID]
-            guard let response,
-                  let object = try JSONSerialization.jsonObject(
-                    with: response
-                  ) as? [String: Any],
-                  object["error"] == nil else {
-                throw CodexClientError.invalidResponse
-            }
-            try Self.write(#"{"method":"initialized"}"#, to: connection.input)
-            initialized = true
-        }
+        try await ensureInitialized(connection)
 
         var state = try await readAccountState(from: connection)
         for _ in 0 ..< 2 where state.needsReconciliation {
@@ -202,6 +247,84 @@ actor CodexClient {
         }
         lastResult = result
         return result
+    }
+
+    private func threadProjectionResponseWithReconnect(
+        for request: ThreadProjectionReadRequest
+    ) async throws -> Data {
+        for attempt in 0 ... 1 {
+            do {
+                let connection = try activeConnection()
+                try await ensureInitialized(connection)
+                let id = requestID()
+                let method: String
+                let params: [String: Any]
+                switch request {
+                case let .list(cursor, limit, useStateDBOnly, sortKey):
+                    method = "thread/list"
+                    params = [
+                        "cursor": cursor as Any,
+                        "limit": limit,
+                        "useStateDbOnly": useStateDBOnly,
+                        "sortKey": sortKey
+                    ]
+                case let .read(threadID, includeTurns):
+                    method = "thread/read"
+                    params = [
+                        "threadId": threadID,
+                        "includeTurns": includeTurns
+                    ]
+                }
+                try Self.write(
+                    object: [
+                        "id": id,
+                        "method": method,
+                        "params": params
+                    ],
+                    to: connection.input
+                )
+                guard let response = try await responses(
+                    for: [id],
+                    from: connection
+                ).values[id] else {
+                    throw CodexClientError.invalidResponse
+                }
+                return response
+            } catch {
+                invalidateConnection()
+                if attempt == 0,
+                   case CodexClientError.connectionLost = error {
+                    continue
+                }
+                throw error
+            }
+        }
+        throw CodexClientError.connectionLost
+    }
+
+    private func ensureInitialized(
+        _ connection: CodexAppServerConnection
+    ) async throws {
+        guard !initialized else { return }
+        let initializeID = requestID()
+        try Self.write(
+            #"{"id":\#(initializeID),"method":"initialize","params":{"clientInfo":{"name":"codex-limits","title":"Codex Limits","version":"\#(Self.version)"},"capabilities":{"experimentalApi":true}}}"#,
+            to: connection.input
+        )
+        let response = try await responses(
+            for: [initializeID],
+            from: connection
+        ).values[initializeID]
+        guard let response,
+              let object = try JSONSerialization.jsonObject(
+                with: response
+              ) as? [String: Any],
+              object["error"] == nil else {
+            throw CodexClientError.invalidResponse
+        }
+        serverCLIVersion = Self.serverCLIVersion(in: object)
+        try Self.write(#"{"method":"initialized"}"#, to: connection.input)
+        initialized = true
     }
 
     private func readAccountState(
@@ -240,17 +363,35 @@ actor CodexClient {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
+    private static func serverCLIVersion(
+        in response: [String: Any]
+    ) -> String? {
+        guard let result = response["result"] as? [String: Any],
+              let userAgent = result["userAgent"] as? String else {
+            return nil
+        }
+        return userAgent.split(separator: " ").compactMap { component in
+            let parts = component.split(separator: "/", maxSplits: 1)
+            guard parts.count == 2,
+                  parts[1].contains("."),
+                  parts[1].allSatisfy({
+                      $0.isNumber || $0 == "." || $0 == "-"
+                  }) else {
+                return nil
+            }
+            return String(parts[1])
+        }.first
+    }
+
     private static func liveConnection() throws -> CodexAppServerConnection {
-        guard let executable = executablePaths.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else {
+        guard let executable = liveExecutableURL() else {
             throw CodexClientError.cliNotFound
         }
 
         let process = Process()
         let input = Pipe()
         let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
+        process.executableURL = executable
         process.arguments = ["app-server", "--stdio"]
         process.standardInput = input
         process.standardOutput = output
@@ -272,12 +413,16 @@ actor CodexClient {
     }
 
     private func activeConnection() throws -> CodexAppServerConnection {
-        if let connection, connection.isRunning() {
+        let currentExecutableIdentity = executableIdentity()
+        if let connection,
+           connection.isRunning(),
+           currentExecutableIdentity == connectionExecutableIdentity {
             return connection
         }
         invalidateConnection()
         let connection = try makeConnection()
         self.connection = connection
+        connectionExecutableIdentity = currentExecutableIdentity
         return connection
     }
 
@@ -285,6 +430,35 @@ actor CodexClient {
         connection?.stop()
         connection = nil
         initialized = false
+        serverCLIVersion = nil
+        connectionExecutableIdentity = nil
+    }
+
+    private static func liveExecutableURL() -> URL? {
+        executablePaths.lazy.compactMap { path -> URL? in
+            guard FileManager.default.isExecutableFile(atPath: path) else {
+                return nil
+            }
+            return URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        }.first
+    }
+
+    private static func liveExecutableIdentity() -> String? {
+        guard let executable = liveExecutableURL(),
+              let attributes = try? FileManager.default.attributesOfItem(
+                  atPath: executable.path
+              ) else {
+            return nil
+        }
+        let fileNumber = attributes[.systemFileNumber] as? NSNumber
+        let size = attributes[.size] as? NSNumber
+        let modified = attributes[.modificationDate] as? Date
+        return [
+            executable.path,
+            fileNumber?.stringValue ?? "unknown",
+            size?.stringValue ?? "unknown",
+            modified?.timeIntervalSince1970.description ?? "unknown"
+        ].joined(separator: ":")
     }
 
     private func requestID() -> Int {
@@ -583,6 +757,20 @@ actor CodexClient {
         } catch {
             throw CodexClientError.connectionLost
         }
+    }
+
+    private static func write(
+        object: [String: Any],
+        to handle: FileHandle
+    ) throws {
+        guard JSONSerialization.isValidJSONObject(object),
+              let message = String(
+                  data: try JSONSerialization.data(withJSONObject: object),
+                  encoding: .utf8
+              ) else {
+            throw CodexClientError.invalidResponse
+        }
+        try write(message, to: handle)
     }
 
 }

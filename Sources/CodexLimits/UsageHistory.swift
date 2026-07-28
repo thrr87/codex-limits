@@ -67,6 +67,7 @@ actor UsageHistory {
         case none
         case complete
         case pendingSync
+        case pendingLocal
     }
 
     enum Issue: Equatable, Sendable {
