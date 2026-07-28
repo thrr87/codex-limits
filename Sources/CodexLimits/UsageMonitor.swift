@@ -38,6 +38,7 @@ final class UsageMonitor: ObservableObject {
         "localHistoryDeletionCutoff"
     private let defaults: UserDefaults
     private let history: UsageHistory
+    private let codexAssistedHistory: CodexAssistedHistory?
     private let fetchUsage: () async throws -> CodexFetchResult
     private let localActivityCollector: LocalActivityCollector?
     private let resetReminderCoordinator: ResetReminderCoordinator
@@ -74,7 +75,8 @@ final class UsageMonitor: ObservableObject {
                 installedCLIVersion: {
                     try? await CodexClient.shared.installedCLIVersion()
                 }
-            )
+            ),
+            codexAssistedHistory: CodexAssistedHistory.shared
         )
     }
 
@@ -85,11 +87,13 @@ final class UsageMonitor: ObservableObject {
         localActivityCollector: LocalActivityCollector? = nil,
         resetReminderScheduler: (any ResetReminderScheduling)? = nil,
         resetReminderNow: @escaping () -> Date = Date.init,
+        codexAssistedHistory: CodexAssistedHistory? = nil,
         fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch
     ) {
         self.defaults = defaults
         self.fetchUsage = fetchUsage
         self.localActivityCollector = localActivityCollector
+        self.codexAssistedHistory = codexAssistedHistory
         let resetReminderCoordinator = ResetReminderCoordinator(
             defaults: defaults,
             scheduler: resetReminderScheduler
@@ -421,23 +425,42 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        let localDeletedAt = Date()
+        NotificationCenter.default.post(
+            name: .codexAssistedHistoryDeleted,
+            object: nil,
+            userInfo: [
+                codexAssistedHistoryDeletionCutoffKey: localDeletedAt
+            ]
+        )
         await prepareHistory()
         apply(await history.deleteAnalyticsHistory(
             syncTarget: configuredSyncDirectory,
             expectsSyncTarget: defaults.bool(forKey: Self.historySyncSelectedKey)
         ))
-        let localDeletedAt = Date()
+        var localDeletionFailed = false
         do {
             try await localActivityCollector?.deleteHistory(at: localDeletedAt)
-            defaults.removeObject(
-                forKey: Self.localHistoryDeletionCutoffKey
+        } catch {
+            localDeletionFailed = true
+        }
+        do {
+            try await codexAssistedHistory?.deleteAll(
+                upTo: localDeletedAt
             )
         } catch {
+            localDeletionFailed = true
+        }
+        if localDeletionFailed {
             defaults.set(
                 localDeletedAt,
                 forKey: Self.localHistoryDeletionCutoffKey
             )
             historyDeletionStatus = .pendingLocal
+        } else {
+            defaults.removeObject(
+                forKey: Self.localHistoryDeletionCutoffKey
+            )
         }
         localActivityCollection = .unavailable(
             "Codex local records are unavailable"
@@ -463,10 +486,11 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        let assistedDeletionCutoff = defaults.object(
+            forKey: Self.localHistoryDeletionCutoffKey
+        ) as? Date
         let wasLocalPending = historyDeletionStatus == .pendingLocal
-            || defaults.object(
-                forKey: Self.localHistoryDeletionCutoffKey
-            ) != nil
+            || assistedDeletionCutoff != nil
         await prepareHistory()
         let bookmarkedTarget = resolveHistoryBookmark()
         if configuredSyncDirectory == nil {
@@ -488,11 +512,22 @@ final class UsageMonitor: ObservableObject {
                 )
             }
             try await localActivityCollector?.retryHistoryDeletion()
+        } catch {
+            localDeletionFailed = true
+        }
+        if let assistedDeletionCutoff {
+            do {
+                try await codexAssistedHistory?.deleteAll(
+                    upTo: assistedDeletionCutoff
+                )
+            } catch {
+                localDeletionFailed = true
+            }
+        }
+        if !localDeletionFailed {
             defaults.removeObject(
                 forKey: Self.localHistoryDeletionCutoffKey
             )
-        } catch {
-            localDeletionFailed = true
         }
         if state.deletionStatus == .complete,
            let configuredSyncDirectory {

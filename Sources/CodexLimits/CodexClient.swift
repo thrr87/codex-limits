@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 private actor CodexProtocolGate {
@@ -102,6 +103,121 @@ final class CodexAppServerConnection: @unchecked Sendable {
                 return bufferedOutput
             }
             bufferedOutput.append(chunk)
+        }
+    }
+}
+
+enum CodexIsolatedHome {
+    static let directoryPrefix = "codex-limits-analysis-"
+    private static let staleAge: TimeInterval = 24 * 60 * 60
+
+    static func prepare(
+        sourceHome: URL,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        now: Date = Date()
+    ) throws -> URL {
+        removeStaleDirectories(
+            in: temporaryDirectory,
+            now: now,
+            maximumAge: staleAge
+        )
+        let directory = temporaryDirectory.appendingPathComponent(
+            "\(directoryPrefix)\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        do {
+            let sourceAuthentication = sourceHome.appendingPathComponent(
+                "auth.json"
+            )
+            let authentication = directory.appendingPathComponent("auth.json")
+            try FileManager.default.createSymbolicLink(
+                at: authentication,
+                withDestinationURL: sourceAuthentication
+            )
+            return directory
+        } catch {
+            remove(directory)
+            throw error
+        }
+    }
+
+    static func remove(_ directory: URL) {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    static func removeStaleDirectories(
+        in temporaryDirectory: URL,
+        now: Date,
+        maximumAge: TimeInterval
+    ) {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: temporaryDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        for candidate in contents
+        where candidate.lastPathComponent.hasPrefix(directoryPrefix) {
+            guard let attributes = try? FileManager.default.attributesOfItem(
+                atPath: candidate.path
+            ),
+                  attributes[.type] as? FileAttributeType == .typeDirectory,
+                  let modifiedAt = attributes[.modificationDate] as? Date,
+                  now.timeIntervalSince(modifiedAt) > maximumAge else {
+                continue
+            }
+            remove(candidate)
+        }
+    }
+}
+
+private final class CodexAppServerProcessOwner: @unchecked Sendable {
+    private let process: Process
+    private let input: FileHandle
+    private let output: FileHandle
+    private let isolatedHome: URL?
+    private let lock = NSLock()
+    private var didStop = false
+
+    init(
+        process: Process,
+        input: FileHandle,
+        output: FileHandle,
+        isolatedHome: URL?
+    ) {
+        self.process = process
+        self.input = input
+        self.output = output
+        self.isolatedHome = isolatedHome
+    }
+
+    func stop() {
+        let shouldStop = lock.withLock {
+            guard !didStop else { return false }
+            didStop = true
+            return true
+        }
+        guard shouldStop else { return }
+        try? input.close()
+        try? output.close()
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(0.5)
+            while process.isRunning, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        if let isolatedHome {
+            CodexIsolatedHome.remove(isolatedHome)
         }
     }
 }
@@ -394,7 +510,27 @@ actor CodexClient {
         }.first
     }
 
-    private static func liveConnection() throws -> CodexAppServerConnection {
+    static func liveConnection() throws -> CodexAppServerConnection {
+        try liveConnection(codexHome: nil)
+    }
+
+    static func liveIsolatedConnection() throws -> CodexAppServerConnection {
+        let sourceHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex", isDirectory: true)
+        let directory = try CodexIsolatedHome.prepare(sourceHome: sourceHome)
+        do {
+            return try liveConnection(codexHome: directory)
+        } catch {
+            CodexIsolatedHome.remove(directory)
+            throw error
+        }
+    }
+
+    private static func liveConnection(
+        codexHome: URL?
+    ) throws -> CodexAppServerConnection {
         guard let executable = liveExecutableURL() else {
             throw CodexClientError.cliNotFound
         }
@@ -404,22 +540,28 @@ actor CodexClient {
         let output = Pipe()
         process.executableURL = executable
         process.arguments = ["app-server", "--stdio"]
+        if let codexHome {
+            process.environment = ProcessInfo.processInfo.environment.merging(
+                ["CODEX_HOME": codexHome.path],
+                uniquingKeysWith: { _, isolated in isolated }
+            )
+        }
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         try process.run()
+        let owner = CodexAppServerProcessOwner(
+            process: process,
+            input: input.fileHandleForWriting,
+            output: output.fileHandleForReading,
+            isolatedHome: codexHome
+        )
 
         return CodexAppServerConnection(
             input: input.fileHandleForWriting,
             output: output.fileHandleForReading,
             isRunning: { process.isRunning },
-            stop: {
-                try? input.fileHandleForWriting.close()
-                try? output.fileHandleForReading.close()
-                if process.isRunning {
-                    process.terminate()
-                }
-            }
+            stop: { owner.stop() }
         )
     }
 
@@ -563,6 +705,38 @@ actor CodexClient {
                 usageResponse: usageResponse,
                 fetchedAt: fetchedAt
             )
+        } catch let error as CodexClientError {
+            throw error
+        } catch {
+            throw CodexClientError.invalidResponse
+        }
+    }
+
+    static func decodeWeeklyLimit(
+        rateLimitsResponse: Data
+    ) throws -> LimitReading? {
+        do {
+            let response = try JSONDecoder().decode(
+                RPCResponse<RateLimitsResult>.self,
+                from: rateLimitsResponse
+            )
+            guard let result = response.result else {
+                throw CodexClientError.invalidResponse
+            }
+            let snapshots = result.rateLimitsByLimitId
+                ?? ["codex": result.rateLimits]
+            let mainSnapshot = snapshots["codex"] ?? result.rateLimits
+            return windows(from: mainSnapshot)
+                .first(where: {
+                    $0.durationMinutes == weeklyWindowDurationMinutes
+                })
+                .map {
+                    LimitReading(
+                        limitId: "codex",
+                        name: "Codex",
+                        window: $0
+                    )
+                }
         } catch let error as CodexClientError {
             throw error
         } catch {

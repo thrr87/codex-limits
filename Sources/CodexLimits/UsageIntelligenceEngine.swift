@@ -5,13 +5,13 @@ enum UsageSourceState: Equatable, Sendable {
     case failed(String)
 }
 
-enum UsageFreshness: String, Equatable, Sendable {
+enum UsageFreshness: String, Codable, Equatable, Sendable {
     case fresh
     case stale
     case unavailable
 }
 
-enum CoverageLevel: String, Equatable, Sendable {
+enum CoverageLevel: String, Codable, Equatable, Sendable {
     case complete
     case high
     case partial
@@ -31,7 +31,7 @@ enum CoverageLevel: String, Equatable, Sendable {
     }
 }
 
-enum ConfidenceLevel: String, Equatable, Sendable {
+enum ConfidenceLevel: String, Codable, Equatable, Sendable {
     case high
     case medium
     case low

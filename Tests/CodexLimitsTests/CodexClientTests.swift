@@ -2,6 +2,101 @@ import XCTest
 @testable import CodexLimits
 
 final class CodexClientTests: XCTestCase {
+    func testIsolatedHomeLinksCredentialsAndRemovesTheLink() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let temporary = root.appendingPathComponent(
+            "temporary",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: source,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: temporary,
+            withIntermediateDirectories: true
+        )
+        let sourceAuthentication = source.appendingPathComponent("auth.json")
+        try Data("secret".utf8).write(to: sourceAuthentication)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let isolated = try CodexIsolatedHome.prepare(
+            sourceHome: source,
+            temporaryDirectory: temporary,
+            now: Date(timeIntervalSince1970: 10_000)
+        )
+        let isolatedAuthentication = isolated.appendingPathComponent(
+            "auth.json"
+        )
+
+        let values = try isolatedAuthentication.resourceValues(
+            forKeys: [.isSymbolicLinkKey]
+        )
+        XCTAssertEqual(values.isSymbolicLink, true)
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: isolatedAuthentication.path
+            ),
+            sourceAuthentication.path
+        )
+
+        CodexIsolatedHome.remove(isolated)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: isolated.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: sourceAuthentication.path
+            )
+        )
+    }
+
+    func testIsolatedHomeRemovesOnlyStaleOwnedDirectories() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stale = root.appendingPathComponent(
+            "\(CodexIsolatedHome.directoryPrefix)stale",
+            isDirectory: true
+        )
+        let current = root.appendingPathComponent(
+            "\(CodexIsolatedHome.directoryPrefix)current",
+            isDirectory: true
+        )
+        let unrelated = root.appendingPathComponent(
+            "another-app",
+            isDirectory: true
+        )
+        for directory in [stale, current, unrelated] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_000)],
+            ofItemAtPath: stale.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 9_900)],
+            ofItemAtPath: current.path
+        )
+
+        CodexIsolatedHome.removeStaleDirectories(
+            in: root,
+            now: Date(timeIntervalSince1970: 10_000),
+            maximumAge: 1_000
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: current.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+    }
+
     func testRepeatedFetchesReuseOneInitializedSession() async throws {
         let server = PersistentAppServerFixture()
         let client = CodexClient(

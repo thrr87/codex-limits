@@ -5,6 +5,7 @@ import SwiftUI
 struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     @StateObject private var workspace: AnalyticsWorkspaceStore
+    @StateObject private var assistedInsights: CodexAssistedInsightStore
     @Environment(\.openSettings) private var openSettings
 
     init(
@@ -14,6 +15,9 @@ struct MenuContentView: View {
         self.monitor = monitor
         _workspace = StateObject(
             wrappedValue: AnalyticsWorkspaceStore(defaults: defaults)
+        )
+        _assistedInsights = StateObject(
+            wrappedValue: CodexAssistedInsightStore()
         )
     }
 
@@ -89,6 +93,7 @@ struct MenuContentView: View {
             AnalyticsWorkspaceBody(
                 reader: monitor.readerSnapshot,
                 store: workspace,
+                assistedInsights: assistedInsights,
                 analyticsPreferencesChanged: {
                     monitor.analyticsPreferencesDidChange(
                         exploration: workspace.state,
@@ -195,9 +200,11 @@ struct AnalyticsWorkspacePresentationView<Content: View>: View {
     }
 }
 
+@MainActor
 struct AnalyticsWorkspaceBody: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    @ObservedObject var assistedInsights: CodexAssistedInsightStore
     let analyticsPreferencesChanged: () -> Void
     let resetReminderState: ResetReminderState
     let setResetReminderEnabled: (Bool) -> Void
@@ -206,6 +213,7 @@ struct AnalyticsWorkspaceBody: View {
     init(
         reader: UsageReaderSnapshot,
         store: AnalyticsWorkspaceStore,
+        assistedInsights: CodexAssistedInsightStore,
         analyticsPreferencesChanged: @escaping () -> Void = {},
         resetReminderState: ResetReminderState = ResetReminderState(
             isEnabled: false,
@@ -218,6 +226,7 @@ struct AnalyticsWorkspaceBody: View {
     ) {
         self.reader = reader
         self.store = store
+        self.assistedInsights = assistedInsights
         self.analyticsPreferencesChanged = analyticsPreferencesChanged
         self.resetReminderState = resetReminderState
         self.setResetReminderEnabled = setResetReminderEnabled
@@ -239,7 +248,11 @@ struct AnalyticsWorkspaceBody: View {
                     setResetReminderLeadTime: setResetReminderLeadTime
                 )
             case .insights:
-                InsightsWorkspace(reader: reader, store: store)
+                InsightsWorkspace(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: assistedInsights
+                )
             }
         }
         .onChange(of: store.state) { _, _ in
@@ -3579,8 +3592,23 @@ private func sourceNames(
 struct InsightsWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    @ObservedObject var assistedInsights: CodexAssistedInsightStore
+    @State private var showsAssistedInfo = false
 
     private var snapshot: DeterministicInsightsSnapshot { reader.insights }
+    private var assistedPayload: CodexMetadataAnalysisPayload {
+        CodexMetadataAnalysisPayload.make(
+            reader: reader,
+            exploration: store.state
+        )
+    }
+    private var assistedScope: CodexAssistedAnalysisScope {
+        CodexAssistedAnalysisScope(
+            exploration: store.state,
+            accountPartitionID: reader.accountPartitionID,
+            payload: assistedPayload
+        )
+    }
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 14) {
@@ -3615,11 +3643,199 @@ struct InsightsWorkspace: View {
                 }
             }
 
-            WorkspaceCard(title: "Codex-assisted") {
-                Text("No Codex-assisted insights are available.")
-                    .foregroundStyle(.secondary)
+            if assistedInsights.showsCard(for: assistedScope) {
+                codexAssistedCard
             }
         }
+        .task(id: reader.accountPartitionID) {
+            await assistedInsights.checkAvailability(
+                accountPartitionID: reader.accountPartitionID
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var codexAssistedCard: some View {
+        WorkspaceCard(title: "Codex-assisted") {
+            VStack(alignment: .leading, spacing: 10) {
+                if let result = assistedInsights.result(for: assistedScope) {
+                    Text(result.title)
+                        .font(.headline)
+                    Text(result.summary)
+                        .foregroundStyle(.secondary)
+                    ForEach(
+                        Array(result.evidence.enumerated()),
+                        id: \.offset
+                    ) { _, evidence in
+                        Text(evidence)
+                            .font(.caption)
+                    }
+                    Grid(
+                        alignment: .leading,
+                        horizontalSpacing: 16,
+                        verticalSpacing: 5
+                    ) {
+                        insightEvidenceRow(
+                            "Source",
+                            result.source
+                        )
+                        insightEvidenceRow(
+                            "Confidence",
+                            result.confidence.displayName
+                        )
+                        insightEvidenceRow(
+                            "Coverage",
+                            result.coverage.displayName
+                        )
+                        insightEvidenceRow(
+                            "Freshness",
+                            result.freshness.rawValue.capitalized
+                        )
+                        if !result.intervals.isEmpty {
+                            insightEvidenceRow(
+                                "Period",
+                                result.intervals
+                                    .map(assistedInterval)
+                                    .joined(separator: "; ")
+                            )
+                        }
+                        insightEvidenceRow(
+                            "Updated",
+                            result.observedAt.formatted(
+                                date: .abbreviated,
+                                time: .shortened
+                            )
+                        )
+                    }
+                    .font(.caption)
+
+                } else if assistedInsights.isRunning {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Codex is analyzing metadata.")
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Codex is analyzing metadata")
+                    Button(
+                        assistedInsights.isCancelling ? "Stopping…" : "Cancel"
+                    ) {
+                        Task {
+                            await assistedInsights.cancelAnalysis()
+                        }
+                    }
+                    .disabled(assistedInsights.isCancelling)
+                    .accessibilityHint("Stops this Codex analysis")
+                } else {
+                    if let error = assistedInsights.errorMessage {
+                        Text(error)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel(error)
+                    } else if assistedInsights.wasCancelled {
+                        Text("Analysis stopped.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Ask Codex to analyze the metadata shown here.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let overhead = assistedInsights.overhead {
+                    assistedOverhead(overhead)
+                }
+
+                if assistedInsights.showsAnalyzeAction,
+                   !assistedInsights.isRunning {
+                    HStack(spacing: 8) {
+                        Button(
+                            assistedInsights.result(for: assistedScope) == nil
+                                ? "Analyze with Codex"
+                                : "Analyze again"
+                        ) {
+                            assistedInsights.startAnalysis(
+                                payload: assistedPayload,
+                                scope: assistedScope
+                            )
+                        }
+                        .accessibilityHint(
+                            "Sends bounded metadata to Codex and uses your allowance"
+                        )
+
+                        Button {
+                            showsAssistedInfo.toggle()
+                        } label: {
+                            Image(systemName: "info.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("About Analyze with Codex")
+                        .accessibilityLabel("About Analyze with Codex")
+                        .popover(isPresented: $showsAssistedInfo) {
+                            Text(CodexAssistedCopy.informationTip)
+                                .font(.callout)
+                                .frame(width: 280, alignment: .leading)
+                                .padding(14)
+                        }
+                    }
+                }
+            }
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    @ViewBuilder
+    private func assistedOverhead(
+        _ overhead: CodexAnalyticsOverhead
+    ) -> some View {
+        Divider()
+        Text("Analytics Overhead")
+            .font(.callout.weight(.medium))
+        insightEvidenceRow(
+            "Request time",
+            assistedDuration(overhead.durationSeconds)
+        )
+        if let movement = overhead.accountMovement {
+            insightEvidenceRow(
+                "Account movement",
+                "\(percent(movement.startRemainingPercent)) → \(percent(movement.endRemainingPercent)) usage remaining"
+            )
+            Text(
+                "Account movement during this request may include other Codex work."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+            insightEvidenceRow(
+                "Account movement",
+                "Not available"
+            )
+        }
+    }
+
+    private func assistedDuration(_ seconds: TimeInterval) -> String {
+        Duration.seconds(max(seconds, 0)).formatted(
+            .units(
+                allowed: [.hours, .minutes, .seconds],
+                width: .abbreviated,
+                maximumUnitCount: 2,
+                zeroValueUnits: .hide
+            )
+        )
+    }
+
+    private func assistedInterval(_ interval: DateInterval) -> String {
+        let start = interval.start.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        let end = interval.end.formatted(
+            date: .abbreviated,
+            time: .shortened
+        )
+        return "\(start)–\(end)"
+    }
+
+    private func percent(_ value: Double) -> String {
+        "\(value.formatted(.number.precision(.fractionLength(0 ... 1))))%"
     }
 
     @ViewBuilder

@@ -68,7 +68,8 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             renders(
                 AnalyticsWorkspaceBody(
                     reader: reader(fetchedAt: Date(timeIntervalSince1970: 1_500)),
-                    store: restored
+                    store: restored,
+                    assistedInsights: CodexAssistedInsightStore()
                 ),
                 size: CGSize(width: 640, height: 780)
             )
@@ -616,7 +617,11 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             store.selectSection(section)
             XCTAssertTrue(
                 renders(
-                    AnalyticsWorkspaceBody(reader: reader, store: store),
+                    AnalyticsWorkspaceBody(
+                        reader: reader,
+                        store: store,
+                        assistedInsights: CodexAssistedInsightStore()
+                    ),
                     size: CGSize(width: 640, height: 620)
                 ),
                 "\(section.rawValue) did not render"
@@ -628,7 +633,11 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             store.selectGraph(graph)
             XCTAssertTrue(
                 renders(
-                    AnalyticsWorkspaceBody(reader: reader, store: store),
+                    AnalyticsWorkspaceBody(
+                        reader: reader,
+                        store: store,
+                        assistedInsights: CodexAssistedInsightStore()
+                    ),
                     size: CGSize(width: 640, height: 620)
                 ),
                 "\(graph.rawValue) did not render"
