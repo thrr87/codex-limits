@@ -120,12 +120,7 @@ enum LocalTokenActivityAggregator {
         interval: DateInterval,
         observation: LocalActivityObservation
     ) -> LocalTokenActivitySnapshot {
-        let fractionalFormatter = ISO8601DateFormatter()
-        fractionalFormatter.formatOptions = [
-            .withInternetDateTime,
-            .withFractionalSeconds
-        ]
-        let standardFormatter = ISO8601DateFormatter()
+        let timestampParser = LocalEventTimestampParser()
         var seen = Set<String>()
         var hasUnboundedCounter = false
         let values = facts.compactMap { fact -> (Date, Int64)? in
@@ -134,8 +129,7 @@ enum LocalTokenActivityAggregator {
                   let eventID = fact.eventID,
                   seen.insert(eventID).inserted,
                   let timestamp = fact.eventTimestamp,
-                  let date = fractionalFormatter.date(from: timestamp)
-                    ?? standardFormatter.date(from: timestamp),
+                  let date = timestampParser.date(from: timestamp),
                   date >= interval.start,
                   date < interval.end else {
                 return nil

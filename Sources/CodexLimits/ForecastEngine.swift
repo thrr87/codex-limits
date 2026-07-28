@@ -13,12 +13,13 @@ enum ForecastEngine {
         let currentSamples = samples
             .filter { $0.resetsAt == window.resetsAt && $0.observedAt <= now }
             .sorted { $0.observedAt < $1.observedAt }
+        let currentIntervalSamples = samplesAfterLastCorrection(currentSamples)
         let elapsedDays = max(now.timeIntervalSince(window.startsAt) / 86_400, 1 / 24)
         let windowRate = max((100 - window.remainingPercent) / elapsedDays, 0)
         let recentRate: Double
 
-        if let first = currentSamples.first,
-           let last = currentSamples.last,
+        if let first = currentIntervalSamples.first,
+           let last = currentIntervalSamples.last,
            last.observedAt > first.observedAt {
             let days = last.observedAt.timeIntervalSince(first.observedAt) / 86_400
             recentRate = max((first.remainingPercent - last.remainingPercent) / days, 0)
@@ -26,38 +27,46 @@ enum ForecastEngine {
             recentRate = windowRate
         }
 
-        let currentRate = currentSamples.count > 1
+        let currentRate = currentIntervalSamples.count > 1
             ? 0.7 * recentRate + 0.3 * windowRate
             : windowRate
-        let historicalRates = Dictionary(grouping: samples.filter { $0.resetsAt != window.resetsAt }) {
-            $0.resetsAt
-        }.values.compactMap { windowSamples -> Double? in
-            let ordered = windowSamples.sorted { $0.observedAt < $1.observedAt }
-            guard let first = ordered.first,
-                  let last = ordered.last,
-                  last.observedAt > first.observedAt else { return nil }
-            let days = last.observedAt.timeIntervalSince(first.observedAt) / 86_400
-            return max((first.remainingPercent - last.remainingPercent) / days, 0)
-        }
+        let historicalRates = comparableHistoricalRates(
+            samples: samples,
+            excluding: window.resetsAt
+        )
         let historicalRate: Double
+        let historicalReferenceSource: UsageForecastReferenceSource?
         if historicalRates.isEmpty {
-            historicalRate = tokenBootstrapRate(
+            let tokenRate = tokenBootstrapRate(
                 window: window,
                 windowRate: windowRate,
                 tokenHistory: tokenHistory,
                 now: now
-            ) ?? currentRate
+            )
+            historicalRate = tokenRate ?? currentRate
+            historicalReferenceSource = tokenRate == nil ? nil : .tokenEstimate
         } else {
-            historicalRate = historicalRates.reduce(0, +) / Double(historicalRates.count)
+            historicalRate = median(Array(historicalRates.prefix(4)))
+            historicalReferenceSource = .accountHistory
         }
         let expectedRate = 0.75 * currentRate + 0.25 * historicalRate
         let safetyRate = max(currentRate, historicalRate) * 1.2
         let expected = max(window.remainingPercent - expectedRate * daysLeft, 0)
         let safety = max(window.remainingPercent - safetyRate * daysLeft, 0)
         let historical = max(window.remainingPercent - historicalRate * daysLeft, 0)
-        let recommended = daysLeft > 0
+        let historicalReference = historicalReferenceSource.map {
+            UsageForecastReference(
+                source: $0,
+                percentPerDay: historicalRate,
+                remainingAtReset: historical
+            )
+        }
+        let allowanceRate = daysLeft > 0
             ? max(window.remainingPercent - safetyBuffer, 0) / daysLeft
             : 0
+        let recommended = historicalReferenceSource == .accountHistory
+            ? min(allowanceRate, historicalRate * 1.2)
+            : allowanceRate
         let status: PaceStatus
         if safety < safetyBuffer || (previousStatus == .slowDown && safety < safetyBuffer + 1) {
             status = .slowDown
@@ -71,12 +80,69 @@ enum ForecastEngine {
             status: status,
             expectedRemainingAtReset: expected,
             safetyRemainingAtReset: safety,
-            historicalRemainingAtReset: historical,
             recommendedPercentPerDay: recommended,
             currentPercentPerDay: expectedRate,
-            historicalPercentPerDay: historicalRate,
-            safetyPercentPerDay: safetyRate
+            safetyPercentPerDay: safetyRate,
+            historicalReference: historicalReference
         )
+    }
+
+    private static func samplesAfterLastCorrection(
+        _ samples: [UsageSample]
+    ) -> [UsageSample] {
+        UsageHistoryPolicy.segments(samples).last ?? []
+    }
+
+    private static func comparableHistoricalRates(
+        samples: [UsageSample],
+        excluding currentReset: Date
+    ) -> [Double] {
+        let day: TimeInterval = 86_400
+        return Dictionary(
+            grouping: samples.filter { $0.resetsAt != currentReset },
+            by: \.resetsAt
+        )
+        .compactMap { reset, windowSamples -> (Date, Double)? in
+            let start = reset.addingTimeInterval(-7 * day)
+            let ordered = windowSamples
+                .filter {
+                    $0.observedAt >= start && $0.observedAt <= reset
+                }
+                .sorted { $0.observedAt < $1.observedAt }
+            let intervals = UsageHistoryPolicy.segments(ordered)
+            guard let first = ordered.first,
+                  let last = ordered.last,
+                  ordered.count >= 2,
+                  intervals.count == 1,
+                  first.observedAt.timeIntervalSince(start)
+                    <= UsageHistoryPolicy.tightBoundary,
+                  reset.timeIntervalSince(last.observedAt)
+                    <= UsageHistoryPolicy.tightBoundary,
+                  zip(ordered, ordered.dropFirst()).allSatisfy({
+                      $1.observedAt.timeIntervalSince($0.observedAt)
+                          <= UsageHistoryPolicy.maximumComparableGap
+                  }),
+                  last.observedAt > first.observedAt else {
+                return nil
+            }
+            let days = last.observedAt.timeIntervalSince(first.observedAt) / day
+            return (reset, max(
+                (first.remainingPercent - last.remainingPercent) / days,
+                0
+            ))
+        }
+        .sorted { $0.0 > $1.0 }
+        .map(\.1)
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        let ordered = values.sorted()
+        guard !ordered.isEmpty else { return 0 }
+        let middle = ordered.count / 2
+        if ordered.count.isMultiple(of: 2) {
+            return (ordered[middle - 1] + ordered[middle]) / 2
+        }
+        return ordered[middle]
     }
 
     private static func tokenBootstrapRate(

@@ -424,6 +424,7 @@ private struct GraphsWorkspace: View {
                 UsageRemainingChart(
                     window: weekly.window,
                     chart: reader.chart,
+                    evidence: reader.evidence,
                     store: store
                 )
 
@@ -447,6 +448,13 @@ private struct GraphsWorkspace: View {
                         Text("Runway")
                             .foregroundStyle(.secondary)
                         Text(reader.guidance?.runway.text ?? "Not enough data")
+                    }
+                    if let gap = reader.guidance?.runway.gapText {
+                        GridRow {
+                            Text("Gap to reset")
+                                .foregroundStyle(.secondary)
+                            Text(gap)
+                        }
                     }
                     if let range = reader.guidance?.remainingAtResetRange {
                         GridRow {
@@ -997,6 +1005,7 @@ private struct WorkspaceFilterMenu: View {
 private struct UsageRemainingChart: View {
     let window: UsageWindow
     let chart: UsageChartSnapshot
+    let evidence: UsageEvidence
     @ObservedObject var store: AnalyticsWorkspaceStore
 
     @State private var selection: UsageChartSelection?
@@ -1108,6 +1117,7 @@ private struct UsageRemainingChart: View {
             }
 
             selectedPointDetail
+            selectedRangeDetail
 
             HStack(spacing: 10) {
                 Button {
@@ -1136,6 +1146,30 @@ private struct UsageRemainingChart: View {
     }
 
     @ViewBuilder
+    private var selectedRangeDetail: some View {
+        if store.state.timeRange == .selected,
+           let range = store.state.visibleRange {
+            let points = chart.observed
+                .filter { range.contains($0.date) }
+                .sorted { $0.date < $1.date }
+            if let first = points.first, let last = points.last {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(
+                        "\(Int(first.remaining.rounded()))% \(first.date.formatted(date: .abbreviated, time: .shortened)) – \(Int(last.remaining.rounded()))% \(last.date.formatted(date: .abbreviated, time: .shortened))"
+                    )
+                    .monospacedDigit()
+                    Text(
+                        "\(chart.observedSource.rawValue) · \(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .accessibilityElement(children: .combine)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var chartLegend: some View {
         ChartLegendItem(label: "Target", color: .green, dash: [3, 3])
         ChartLegendItem(
@@ -1148,10 +1182,19 @@ private struct UsageRemainingChart: View {
                 color: currentColor,
                 dash: [7, 3]
             )
+        }
+        if !chart.historicalProjection.isEmpty {
             ChartLegendItem(
                 label: "Past estimate",
                 color: .secondary,
                 dash: [2, 3]
+            )
+        }
+        if !chart.estimatedBackfill.isEmpty {
+            ChartLegendItem(
+                label: "Estimated backfill · Token activity",
+                color: .orange,
+                dash: [1, 4]
             )
         }
     }
@@ -1171,15 +1214,27 @@ private struct UsageRemainingChart: View {
 
     @ChartContentBuilder
     private var observedMarks: some ChartContent {
-        ForEach(chart.observed) { point in
-            LineMark(
-                x: .value("Time", point.date),
-                y: .value("Actual", point.remaining),
-                series: .value("Series", "Actual")
-            )
-            .foregroundStyle(Color.blue)
-            .lineStyle(StrokeStyle(lineWidth: 2))
-            .interpolationMethod(.stepEnd)
+        ForEach(
+            Array(chart.observedSegments.enumerated()),
+            id: \.offset
+        ) { segmentIndex, segment in
+            ForEach(segment) { point in
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value("Actual", point.remaining),
+                    series: .value("Series", "Actual \(segmentIndex)")
+                )
+                .foregroundStyle(Color.blue)
+                .lineStyle(StrokeStyle(lineWidth: 2))
+                .interpolationMethod(.stepEnd)
+
+                PointMark(
+                    x: .value("Time", point.date),
+                    y: .value("Actual", point.remaining)
+                )
+                .foregroundStyle(Color.blue)
+                .symbolSize(12)
+            }
         }
     }
 
@@ -1203,6 +1258,16 @@ private struct UsageRemainingChart: View {
             )
             .foregroundStyle(Color.secondary)
             .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [2, 3]))
+        }
+
+        ForEach(chart.estimatedBackfill) { point in
+            LineMark(
+                x: .value("Time", point.date),
+                y: .value("Estimated backfill", point.remaining),
+                series: .value("Series", "Estimated backfill")
+            )
+            .foregroundStyle(Color.orange)
+            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [1, 4]))
         }
     }
 
@@ -1246,6 +1311,8 @@ private struct UsageRemainingChart: View {
                     )
                 )
                 .foregroundStyle(.secondary)
+                Text(selection.source.label)
+                    .foregroundStyle(.secondary)
             } else {
                 Text("Choose a point for exact details.")
                     .foregroundStyle(.secondary)
@@ -1269,6 +1336,15 @@ private struct UsageRemainingChart: View {
         .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
 
         if let selection {
+            Text(
+                "\(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel(
+                "\(evidence.coverage.displayName) coverage, \(evidence.confidence.displayName) confidence"
+            )
+
             HStack(spacing: 10) {
                 if let keyboardRangeStart {
                     Text(
@@ -1428,8 +1504,10 @@ private struct UsageRemainingChart: View {
         case .target: .green
         case .currentEstimate: currentColor
         case .pastEstimate: .secondary
+        case .estimatedBackfill: .orange
         }
     }
+
 }
 
 private struct ChartLegendItem: View {

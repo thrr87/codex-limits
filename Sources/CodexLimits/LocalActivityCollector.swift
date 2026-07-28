@@ -632,13 +632,7 @@ actor LocalActivityCollector {
     }
 
     private func parseTimestamp(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [
-            .withInternetDateTime,
-            .withFractionalSeconds
-        ]
-        return fractional.date(from: value)
-            ?? ISO8601DateFormatter().date(from: value)
+        LocalEventTimestampParser().date(from: value)
     }
 
     @discardableResult

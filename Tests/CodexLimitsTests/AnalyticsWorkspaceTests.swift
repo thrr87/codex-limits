@@ -213,9 +213,16 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         let chart = UsageChartSnapshot(
             observedSource: .account,
             target: [UsageChartPoint(date: date, remaining: 60)],
-            observed: [UsageChartPoint(date: date, remaining: 52)],
             currentProjection: [UsageChartPoint(date: date, remaining: 48)],
-            historicalProjection: [],
+            currentAllowanceReset: date,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: date,
+                    observedSegments: [[
+                        UsageChartPoint(date: date, remaining: 52)
+                    ]]
+                )
+            ],
             currentRunsFaster: true,
             accessibilityValue: "Observed usage"
         )
@@ -226,7 +233,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertEqual(selection?.remaining, 52)
         XCTAssertEqual(
             selection?.accessibilityValue,
-            "Actual, 52% remaining"
+            "Actual, 52% remaining, Account"
         )
     }
 
@@ -236,12 +243,17 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         let chart = UsageChartSnapshot(
             observedSource: .account,
             target: [],
-            observed: [
-                UsageChartPoint(date: hidden, remaining: 90),
-                UsageChartPoint(date: visible, remaining: 70)
-            ],
             currentProjection: [],
-            historicalProjection: [],
+            currentAllowanceReset: visible,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: visible,
+                    observedSegments: [[
+                        UsageChartPoint(date: hidden, remaining: 90),
+                        UsageChartPoint(date: visible, remaining: 70)
+                    ]]
+                )
+            ],
             currentRunsFaster: false,
             accessibilityValue: "Observed usage"
         )
@@ -265,12 +277,17 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         let chart = UsageChartSnapshot(
             observedSource: .account,
             target: [],
-            observed: [
-                UsageChartPoint(date: first, remaining: 80),
-                UsageChartPoint(date: second, remaining: 70)
-            ],
             currentProjection: [],
-            historicalProjection: [],
+            currentAllowanceReset: second,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: second,
+                    observedSegments: [[
+                        UsageChartPoint(date: first, remaining: 80),
+                        UsageChartPoint(date: second, remaining: 70)
+                    ]]
+                )
+            ],
             currentRunsFaster: false,
             accessibilityValue: "Observed usage"
         )
@@ -299,18 +316,87 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testKeyboardPointNavigationIncludesEveryVisibleSeries() {
+        let start = Date(timeIntervalSince1970: 4_000)
+        let observed = Date(timeIntervalSince1970: 5_000)
+        let estimate = Date(timeIntervalSince1970: 6_000)
+        let backfill = Date(timeIntervalSince1970: 7_000)
+        let chart = UsageChartSnapshot(
+            observedSource: .account,
+            target: [UsageChartPoint(date: start, remaining: 100)],
+            currentProjection: [
+                UsageChartPoint(date: estimate, remaining: 50)
+            ],
+            reference: UsageChartReferenceSeries(
+                source: .tokenEstimate,
+                points: [UsageChartPoint(date: backfill, remaining: 40)]
+            ),
+            currentAllowanceReset: observed,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: observed,
+                    observedSegments: [[
+                        UsageChartPoint(date: observed, remaining: 70)
+                    ]]
+                )
+            ],
+            currentRunsFaster: true,
+            accessibilityValue: "Usage"
+        )
+        let range = DateInterval(
+            start: start.addingTimeInterval(-1),
+            end: backfill.addingTimeInterval(1)
+        )
+
+        let first = UsageChartSelection.stepping(
+            from: nil,
+            by: 1,
+            in: chart,
+            within: range
+        )
+        let second = UsageChartSelection.stepping(
+            from: first,
+            by: 1,
+            in: chart,
+            within: range
+        )
+        let third = UsageChartSelection.stepping(
+            from: second,
+            by: 1,
+            in: chart,
+            within: range
+        )
+        let fourth = UsageChartSelection.stepping(
+            from: third,
+            by: 1,
+            in: chart,
+            within: range
+        )
+
+        XCTAssertEqual(
+            [first?.series, second?.series, third?.series, fourth?.series],
+            [.target, .observed, .currentEstimate, .estimatedBackfill]
+        )
+        XCTAssertEqual(fourth?.source, .tokenEstimate)
+    }
+
     func testZoomAnchorPrefersTheLatestObservedPoint() {
         let first = Date(timeIntervalSince1970: 2_000)
         let latest = Date(timeIntervalSince1970: 4_000)
         let chart = UsageChartSnapshot(
             observedSource: .account,
             target: [],
-            observed: [
-                UsageChartPoint(date: first, remaining: 80),
-                UsageChartPoint(date: latest, remaining: 60)
-            ],
             currentProjection: [],
-            historicalProjection: [],
+            currentAllowanceReset: latest,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: latest,
+                    observedSegments: [[
+                        UsageChartPoint(date: first, remaining: 80),
+                        UsageChartPoint(date: latest, remaining: 60)
+                    ]]
+                )
+            ],
             currentRunsFaster: false,
             accessibilityValue: "Observed usage"
         )

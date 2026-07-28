@@ -66,6 +66,30 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+enum UsageHistoryPolicy {
+    static let weeklyDurationMinutes = 10_080
+    static let correctionTolerance = 0.1
+    static let tightBoundary: TimeInterval = 15 * 60
+    static let maximumComparableGap: TimeInterval = 30 * 60
+
+    static func segments(
+        _ samples: [UsageSample]
+    ) -> [[UsageSample]] {
+        samples.sorted { $0.observedAt < $1.observedAt }
+            .reduce(into: []) { intervals, sample in
+                if let previous = intervals.last?.last,
+                   sample.remainingPercent
+                    > previous.remainingPercent + correctionTolerance {
+                    intervals.append([sample])
+                } else if intervals.isEmpty {
+                    intervals.append([sample])
+                } else {
+                    intervals[intervals.count - 1].append(sample)
+                }
+            }
+    }
+}
+
 enum TokenDayCompleteness: String, Codable, Equatable, Sendable {
     case complete
     case partial
@@ -275,9 +299,31 @@ struct Forecast: Equatable, Sendable {
     let status: PaceStatus
     let expectedRemainingAtReset: Double
     let safetyRemainingAtReset: Double
-    let historicalRemainingAtReset: Double
     let recommendedPercentPerDay: Double
     let currentPercentPerDay: Double
-    let historicalPercentPerDay: Double
     let safetyPercentPerDay: Double
+    let historicalReference: UsageForecastReference?
+
+    var historicalRemainingAtReset: Double {
+        historicalReference?.remainingAtReset ?? expectedRemainingAtReset
+    }
+
+    var historicalPercentPerDay: Double {
+        historicalReference?.percentPerDay ?? currentPercentPerDay
+    }
+
+    var historicalReferenceSource: UsageForecastReferenceSource? {
+        historicalReference?.source
+    }
+}
+
+enum UsageForecastReferenceSource: String, Equatable, Sendable {
+    case accountHistory = "Account history"
+    case tokenEstimate = "Token activity estimate"
+}
+
+struct UsageForecastReference: Equatable, Sendable {
+    let source: UsageForecastReferenceSource
+    let percentPerDay: Double
+    let remainingAtReset: Double
 }

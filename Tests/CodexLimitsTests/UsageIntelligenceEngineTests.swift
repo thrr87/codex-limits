@@ -390,10 +390,10 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             UsageChartPoint(date: now, remaining: 20)
         )
         XCTAssertEqual(reader.chart.currentProjection.count, 2)
-        XCTAssertEqual(reader.chart.historicalProjection.count, 2)
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
         XCTAssertEqual(
             reader.chart.accessibilityValue,
-            "Now has 20 percent remaining. At reset, the current pace leaves 0 percent and the historical pace leaves 0 percent."
+            "Now has 20 percent remaining. At reset, the current pace leaves 0 percent."
         )
     }
 
@@ -549,6 +549,45 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 UsageChartPoint(date: now, remaining: 55)
             ]
         )
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
+    }
+
+    func testTokenBackfillUsesItsOwnEstimatedSeriesAndSource() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 100 * day)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: (-33 ... -1).map {
+                TokenDay(
+                    date: now.addingTimeInterval(Double($0) * day),
+                    tokens: $0 < -5 ? 200 : 100
+                )
+            }
+        )
+        let samples = denseSamples(
+            account: account,
+            firstOffset: 10 * 60,
+            step: 30 * 60
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
+        XCTAssertEqual(reader.chart.estimatedBackfill.count, 2)
+        XCTAssertEqual(
+            reader.chart.historicalReferenceSource,
+            .tokenEstimate
+        )
     }
 
     func testUnknownCorrectionWithholdsGuidance() {
@@ -582,6 +621,202 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Unknown reset or correction")
         XCTAssertNil(reader.guidance)
+        XCTAssertEqual(reader.chart.observedSegments.count, 2)
+        XCTAssertEqual(reader.chart.observedSegments.flatMap { $0 }, reader.chart.observed)
+    }
+
+    func testUnknownCorrectionStartsANewMediumConfidenceInterval() {
+        let now = Date(timeIntervalSince1970: 6_050_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let correctionAt = now.addingTimeInterval(-26 * 3_600)
+        let samples = [
+            UsageSample(
+                observedAt: correctionAt.addingTimeInterval(-30 * 60),
+                remainingPercent: 30,
+                resetsAt: account.mainLimit!.window.resetsAt
+            ),
+            UsageSample(
+                observedAt: correctionAt,
+                remainingPercent: 90,
+                resetsAt: account.mainLimit!.window.resetsAt
+            )
+        ] + stride(from: 25.5, through: 0.5, by: -0.5).map { hoursAgo in
+            UsageSample(
+                observedAt: now.addingTimeInterval(-hoursAgo * 3_600),
+                remainingPercent: 70 + hoursAgo / 1.275,
+                resetsAt: account.mainLimit!.window.resetsAt
+            )
+        }
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.evidence.coverage, .partial)
+        XCTAssertEqual(reader.evidence.confidence, .medium)
+        XCTAssertEqual(reader.evidence.reason, "Unknown reset or correction")
+        XCTAssertNotNil(reader.guidance)
+    }
+
+    func testRunwayShowsWhenUsageEndsAndHowLongBeforeReset() {
+        let now = Date(timeIntervalSince1970: 6_100_000)
+        let account = makeSnapshot(remaining: 20, fetchedAt: now)
+        let samples = denseSamples(
+            account: account,
+            firstOffset: 0,
+            step: 30 * 60
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        guard case let .exhausts(_, beforeReset) = reader.guidance?.runway else {
+            return XCTFail("Expected an exhaustion estimate")
+        }
+        XCTAssertGreaterThan(beforeReset, 0)
+        XCTAssertTrue(reader.guidance?.runway.gapText?.contains("before reset") == true)
+    }
+
+    func testFiveHourLimitIsNeverUsedWhenWeeklyUsageIsMissing() {
+        let now = Date(timeIntervalSince1970: 6_200_000)
+        let fiveHour = LimitReading(
+            limitId: "codex",
+            name: "Codex",
+            window: UsageWindow(
+                remainingPercent: 70,
+                resetsAt: now.addingTimeInterval(3_600),
+                durationMinutes: 300
+            )
+        )
+        let account = UsageSnapshot(
+            mainLimit: nil,
+            otherLimits: [fiveHour],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: now
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertNil(reader.weeklyUsageRemaining)
+        XCTAssertEqual(reader.evidence.coverage, .unavailable)
+        XCTAssertEqual(reader.evidence.reason, "Weekly usage unavailable")
+        XCTAssertNil(reader.guidance)
+        XCTAssertTrue(reader.chart.observed.isEmpty)
+    }
+
+    func testWorkloadMixChangeCapsOtherwiseHighEvidence() {
+        let now = Date(timeIntervalSince1970: 6_300_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let samples = denseSamples(
+            account: account,
+            firstOffset: 0,
+            step: 30 * 60
+        )
+        let currentStart = account.mainLimit!.window.startsAt
+        let facts = modelFacts(
+            model: "gpt-current",
+            dates: (0 ..< 10).map {
+                now.addingTimeInterval(-Double($0 + 1) * 60)
+            }
+        ) + modelFacts(
+            model: "gpt-previous",
+            dates: (0 ..< 10).map {
+                currentStart.addingTimeInterval(-Double($0 + 1) * 60)
+            }
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                localActivityFacts: facts,
+                localActivityObservation: .continuous(
+                    sourceVersion: "test",
+                    observedAt: now
+                )
+            )
+        )
+
+        XCTAssertEqual(reader.evidence.coverage, .partial)
+        XCTAssertEqual(reader.evidence.confidence, .medium)
+        XCTAssertEqual(reader.evidence.reason, "Workload mix changed")
+    }
+
+    func testKnownResetKeepsObservedWindowsSeparate() {
+        let now = Date(timeIntervalSince1970: 6_400_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let currentReset = account.mainLimit!.window.resetsAt
+        let previousReset = currentReset.addingTimeInterval(-7 * 86_400)
+        let samples = [
+            UsageSample(
+                observedAt: previousReset.addingTimeInterval(-86_400),
+                remainingPercent: 40,
+                resetsAt: previousReset
+            ),
+            UsageSample(
+                observedAt: previousReset,
+                remainingPercent: 30,
+                resetsAt: previousReset
+            )
+        ] + denseSamples(
+            account: account,
+            firstOffset: 0,
+            step: 30 * 60
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(
+            reader.chart.allowanceWindows.map(\.resetsAt),
+            [previousReset, currentReset]
+        )
+        XCTAssertEqual(
+            reader.chart.allowanceWindows.first?
+                .observedSegments.flatMap { $0 }.count,
+            2
+        )
+        XCTAssertFalse(
+            reader.chart.allowanceWindows.last?
+                .observedSegments.flatMap { $0 }.isEmpty ?? true
+        )
     }
 
     func testSparseHistoryWithholdsGuidance() {
@@ -799,6 +1034,33 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 observedAt: Date(timeIntervalSince1970: time),
                 remainingPercent: 100 - (100 - window.remainingPercent) * progress,
                 resetsAt: window.resetsAt
+            )
+        }
+    }
+
+    private func modelFacts(
+        model: String,
+        dates: [Date]
+    ) -> [LocalActivityFact] {
+        let formatter = ISO8601DateFormatter()
+        return dates.enumerated().map { index, date in
+            LocalActivityFact(
+                key: .effectiveModel,
+                availability: .available,
+                value: .text(model),
+                numericDelta: nil,
+                tokenSegment: nil,
+                reason: nil,
+                eventID: "\(model)-\(index)",
+                eventTimestamp: formatter.string(from: date),
+                source: LocalActivitySourceMetadata(
+                    source: .rolloutJSONL,
+                    sourceVersion: "test",
+                    schemaVersion: "1",
+                    sourceGeneration: 1,
+                    historyMode: nil,
+                    observedAt: date
+                )
             )
         }
     }

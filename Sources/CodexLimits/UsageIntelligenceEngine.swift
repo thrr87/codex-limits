@@ -18,6 +18,17 @@ enum CoverageLevel: String, Equatable, Sendable {
     case low
     case unavailable
     case notApplicable
+
+    var displayName: String {
+        switch self {
+        case .complete: "Complete"
+        case .high: "High"
+        case .partial: "Partial"
+        case .low: "Low"
+        case .unavailable: "Unavailable"
+        case .notApplicable: "Not applicable"
+        }
+    }
 }
 
 enum ConfidenceLevel: String, Equatable, Sendable {
@@ -25,6 +36,15 @@ enum ConfidenceLevel: String, Equatable, Sendable {
     case medium
     case low
     case unavailable
+
+    var displayName: String {
+        switch self {
+        case .high: "High"
+        case .medium: "Medium"
+        case .low: "Low"
+        case .unavailable: "Unavailable"
+        }
+    }
 }
 
 enum UsageValueSource: String, Equatable, Sendable {
@@ -66,12 +86,12 @@ struct UsageEstimateRange: Equatable, Sendable {
 }
 
 enum UsageRunway: Equatable, Sendable {
-    case exhausts(Date)
+    case exhausts(Date, beforeReset: TimeInterval)
     case throughReset
 
     var text: String {
         switch self {
-        case let .exhausts(date):
+        case let .exhausts(date, _):
             date.formatted(
                 Date.FormatStyle(date: .abbreviated, time: .shortened)
                     .locale(Locale(identifier: "en_US"))
@@ -79,6 +99,20 @@ enum UsageRunway: Equatable, Sendable {
         case .throughReset:
             "Through reset"
         }
+    }
+
+    var gapText: String? {
+        guard case let .exhausts(_, beforeReset) = self else { return nil }
+        let minutes = max(Int((beforeReset / 60).rounded()), 0)
+        if minutes < 60 {
+            return "\(minutes) min before reset"
+        }
+        let hours = Int((Double(minutes) / 60).rounded())
+        if hours < 48 {
+            return "\(hours) \(hours == 1 ? "hr" : "hrs") before reset"
+        }
+        let days = Int((Double(hours) / 24).rounded())
+        return "\(days) \(days == 1 ? "day" : "days") before reset"
     }
 }
 
@@ -101,14 +135,69 @@ struct UsageChartPoint: Equatable, Identifiable, Sendable {
     var id: Date { date }
 }
 
+struct UsageAllowanceWindowSeries: Equatable, Identifiable, Sendable {
+    let resetsAt: Date
+    let observedSegments: [[UsageChartPoint]]
+
+    var id: Date { resetsAt }
+}
+
+struct UsageChartReferenceSeries: Equatable, Sendable {
+    let source: UsageForecastReferenceSource
+    let points: [UsageChartPoint]
+}
+
 struct UsageChartSnapshot: Equatable, Sendable {
     let observedSource: UsageValueSource
     let target: [UsageChartPoint]
-    let observed: [UsageChartPoint]
     let currentProjection: [UsageChartPoint]
-    let historicalProjection: [UsageChartPoint]
+    let reference: UsageChartReferenceSeries?
+    let currentAllowanceReset: Date?
+    let allowanceWindows: [UsageAllowanceWindowSeries]
     let currentRunsFaster: Bool
     let accessibilityValue: String
+
+    var observedSegments: [[UsageChartPoint]] {
+        allowanceWindows.first {
+            $0.resetsAt == currentAllowanceReset
+        }?.observedSegments ?? []
+    }
+
+    var observed: [UsageChartPoint] {
+        observedSegments.flatMap { $0 }
+    }
+
+    var historicalProjection: [UsageChartPoint] {
+        reference?.source == .accountHistory ? reference?.points ?? [] : []
+    }
+
+    var estimatedBackfill: [UsageChartPoint] {
+        reference?.source == .tokenEstimate ? reference?.points ?? [] : []
+    }
+
+    var historicalReferenceSource: UsageForecastReferenceSource? {
+        reference?.source
+    }
+
+    init(
+        observedSource: UsageValueSource,
+        target: [UsageChartPoint],
+        currentProjection: [UsageChartPoint],
+        reference: UsageChartReferenceSeries? = nil,
+        currentAllowanceReset: Date?,
+        allowanceWindows: [UsageAllowanceWindowSeries] = [],
+        currentRunsFaster: Bool,
+        accessibilityValue: String
+    ) {
+        self.observedSource = observedSource
+        self.target = target
+        self.currentProjection = currentProjection
+        self.reference = reference
+        self.currentAllowanceReset = currentAllowanceReset
+        self.allowanceWindows = allowanceWindows
+        self.currentRunsFaster = currentRunsFaster
+        self.accessibilityValue = accessibilityValue
+    }
 }
 
 enum AccountTokenActivityState: String, Equatable, Sendable {
@@ -217,7 +306,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     }
 
     var evidenceText: String {
-        "\(UsageValueSource.derivedEstimate.rawValue) · \(coverageName(evidence.coverage)) coverage · \(confidenceName(evidence.confidence)) confidence"
+        "\(UsageValueSource.derivedEstimate.rawValue) · \(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
     }
 
     var sourceMessage: String? {
@@ -246,36 +335,17 @@ struct UsageReaderSnapshot: Equatable, Sendable {
         return isStale ? "Stale · \(updated)" : updated
     }
 
-    private func coverageName(_ value: CoverageLevel) -> String {
-        switch value {
-        case .complete: "Complete"
-        case .high: "High"
-        case .partial: "Partial"
-        case .low: "Low"
-        case .unavailable: "Unavailable"
-        case .notApplicable: "Not applicable"
-        }
-    }
-
-    private func confidenceName(_ value: ConfidenceLevel) -> String {
-        switch value {
-        case .high: "High"
-        case .medium: "Medium"
-        case .low: "Low"
-        case .unavailable: "Unavailable"
-        }
-    }
 }
 
 private enum CurrentUsagePolicy {
     static let version = 1
-    static let tightBoundary: TimeInterval = 15 * 60
+    static let tightBoundary = UsageHistoryPolicy.tightBoundary
     static let looseBoundary: TimeInterval = 60 * 60
-    static let highGap: TimeInterval = 30 * 60
+    static let highGap = UsageHistoryPolicy.maximumComparableGap
     static let partialGap: TimeInterval = 6 * 60 * 60
+    static let minimumCorrectionInterval: TimeInterval = 6 * 60 * 60
     static let highShare = 0.8
     static let partialShare = 0.5
-    static let correctionTolerance = 0.1
 }
 
 enum UsageIntelligenceEngine {
@@ -297,11 +367,19 @@ enum UsageIntelligenceEngine {
                 .sorted { $0.observedAt < $1.observedAt }
             }
         } ?? []
+        let workloadMixChanged = input.account?.mainLimit.map {
+            LocalWorkloadMixAnalyzer.detectsChange(
+                facts: input.localActivityFacts,
+                observation: input.localActivityObservation,
+                window: $0.window
+            )
+        } ?? false
         let evidence = evidence(
             account: input.account,
             samples: currentSamples,
             sourceState: input.sourceState,
-            now: input.now
+            now: input.now,
+            workloadMixChanged: workloadMixChanged
         )
         let guidance: UsageGuidance? = input.account.flatMap { account in
             guard let weeklyLimit = account.mainLimit else { return nil }
@@ -343,9 +421,17 @@ enum UsageIntelligenceEngine {
                 forecast: forecast
             )
         }
+        let chartSamples = input.samples.filter { sample in
+            guard let currentReset = input.account?.mainLimit?.window.resetsAt,
+                  sample.resetsAt == currentReset,
+                  let epoch = input.accountEpochStartedAt else {
+                return true
+            }
+            return sample.observedAt >= epoch
+        }
         let chart = chart(
             account: input.account,
-            samples: currentSamples,
+            samples: chartSamples,
             guidance: guidance,
             safetyBuffer: input.safetyBuffer
         )
@@ -575,9 +661,9 @@ enum UsageIntelligenceEngine {
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: [],
-                observed: [],
                 currentProjection: [],
-                historicalProjection: [],
+                currentAllowanceReset: nil,
+                allowanceWindows: [],
                 currentRunsFaster: false,
                 accessibilityValue: "Usage is not available."
             )
@@ -587,66 +673,93 @@ enum UsageIntelligenceEngine {
             UsageChartPoint(date: window.startsAt, remaining: 100),
             UsageChartPoint(date: window.resetsAt, remaining: safetyBuffer)
         ]
-        let observed = observedPoints(
+        let allowanceWindows = allowanceWindowSeries(
             account: account,
-            window: window,
             samples: samples
         )
         guard let forecast = guidance?.forecast else {
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: target,
-                observed: observed,
                 currentProjection: [],
-                historicalProjection: [],
+                currentAllowanceReset: window.resetsAt,
+                allowanceWindows: allowanceWindows,
                 currentRunsFaster: false,
                 accessibilityValue: "Now has \(Int(window.remainingPercent.rounded())) percent remaining. A forecast is not available."
             )
         }
+        let referenceProjection = projection(
+            account: account,
+            window: window,
+            rate: forecast.historicalPercentPerDay,
+            remainingAtReset: forecast.historicalRemainingAtReset
+        )
+        let reference = forecast.historicalReferenceSource.map {
+            UsageChartReferenceSeries(
+                source: $0,
+                points: referenceProjection
+            )
+        }
+        let referenceDescription = forecast.historicalReferenceSource.map {
+            " and the \($0.rawValue.lowercased()) leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent"
+        } ?? ""
         return UsageChartSnapshot(
             observedSource: .account,
             target: target,
-            observed: observed,
             currentProjection: projection(
                 account: account,
                 window: window,
                 rate: forecast.currentPercentPerDay,
                 remainingAtReset: forecast.expectedRemainingAtReset
             ),
-            historicalProjection: projection(
-                account: account,
-                window: window,
-                rate: forecast.historicalPercentPerDay,
-                remainingAtReset: forecast.historicalRemainingAtReset
-            ),
+            reference: reference,
+            currentAllowanceReset: window.resetsAt,
+            allowanceWindows: allowanceWindows,
             currentRunsFaster: forecast.currentPercentPerDay
                 > forecast.historicalPercentPerDay,
-            accessibilityValue: "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent and the historical pace leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent."
+            accessibilityValue: "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent\(referenceDescription)."
         )
     }
 
-    private static func observedPoints(
+    private static func allowanceWindowSeries(
         account: UsageSnapshot,
-        window: UsageWindow,
         samples: [UsageSample]
-    ) -> [UsageChartPoint] {
-        let current = UsageChartPoint(
-            date: account.fetchedAt,
-            remaining: window.remainingPercent
+    ) -> [UsageAllowanceWindowSeries] {
+        guard let currentWindow = account.mainLimit?.window else { return [] }
+        let current = UsageSample(
+            observedAt: account.fetchedAt,
+            remainingPercent: currentWindow.remainingPercent,
+            resetsAt: currentWindow.resetsAt
         )
-        let local = samples
-            .filter {
-                $0.observedAt > window.startsAt
-                    && $0.observedAt < account.fetchedAt
+        return Dictionary(
+            grouping: deduplicatedSamples(samples + [current]),
+            by: \.resetsAt
+        )
+        .compactMap { reset, grouped -> UsageAllowanceWindowSeries? in
+            let start = reset.addingTimeInterval(
+                -Double(UsageHistoryPolicy.weeklyDurationMinutes) * 60
+            )
+            let end = reset == currentWindow.resetsAt
+                ? min(reset, account.fetchedAt)
+                : reset
+            let windowSamples = grouped.filter {
+                $0.observedAt >= start && $0.observedAt <= end
             }
-            .map {
-                UsageChartPoint(
-                    date: $0.observedAt,
-                    remaining: $0.remainingPercent
-                )
+            guard !windowSamples.isEmpty else { return nil }
+            let segments = UsageHistoryPolicy.segments(windowSamples).map {
+                $0.map {
+                    UsageChartPoint(
+                        date: $0.observedAt,
+                        remaining: $0.remainingPercent
+                    )
+                }
             }
-            .sorted { $0.date < $1.date }
-        return deduplicated(local + [current])
+            return UsageAllowanceWindowSeries(
+                resetsAt: reset,
+                observedSegments: segments
+            )
+        }
+        .sorted { $0.resetsAt < $1.resetsAt }
     }
 
     private static func projection(
@@ -680,16 +793,23 @@ enum UsageIntelligenceEngine {
         return [current, endpoint]
     }
 
-    private static func deduplicated(
-        _ points: [UsageChartPoint]
-    ) -> [UsageChartPoint] {
-        points.sorted { $0.date < $1.date }.reduce(into: []) { result, point in
-            if result.last?.date == point.date {
-                result[result.count - 1] = point
-            } else {
-                result.append(point)
-            }
+    private static func deduplicatedSamples(
+        _ samples: [UsageSample]
+    ) -> [UsageSample] {
+        Dictionary(grouping: samples) {
+            UsageSamplePointIdentity(
+                observedAt: $0.observedAt,
+                resetsAt: $0.resetsAt
+            )
         }
+        .values
+        .compactMap(\.last)
+        .sorted { $0.observedAt < $1.observedAt }
+    }
+
+    private struct UsageSamplePointIdentity: Hashable {
+        let observedAt: Date
+        let resetsAt: Date
     }
 
     private static func freshness(
@@ -708,7 +828,8 @@ enum UsageIntelligenceEngine {
         account: UsageSnapshot?,
         samples: [UsageSample],
         sourceState: UsageSourceState,
-        now: Date
+        now: Date,
+        workloadMixChanged: Bool
     ) -> UsageEvidence {
         guard let account, let weeklyLimit = account.mainLimit else {
             return UsageEvidence(
@@ -754,19 +875,10 @@ enum UsageIntelligenceEngine {
                     )
                 ]
         ).sorted { $0.observedAt < $1.observedAt }
-        let hasCorrection = zip(readings, readings.dropFirst()).contains {
-            $1.remainingPercent
-                > $0.remainingPercent + CurrentUsagePolicy.correctionTolerance
-        }
-        if hasCorrection {
-            return UsageEvidence(
-                coverage: .low,
-                confidence: .low,
-                reason: "Unknown reset or correction",
-                policyVersion: CurrentUsagePolicy.version
-            )
-        }
-        let points = samples.map(\.observedAt) + [account.fetchedAt]
+        let intervals = UsageHistoryPolicy.segments(readings)
+        let intervalReadings = intervals.last ?? []
+        let hasCorrection = intervals.count > 1
+        let points = intervalReadings.map(\.observedAt)
         let ordered = Array(Set(points)).sorted()
         guard let first = ordered.first, let last = ordered.last else {
             return UsageEvidence(
@@ -779,33 +891,33 @@ enum UsageIntelligenceEngine {
         let maximumGap = zip(ordered, ordered.dropFirst())
             .map { $1.timeIntervalSince($0) }
             .max() ?? 0
-        let startLag = max(first.timeIntervalSince(window.startsAt), 0)
+        let evidenceIntervalStart = hasCorrection ? first : window.startsAt
+        let startLag = max(first.timeIntervalSince(evidenceIntervalStart), 0)
         let endLag = max(now.timeIntervalSince(last), 0)
-        let elapsed = max(now.timeIntervalSince(window.startsAt), 1)
+        let elapsed = max(now.timeIntervalSince(evidenceIntervalStart), 1)
         let observedShare = min(max(last.timeIntervalSince(first) / elapsed, 0), 1)
 
+        let measured: UsageEvidence
         if startLag == 0,
            endLag == 0,
            maximumGap <= CurrentUsagePolicy.highGap {
-            return UsageEvidence(
+            measured = UsageEvidence(
                 coverage: .complete,
                 confidence: .high,
                 reason: nil,
                 policyVersion: CurrentUsagePolicy.version
             )
-        }
-        if observedShare >= CurrentUsagePolicy.highShare,
+        } else if observedShare >= CurrentUsagePolicy.highShare,
            startLag <= CurrentUsagePolicy.tightBoundary,
            endLag <= CurrentUsagePolicy.tightBoundary,
            maximumGap <= CurrentUsagePolicy.highGap {
-            return UsageEvidence(
+            measured = UsageEvidence(
                 coverage: .high,
                 confidence: .high,
                 reason: "Account boundary is within 15 minutes",
                 policyVersion: CurrentUsagePolicy.version
             )
-        }
-        if observedShare >= CurrentUsagePolicy.partialShare,
+        } else if observedShare >= CurrentUsagePolicy.partialShare,
            startLag <= CurrentUsagePolicy.looseBoundary,
            endLag <= CurrentUsagePolicy.looseBoundary,
            maximumGap <= CurrentUsagePolicy.partialGap {
@@ -813,21 +925,47 @@ enum UsageIntelligenceEngine {
             let reason = boundaryLag > CurrentUsagePolicy.tightBoundary
                 ? "Account boundary is \(Int(boundaryLag / 60)) minutes late"
                 : "Account gap over 30 minutes"
-            return UsageEvidence(
+            measured = UsageEvidence(
                 coverage: .partial,
                 confidence: .medium,
                 reason: reason,
                 policyVersion: CurrentUsagePolicy.version
             )
+        } else {
+            measured = UsageEvidence(
+                coverage: .low,
+                confidence: .low,
+                reason: observedShare < CurrentUsagePolicy.partialShare
+                    ? "Less than half of this weekly window is observed"
+                    : maximumGap > CurrentUsagePolicy.partialGap
+                        ? "Account gap over 6 hours"
+                        : "Account boundary is over 1 hour late",
+                policyVersion: CurrentUsagePolicy.version
+            )
+        }
+        if hasCorrection {
+            guard elapsed >= CurrentUsagePolicy.minimumCorrectionInterval else {
+                return UsageEvidence(
+                    coverage: .low,
+                    confidence: .low,
+                    reason: "Unknown reset or correction",
+                    policyVersion: CurrentUsagePolicy.version
+                )
+            }
+            return UsageEvidence(
+                coverage: measured.confidence == .high ? .partial : measured.coverage,
+                confidence: measured.confidence == .high ? .medium : measured.confidence,
+                reason: "Unknown reset or correction",
+                policyVersion: CurrentUsagePolicy.version
+            )
+        }
+        guard workloadMixChanged, measured.confidence == .high else {
+            return measured
         }
         return UsageEvidence(
-            coverage: .low,
-            confidence: .low,
-            reason: observedShare < CurrentUsagePolicy.partialShare
-                ? "Less than half of this weekly window is observed"
-                : maximumGap > CurrentUsagePolicy.partialGap
-                    ? "Account gap over 6 hours"
-                    : "Account boundary is over 1 hour late",
+            coverage: .partial,
+            confidence: .medium,
+            reason: "Workload mix changed",
             policyVersion: CurrentUsagePolicy.version
         )
     }
@@ -842,7 +980,10 @@ enum UsageIntelligenceEngine {
             window.remainingPercent / forecast.currentPercentPerDay * 86_400
         )
         return exhaustsAt < window.resetsAt
-            ? .exhausts(exhaustsAt)
+            ? .exhausts(
+                exhaustsAt,
+                beforeReset: window.resetsAt.timeIntervalSince(exhaustsAt)
+            )
             : .throughReset
     }
 

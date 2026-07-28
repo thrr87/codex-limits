@@ -88,6 +88,95 @@ final class ForecastEngineTests: XCTestCase {
         XCTAssertEqual(result.currentPercentPerDay, 2.5, accuracy: 0.01)
         XCTAssertEqual(result.historicalPercentPerDay, 4, accuracy: 0.01)
         XCTAssertEqual(result.expectedRemainingAtReset, 85, accuracy: 0.01)
+        XCTAssertEqual(result.historicalReferenceSource, .tokenEstimate)
+    }
+
+    func testOnlyCompleteHighCoverageWeeklyWindowsBecomeAccountHistory() {
+        let day: TimeInterval = 86_400
+        let halfHour: TimeInterval = 30 * 60
+        let now = Date(timeIntervalSince1970: 300 * day)
+        let currentReset = now.addingTimeInterval(2 * day)
+        let priorReset = currentReset.addingTimeInterval(-7 * day)
+        let window = UsageWindow(
+            remainingPercent: 60,
+            resetsAt: currentReset,
+            durationMinutes: 10_080
+        )
+        let priorStart = priorReset.addingTimeInterval(-7 * day)
+        let prior = stride(
+            from: priorStart.timeIntervalSince1970,
+            through: priorReset.timeIntervalSince1970,
+            by: halfHour
+        ).map { timestamp in
+            let progress = (timestamp - priorStart.timeIntervalSince1970) / (7 * day)
+            return UsageSample(
+                observedAt: Date(timeIntervalSince1970: timestamp),
+                remainingPercent: 100 - 35 * progress,
+                resetsAt: priorReset
+            )
+        }
+        let sparseOlderReset = priorReset.addingTimeInterval(-7 * day)
+        let sparse = [
+            UsageSample(
+                observedAt: sparseOlderReset.addingTimeInterval(-6 * day),
+                remainingPercent: 100,
+                resetsAt: sparseOlderReset
+            ),
+            UsageSample(
+                observedAt: sparseOlderReset,
+                remainingPercent: 20,
+                resetsAt: sparseOlderReset
+            )
+        ]
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: sparse + prior,
+            tokenHistory: [],
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: nil
+        )
+
+        XCTAssertEqual(result.historicalReferenceSource, .accountHistory)
+        XCTAssertEqual(result.historicalPercentPerDay, 5, accuracy: 0.01)
+        XCTAssertEqual(result.recommendedPercentPerDay, 6, accuracy: 0.01)
+    }
+
+    func testChangedResetTimeDoesNotJoinSamplesIntoTheCurrentInterval() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 400 * day)
+        let reset = now.addingTimeInterval(2 * day)
+        let changedReset = reset.addingTimeInterval(2 * 3_600)
+        let window = UsageWindow(
+            remainingPercent: 60,
+            resetsAt: reset,
+            durationMinutes: 10_080
+        )
+        let samples = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-day),
+                remainingPercent: 95,
+                resetsAt: changedReset
+            ),
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 60,
+                resetsAt: reset
+            )
+        ]
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: samples,
+            tokenHistory: [],
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: nil
+        )
+
+        XCTAssertEqual(result.historicalReferenceSource, nil)
+        XCTAssertEqual(result.currentPercentPerDay, 8, accuracy: 0.01)
     }
 
     func testSlowDownWaitsForOnePointOfRecovery() {

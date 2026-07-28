@@ -249,15 +249,35 @@ enum UsageChartSeries: String, Equatable, Sendable {
     case target = "Target"
     case currentEstimate = "Current estimate"
     case pastEstimate = "Past estimate"
+    case estimatedBackfill = "Estimated backfill"
+}
+
+enum UsageChartPointSource: Equatable, Sendable {
+    case account
+    case derivedEstimate
+    case accountHistory
+    case tokenEstimate
+    case weeklyTarget
+
+    var label: String {
+        switch self {
+        case .account: UsageValueSource.account.rawValue
+        case .derivedEstimate: UsageValueSource.derivedEstimate.rawValue
+        case .accountHistory: UsageForecastReferenceSource.accountHistory.rawValue
+        case .tokenEstimate: UsageForecastReferenceSource.tokenEstimate.rawValue
+        case .weeklyTarget: "Weekly target"
+        }
+    }
 }
 
 struct UsageChartSelection: Equatable, Sendable {
     let series: UsageChartSeries
     let date: Date
     let remaining: Double
+    let source: UsageChartPointSource
 
     var accessibilityValue: String {
-        "\(series.rawValue), \(Int(remaining.rounded()))% remaining"
+        "\(series.rawValue), \(Int(remaining.rounded()))% remaining, \(source.label)"
     }
 
     static func nearest(
@@ -265,29 +285,63 @@ struct UsageChartSelection: Equatable, Sendable {
         in chart: UsageChartSnapshot,
         within visibleRange: DateInterval? = nil
     ) -> UsageChartSelection? {
-        let candidates = chart.observed.map {
-            Candidate(series: .observed, point: $0, priority: 0)
-        } + chart.currentProjection.map {
-            Candidate(series: .currentEstimate, point: $0, priority: 1)
-        } + chart.historicalProjection.map {
-            Candidate(series: .pastEstimate, point: $0, priority: 2)
-        } + chart.target.map {
-            Candidate(series: .target, point: $0, priority: 3)
-        }
-        return candidates.filter {
-            visibleRange?.contains($0.point.date) ?? true
-        }.min {
-            let leftDistance = abs($0.point.date.timeIntervalSince(date))
-            let rightDistance = abs($1.point.date.timeIntervalSince(date))
-            if leftDistance == rightDistance {
-                return $0.priority < $1.priority
+        candidates(in: chart)
+            .filter {
+                visibleRange?.contains($0.point.date) ?? true
+            }.min {
+                let leftDistance = abs($0.point.date.timeIntervalSince(date))
+                let rightDistance = abs($1.point.date.timeIntervalSince(date))
+                if leftDistance == rightDistance {
+                    return $0.priority < $1.priority
+                }
+                return leftDistance < rightDistance
+            }.map {
+                UsageChartSelection(
+                    series: $0.series,
+                    date: $0.point.date,
+                    remaining: $0.point.remaining,
+                    source: $0.source
+                )
             }
-            return leftDistance < rightDistance
-        }.map {
-            UsageChartSelection(
-                series: $0.series,
-                date: $0.point.date,
-                remaining: $0.point.remaining
+    }
+
+    private static func candidates(
+        in chart: UsageChartSnapshot
+    ) -> [Candidate] {
+        chart.observed.map {
+            Candidate(
+                series: .observed,
+                point: $0,
+                priority: 0,
+                source: .account
+            )
+        } + chart.currentProjection.map {
+            Candidate(
+                series: .currentEstimate,
+                point: $0,
+                priority: 1,
+                source: .derivedEstimate
+            )
+        } + chart.historicalProjection.map {
+            Candidate(
+                series: .pastEstimate,
+                point: $0,
+                priority: 2,
+                source: .accountHistory
+            )
+        } + chart.estimatedBackfill.map {
+            Candidate(
+                series: .estimatedBackfill,
+                point: $0,
+                priority: 3,
+                source: .tokenEstimate
+            )
+        } + chart.target.map {
+            Candidate(
+                series: .target,
+                point: $0,
+                priority: 4,
+                source: .weeklyTarget
             )
         }
     }
@@ -298,25 +352,37 @@ struct UsageChartSelection: Equatable, Sendable {
         in chart: UsageChartSnapshot,
         within visibleRange: DateInterval
     ) -> UsageChartSelection? {
-        let points = chart.observed
-            .filter { visibleRange.contains($0.date) }
-            .sorted { $0.date < $1.date }
-        guard !points.isEmpty else { return nil }
+        let selections = candidates(in: chart)
+            .filter { visibleRange.contains($0.point.date) }
+            .sorted {
+                if $0.point.date == $1.point.date {
+                    return $0.priority < $1.priority
+                }
+                return $0.point.date < $1.point.date
+            }
+        guard !selections.isEmpty else { return nil }
         let nextIndex: Int
         if let current {
-            let currentIndex = points.enumerated().min {
-                abs($0.element.date.timeIntervalSince(current.date))
-                    < abs($1.element.date.timeIntervalSince(current.date))
+            let currentIndex = selections.firstIndex {
+                $0.series == current.series
+                    && $0.point.date == current.date
+            } ?? selections.enumerated().min {
+                abs($0.element.point.date.timeIntervalSince(current.date))
+                    < abs($1.element.point.date.timeIntervalSince(current.date))
             }?.offset ?? 0
-            nextIndex = min(max(currentIndex + offset, 0), points.count - 1)
+            nextIndex = min(
+                max(currentIndex + offset, 0),
+                selections.count - 1
+            )
         } else {
-            nextIndex = offset < 0 ? points.count - 1 : 0
+            nextIndex = offset < 0 ? selections.count - 1 : 0
         }
-        let point = points[nextIndex]
+        let selected = selections[nextIndex]
         return UsageChartSelection(
-            series: .observed,
-            date: point.date,
-            remaining: point.remaining
+            series: selected.series,
+            date: selected.point.date,
+            remaining: selected.point.remaining,
+            source: selected.source
         )
     }
 
@@ -324,6 +390,7 @@ struct UsageChartSelection: Equatable, Sendable {
         let series: UsageChartSeries
         let point: UsageChartPoint
         let priority: Int
+        let source: UsageChartPointSource
     }
 }
 
