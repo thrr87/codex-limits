@@ -356,10 +356,21 @@ actor LocalActivityCollector {
             }
         }
         let version = versions.sorted().first ?? "unknown"
-        let activeProjectionIDs = activeTaskIDs.reduce(
+        var activeProjectionIDs = activeTaskIDs.reduce(
             into: Set<String>()
         ) { result, taskID in
             result.formUnion(projectionChainIDs(for: taskID))
+        }
+        let activeRootIDs = Set(
+            activeTaskIDs.compactMap(projectionRootID)
+        )
+        for projection in currentProjections
+        where projectionRootID(for: projection.taskID).map(
+            activeRootIDs.contains
+        ) == true {
+            activeProjectionIDs.formUnion(
+                projectionChainIDs(for: projection.taskID)
+            )
         }
         let activeProjections = activeProjectionIDs.compactMap {
             projections[$0]
@@ -659,6 +670,18 @@ actor LocalActivityCollector {
             current = projection.parentTaskID
         }
         return current == nil
+    }
+
+    private func projectionRootID(for taskID: String) -> String? {
+        var visited = Set<String>()
+        var current: String? = taskID
+        var last: String?
+        while let task = current, visited.insert(task).inserted {
+            guard let projection = projections[task] else { return nil }
+            last = task
+            current = projection.parentTaskID
+        }
+        return current == nil ? last : nil
     }
 
     private struct ProjectionIdentity: Equatable {

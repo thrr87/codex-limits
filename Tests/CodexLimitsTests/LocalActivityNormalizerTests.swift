@@ -150,6 +150,43 @@ final class LocalActivityNormalizerTests: XCTestCase {
         )
     }
 
+    func testRequestedSettingDoesNotReplaceTheEffectiveTurnContext() throws {
+        let fixtureURL = Bundle.module.url(
+            forResource: "local-activity-historical",
+            withExtension: "jsonl",
+            subdirectory: "Fixtures"
+        )!
+        let fixtureText = try String(
+            contentsOf: fixtureURL,
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            fixtureText.contains(
+                #""thread_settings":{"model":"gpt-5.5","reasoning_effort":"medium"}"#
+            )
+        )
+        let observedAt = Date(timeIntervalSince1970: 1_785_000_000)
+        let tail = try IncrementalRolloutTailSource().read(
+            fileURL: fixtureURL,
+            cursor: nil,
+            observedAt: observedAt
+        )
+        let result = LocalActivityNormalizer().normalize(
+            records: tail.records,
+            sourceGeneration: tail.cursor.sourceGeneration,
+            observedAt: observedAt
+        )
+
+        XCTAssertEqual(
+            result.facts(.token).last?.context?.effectiveModel,
+            "gpt-5.6"
+        )
+        XCTAssertEqual(
+            result.facts(.token).last?.context?.reasoning,
+            "high"
+        )
+    }
+
     private func record(
         id: String,
         type: String,

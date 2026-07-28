@@ -477,6 +477,28 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertGreaterThan(batch.cursor.byteOffset, 0)
     }
 
+    func testCompleteMalformedLineIsSkippedWithoutLosingValidRecords() throws {
+        let fixture = try TemporaryRollout()
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task-root","cli_version":"0.145.0"}}"#
+                + "\n"
+                + "{not-json}\n"
+                + #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#
+                + "\n"
+        )
+
+        let batch = try IncrementalRolloutTailSource().read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+
+        XCTAssertEqual(batch.records.map(\.ordinal), [0, 1])
+        XCTAssertEqual(batch.unsupportedRecordCount, 1)
+        XCTAssertEqual(batch.records.last?.totalTokens, 100)
+        XCTAssertEqual(batch.cursor.lastOrdinal, 1)
+    }
+
     func testPartialLineIsEmittedOnceAfterItBecomesComplete() throws {
         let fixture = try TemporaryRollout()
         let firstLine =

@@ -688,6 +688,69 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
     }
 
+    func testCollectorPublishesObservedDescendantWithoutTokenActivity() async throws {
+        let fixture = try CollectorFixture()
+        let rootFile = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "root",
+            lines: [
+                fixture.session(threadID: "root", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let source = ReadOnlyThreadProjectionSource { request in
+            switch request {
+            case .list(cursor: nil, _, _, _):
+                return Data(#"""
+                {"result":{"data":[{
+                  "id":"root",
+                  "parentThreadId":null,
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":"\#(rootFile.path)",
+                  "createdAt":1785232800,
+                  "updatedAt":1785232920
+                },{
+                  "id":"quiet-child",
+                  "parentThreadId":"root",
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":null,
+                  "createdAt":1785232860,
+                  "updatedAt":1785232920
+                }],"nextCursor":null}}
+                """#.utf8)
+            default:
+                XCTFail("Unexpected projection request: \(request)")
+                return Data()
+            }
+        }
+        let interval = try fixture.interval()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: nil,
+            projectionSource: source
+        )
+
+        let result = await collector.refresh(interval: interval)
+        let receipt = UsageReceiptAggregator.evaluate(
+            facts: result.facts,
+            projections: result.projections,
+            interval: interval,
+            observation: result.observation
+        ).slice(in: interval, filters: .all).receipts.first
+
+        XCTAssertEqual(
+            result.projections.map(\.taskID),
+            ["quiet-child", "root"]
+        )
+        XCTAssertEqual(receipt?.taskTree.children.map(\.taskID), [
+            "quiet-child"
+        ])
+        XCTAssertEqual(receipt?.taskTree.children.first?.directTokens, 0)
+    }
+
     func testVersionFourStateRebuildsContextFromTheRollout() async throws {
         let fixture = try CollectorFixture()
         _ = try fixture.rollout(

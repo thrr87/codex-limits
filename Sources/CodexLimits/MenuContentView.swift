@@ -1837,11 +1837,16 @@ private struct FactsWorkspace: View {
             HStack {
                 Text("\(compactTokenCount(slice.totalTokens)) local tokens")
                 Spacer()
-                Text("\(slice.coverage.displayName) coverage")
+                Text("\(slice.receiptCoverage.displayName) coverage")
                     .foregroundStyle(.secondary)
             }
             .font(.caption)
             .accessibilityElement(children: .combine)
+            if let receiptReason = slice.receiptReason {
+                Text(receiptReason)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
 
             if slice.unattributedTokens > 0 {
                 Text(
@@ -1906,11 +1911,27 @@ private struct FactsWorkspace: View {
                     label: "Range",
                     value: receipt.intervalText
                 )
-                receiptBreakdown("Agents", values: receipt.agents)
-                receiptBreakdown("Turns", values: receipt.turns)
-                receiptBreakdown("Models", values: receipt.models)
-                receiptBreakdown(
-                    "Reasoning",
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Task Tree")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text(
+                        "Open a Task to see its agents and turns. Models are the effective settings recorded for each turn."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    UsageReceiptTaskTreeView(
+                        node: receipt.taskTree,
+                        isRoot: true
+                    )
+                }
+                UsageReceiptBreakdownView(
+                    title: "Models",
+                    values: receipt.models
+                )
+                UsageReceiptBreakdownView(
+                    title: "Reasoning",
                     values: receipt.reasoningLevels
                 )
                 FactRow(
@@ -1930,30 +1951,6 @@ private struct FactsWorkspace: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(receipt.accessibilityValue)
-        }
-    }
-
-    @ViewBuilder
-    private func receiptBreakdown(
-        _ label: String,
-        values: [UsageReceiptBreakdown]
-    ) -> some View {
-        if !values.isEmpty {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                ForEach(values) { value in
-                    HStack {
-                        Text(value.label)
-                        Spacer()
-                        Text(compactTokenCount(value.tokens))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .font(.caption)
-                }
-            }
         }
     }
 
@@ -2053,6 +2050,189 @@ private func compactTokenCount(_ value: Int64) -> String {
     value.formatted(
         .number.notation(.compactName).precision(.fractionLength(0 ... 1))
     )
+}
+
+private struct UsageReceiptTaskTreeView: View {
+    let node: UsageReceiptTaskNode
+    let isRoot: Bool
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                FactRow(
+                    label: "Direct Local Token Activity",
+                    value: compactTokenCount(node.directTokens),
+                    detail: sourceNames(node.tokenSources)
+                )
+                if node.unattributedTurnTokens > 0 {
+                    FactRow(
+                        label: "Not linked to a Turn",
+                        value: compactTokenCount(
+                            node.unattributedTurnTokens
+                        ),
+                        detail: "Turn metadata is missing"
+                    )
+                }
+                if let relationshipSource = node.relationshipSource {
+                    FactRow(
+                        label: "Task relationship",
+                        value: isRoot ? "Root" : "Observed",
+                        detail: sourceName(relationshipSource)
+                    )
+                }
+                if !node.turns.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Turns")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(node.turns) { turn in
+                            UsageReceiptTurnView(turn: turn)
+                        }
+                    }
+                }
+                if !node.children.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Agent Tasks")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(node.children) { child in
+                            UsageReceiptTaskTreeView(
+                                node: child,
+                                isRoot: false
+                            )
+                            .padding(.leading, 12)
+                        }
+                    }
+                }
+                FactRow(
+                    label: "Coverage",
+                    value: node.coverage.displayName,
+                    detail: node.reason
+                )
+            }
+            .padding(.leading, 6)
+            .padding(.top, 5)
+        } label: {
+            HStack(spacing: 7) {
+                Image(
+                    systemName: isRoot
+                        ? "text.bubble"
+                        : "person.crop.circle"
+                )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                    if !isRoot {
+                        Text("Task \(node.displayTaskID)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+                Text(compactTokenCount(node.subtreeTokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(node.accessibilityValue)
+            .accessibilityHint("Open to show turns and child Tasks")
+        }
+    }
+
+    private var title: String {
+        if isRoot {
+            return "Root Task \(node.displayTaskID)"
+        }
+        return node.agentLabel.map { "Agent \($0)" } ?? "Agent Task"
+    }
+
+}
+
+private struct UsageReceiptTurnView: View {
+    let turn: UsageReceiptTurn
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 6) {
+                FactRow(
+                    label: "Local Token Activity",
+                    value: compactTokenCount(turn.tokens),
+                    detail: sourceNames(turn.tokenSources)
+                )
+                UsageReceiptBreakdownView(
+                    title: "Effective model",
+                    values: turn.effectiveModels
+                )
+                UsageReceiptBreakdownView(
+                    title: "Reasoning",
+                    values: turn.reasoningLevels
+                )
+                FactRow(
+                    label: "Coverage",
+                    value: turn.coverage.displayName,
+                    detail: turn.reason
+                )
+            }
+            .padding(.leading, 6)
+            .padding(.top, 4)
+        } label: {
+            HStack {
+                Text("Turn \(turn.displayTurnID)")
+                Spacer()
+                Text(compactTokenCount(turn.tokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(turn.accessibilityValue)
+            .accessibilityHint("Open to show effective model and reasoning")
+        }
+    }
+
+}
+
+private struct UsageReceiptBreakdownView: View {
+    let title: String
+    let values: [UsageReceiptBreakdown]
+
+    var body: some View {
+        if !values.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                ForEach(values) { value in
+                    HStack {
+                        Text(value.label)
+                        Spacer()
+                        Text(compactTokenCount(value.tokens))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                }
+            }
+        }
+    }
+}
+
+private func sourceName(_ source: LocalActivitySourceKind) -> String {
+    switch source {
+    case .appServerThreadList:
+        return "Codex Task list"
+    case .rolloutJSONL:
+        return "Codex local records"
+    }
+}
+
+private func sourceNames(
+    _ sources: [LocalActivitySourceKind]
+) -> String? {
+    guard !sources.isEmpty else { return nil }
+    return sources.map(sourceName).joined(separator: " · ")
 }
 
 private struct InsightsWorkspace: View {

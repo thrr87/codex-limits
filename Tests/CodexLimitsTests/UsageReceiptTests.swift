@@ -104,6 +104,11 @@ final class UsageReceiptTests: XCTestCase {
         XCTAssertEqual(slice.totalTokens, 200)
         XCTAssertEqual(slice.unattributedTokens, 0)
         XCTAssertEqual(slice.coverage, .high)
+        XCTAssertEqual(slice.receiptCoverage, .partial)
+        XCTAssertEqual(
+            slice.receiptReason,
+            "Task Tree may omit Review and Guardian Tasks"
+        )
         XCTAssertEqual(slice.receipts.map(\.projectLabel), ["atlas", "atlas"])
         XCTAssertEqual(slice.receipts.map(\.rootTaskID), ["root-1", "root-2"])
         XCTAssertEqual(slice.receipts.map(\.tokens), [140, 60])
@@ -314,13 +319,310 @@ final class UsageReceiptTests: XCTestCase {
 
         let receipt = try XCTUnwrap(slice.receipts.first)
         XCTAssertEqual(receipt.taskCount, 2)
-        XCTAssertEqual(receipt.agents.map(\.label), ["default", "Luna"])
-        XCTAssertEqual(receipt.agents.map(\.tokens), [70, 30])
-        XCTAssertEqual(receipt.turns.map(\.label), ["turn-root", "turn-child"])
+        XCTAssertEqual(receipt.taskTree.directTokens, 70)
+        XCTAssertEqual(receipt.taskTree.children.first?.agentLabel, "Luna")
+        XCTAssertEqual(receipt.taskTree.children.first?.directTokens, 30)
+        XCTAssertEqual(
+            receipt.taskTree.turns.map(\.turnID),
+            ["turn-root"]
+        )
+        XCTAssertEqual(
+            receipt.taskTree.children.first?.turns.map(\.turnID),
+            ["turn-child"]
+        )
         XCTAssertTrue(receipt.accessibilityValue.contains("Project atlas"))
         XCTAssertTrue(receipt.accessibilityValue.contains("100 local tokens"))
         XCTAssertTrue(receipt.accessibilityValue.contains("2 tasks in the tree"))
-        XCTAssertTrue(receipt.accessibilityValue.contains("High coverage"))
+        XCTAssertTrue(receipt.accessibilityValue.contains("Partial coverage"))
+    }
+
+    func testTaskTreeKeepsNestedAgentsAndCountsEachTokenDeltaOnce() throws {
+        let interval = testInterval()
+        let slice = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "root-turn",
+                    date: interval.start.addingTimeInterval(50),
+                    tokens: 60,
+                    taskID: "root",
+                    model: "gpt-5.6-sol",
+                    reasoning: "high",
+                    turnID: "turn-root"
+                ),
+                tokenFact(
+                    eventID: "child-turn",
+                    date: interval.start.addingTimeInterval(100),
+                    tokens: 30,
+                    taskID: "child",
+                    model: "gpt-5.6-luna",
+                    reasoning: "medium",
+                    turnID: "turn-child",
+                    agent: LocalAgentIdentity(
+                        nickname: "Luna",
+                        role: "worker"
+                    )
+                ),
+                tokenFact(
+                    eventID: "grandchild-turn",
+                    date: interval.start.addingTimeInterval(150),
+                    tokens: 10,
+                    taskID: "grandchild",
+                    model: "gpt-5.6-sol",
+                    reasoning: "high",
+                    turnID: "turn-grandchild",
+                    agent: LocalAgentIdentity(
+                        nickname: "Fermat",
+                        role: "reviewer"
+                    )
+                )
+            ],
+            projections: [
+                projection(taskID: "root", project: "atlas"),
+                projection(
+                    taskID: "child",
+                    parentTaskID: "root",
+                    project: "atlas"
+                ),
+                projection(
+                    taskID: "grandchild",
+                    parentTaskID: "child",
+                    project: "atlas"
+                )
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        ).slice(in: interval, filters: .all)
+
+        let receipt = try XCTUnwrap(slice.receipts.first)
+        let root = receipt.taskTree
+        let child = try XCTUnwrap(root.children.first)
+        let grandchild = try XCTUnwrap(child.children.first)
+
+        XCTAssertEqual(receipt.tokens, 100)
+        XCTAssertEqual(root.taskID, "root")
+        XCTAssertEqual(root.directTokens, 60)
+        XCTAssertEqual(root.subtreeTokens, 100)
+        XCTAssertEqual(child.taskID, "child")
+        XCTAssertEqual(child.agentLabel, "Luna")
+        XCTAssertEqual(child.directTokens, 30)
+        XCTAssertEqual(child.subtreeTokens, 40)
+        XCTAssertEqual(grandchild.taskID, "grandchild")
+        XCTAssertEqual(grandchild.agentLabel, "Fermat")
+        XCTAssertEqual(grandchild.directTokens, 10)
+        XCTAssertEqual(grandchild.subtreeTokens, 10)
+        XCTAssertEqual(
+            root.directTokens + child.directTokens + grandchild.directTokens,
+            receipt.tokens
+        )
+        XCTAssertEqual(root.taskCount, receipt.taskCount)
+    }
+
+    func testTaskTreeKeepsSiblingAgentsAndTurnsUnderTheirOwningTask() throws {
+        let interval = testInterval()
+        let slice = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "left-first",
+                    date: interval.start.addingTimeInterval(50),
+                    tokens: 20,
+                    taskID: "left",
+                    model: "gpt-5.6-luna",
+                    reasoning: "medium",
+                    turnID: "turn-left",
+                    agent: LocalAgentIdentity(
+                        nickname: "Luna",
+                        role: "worker"
+                    )
+                ),
+                tokenFact(
+                    eventID: "left-second",
+                    date: interval.start.addingTimeInterval(75),
+                    tokens: 5,
+                    taskID: "left",
+                    model: "gpt-5.6-luna",
+                    reasoning: "medium",
+                    turnID: "turn-left",
+                    agent: LocalAgentIdentity(
+                        nickname: "Luna",
+                        role: "worker"
+                    )
+                ),
+                tokenFact(
+                    eventID: "right",
+                    date: interval.start.addingTimeInterval(100),
+                    tokens: 15,
+                    taskID: "right",
+                    model: "gpt-5.6-sol",
+                    reasoning: "high",
+                    turnID: "turn-right",
+                    agent: LocalAgentIdentity(
+                        nickname: nil,
+                        role: "reviewer"
+                    )
+                )
+            ],
+            projections: [
+                projection(taskID: "root", project: "atlas"),
+                projection(
+                    taskID: "left",
+                    parentTaskID: "root",
+                    project: "atlas"
+                ),
+                projection(
+                    taskID: "right",
+                    parentTaskID: "root",
+                    project: "atlas"
+                )
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        ).slice(in: interval, filters: .all)
+
+        let root = try XCTUnwrap(slice.receipts.first?.taskTree)
+        XCTAssertEqual(root.children.map(\.taskID), ["left", "right"])
+        XCTAssertEqual(root.children.map(\.directTokens), [25, 15])
+        XCTAssertEqual(root.children[0].turns.map(\.turnID), ["turn-left"])
+        XCTAssertEqual(root.children[0].turns.map(\.tokens), [25])
+        XCTAssertEqual(
+            root.children[0].turns.first?.effectiveModels,
+            [UsageReceiptBreakdown(label: "gpt-5.6-luna", tokens: 25)]
+        )
+        XCTAssertEqual(
+            root.children[1].turns.first?.reasoningLevels,
+            [UsageReceiptBreakdown(label: "high", tokens: 15)]
+        )
+    }
+
+    func testTaskTreeIncludesAnObservedDescendantWithoutTokenActivity() throws {
+        let interval = testInterval()
+        let slice = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "root",
+                    date: interval.start.addingTimeInterval(50),
+                    tokens: 20,
+                    taskID: "root",
+                    turnID: "turn-root"
+                )
+            ],
+            projections: [
+                projection(taskID: "root", project: "atlas"),
+                projection(
+                    taskID: "quiet-agent",
+                    parentTaskID: "root",
+                    project: "atlas"
+                )
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        ).slice(in: interval, filters: .all)
+
+        let receipt = try XCTUnwrap(slice.receipts.first)
+        let quietAgent = try XCTUnwrap(receipt.taskTree.children.first)
+        XCTAssertEqual(receipt.taskCount, 2)
+        XCTAssertEqual(quietAgent.taskID, "quiet-agent")
+        XCTAssertEqual(quietAgent.directTokens, 0)
+        XCTAssertEqual(quietAgent.subtreeTokens, 0)
+        XCTAssertTrue(quietAgent.turns.isEmpty)
+        XCTAssertEqual(receipt.taskTree.subtreeTokens, receipt.tokens)
+    }
+
+    func testTaskAndTurnEvidenceNamesObservedSourcesAndCoverage() throws {
+        let interval = testInterval()
+        let slice = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "turn",
+                    date: interval.start.addingTimeInterval(50),
+                    tokens: 20,
+                    taskID: "child",
+                    model: "gpt-5.6-sol",
+                    reasoning: "high",
+                    turnID: "turn-child"
+                )
+            ],
+            projections: [
+                projection(taskID: "root", project: "atlas"),
+                projection(
+                    taskID: "child",
+                    parentTaskID: "root",
+                    project: "atlas"
+                )
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        ).slice(in: interval, filters: .all)
+
+        let child = try XCTUnwrap(
+            slice.receipts.first?.taskTree.children.first
+        )
+        let turn = try XCTUnwrap(child.turns.first)
+        XCTAssertEqual(child.relationshipSource, .appServerThreadList)
+        XCTAssertEqual(child.tokenSources, [.rolloutJSONL])
+        XCTAssertEqual(child.coverage, .partial)
+        XCTAssertEqual(turn.tokenSources, [.rolloutJSONL])
+        XCTAssertEqual(turn.effectiveModel, "gpt-5.6-sol")
+        XCTAssertEqual(turn.reasoning, "high")
+        XCTAssertEqual(turn.coverage, .partial)
+    }
+
+    func testMissingTurnAndWorkloadMetadataStayVisibleAndReconcile() throws {
+        let interval = testInterval()
+        let slice = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "no-turn",
+                    date: interval.start.addingTimeInterval(50),
+                    tokens: 20,
+                    taskID: "root"
+                ),
+                tokenFact(
+                    eventID: "turn-without-workload",
+                    date: interval.start.addingTimeInterval(100),
+                    tokens: 30,
+                    taskID: "child",
+                    turnID: "turn-child"
+                )
+            ],
+            projections: [
+                projection(taskID: "root", project: "atlas"),
+                projection(
+                    taskID: "child",
+                    parentTaskID: "root",
+                    project: "atlas"
+                )
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        ).slice(in: interval, filters: .all)
+
+        let receipt = try XCTUnwrap(slice.receipts.first)
+        let root = receipt.taskTree
+        let child = try XCTUnwrap(root.children.first)
+        let turn = try XCTUnwrap(child.turns.first)
+
+        XCTAssertEqual(root.unattributedTurnTokens, 20)
+        XCTAssertEqual(
+            root.turns.reduce(0) { $0 + $1.tokens }
+                + root.unattributedTurnTokens,
+            root.directTokens
+        )
+        XCTAssertEqual(root.coverage, .partial)
+        XCTAssertEqual(
+            root.reason,
+            "Some local token activity has no Turn metadata"
+        )
+        XCTAssertEqual(turn.coverage, .partial)
+        XCTAssertEqual(
+            turn.reason,
+            "Effective model metadata is missing"
+        )
+        XCTAssertEqual(
+            child.turns.reduce(0) { $0 + $1.tokens }
+                + child.unattributedTurnTokens,
+            child.directTokens
+        )
+        XCTAssertEqual(root.subtreeTokens, receipt.tokens)
     }
 
     func testSourceGapLowersEveryReceiptCoverage() {
@@ -458,7 +760,7 @@ final class UsageReceiptTests: XCTestCase {
         )
         XCTAssertEqual(
             slice.receipts.first { $0.rootTaskID == "root-b" }?.coverage,
-            .high
+            .partial
         )
     }
 
@@ -681,7 +983,14 @@ final class UsageReceiptTests: XCTestCase {
             rolloutFileURL: nil,
             createdAt: nil,
             updatedAt: nil,
-            source: source(observedAt: .distantPast)
+            source: LocalActivitySourceMetadata(
+                source: .appServerThreadList,
+                sourceVersion: "0.145.0",
+                schemaVersion: "app-server-v2",
+                sourceGeneration: 0,
+                historyMode: nil,
+                observedAt: .distantPast
+            )
         )
     }
 
