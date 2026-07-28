@@ -56,6 +56,14 @@ struct LocalTurnTiming: Codable, Equatable, Sendable {
     let timeToFirstTokenMilliseconds: Int64?
 }
 
+struct LocalActivityContext: Codable, Equatable, Sendable {
+    let taskID: String?
+    let turnID: String?
+    let agent: LocalAgentIdentity?
+    let effectiveModel: String?
+    let reasoning: String?
+}
+
 struct LocalActivityFact: Codable, Equatable, Sendable {
     let key: LocalActivityFactKey
     let availability: LocalActivityAvailability
@@ -66,6 +74,7 @@ struct LocalActivityFact: Codable, Equatable, Sendable {
     let eventID: String?
     let eventTimestamp: String?
     let source: LocalActivitySourceMetadata
+    var context: LocalActivityContext? = nil
 }
 
 struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
@@ -74,6 +83,7 @@ struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
     var historyMode: String?
     var lastTotalTokens: Int64?
     var tokenSegment: UInt64
+    var context: LocalActivityContext? = nil
 }
 
 struct LocalActivityNormalizationResult: Equatable, Sendable {
@@ -102,7 +112,8 @@ struct LocalActivityNormalizer {
             sourceVersion: "unknown",
             historyMode: nil,
             lastTotalTokens: nil,
-            tokenSegment: 0
+            tokenSegment: 0,
+            context: nil
         )
         let observedVersion = records.lazy.compactMap(\.cliVersion).first
         let sourceChanged = previousState.map {
@@ -114,6 +125,7 @@ struct LocalActivityNormalizer {
         if sourceChanged {
             state.lastTotalTokens = nil
             state.tokenSegment += 1
+            state.context = nil
         }
         state.sourceGeneration = sourceGeneration
         if let observedVersion {
@@ -131,8 +143,40 @@ struct LocalActivityNormalizer {
             observedAt: observedAt
         )
         var facts = unavailableFacts(source: source)
+        var currentTaskID = state.context?.taskID
+        var currentTurnID = state.context?.turnID
+        var currentAgent = state.context?.agent
+        var currentModel = state.context?.effectiveModel
+        var currentReasoning = state.context?.reasoning
 
         for record in records {
+            if let taskID = record.threadID {
+                currentTaskID = taskID
+            }
+            if let turnID = record.turnID {
+                currentTurnID = turnID
+            }
+            if record.agentNickname != nil || record.agentRole != nil {
+                currentAgent = LocalAgentIdentity(
+                    nickname: record.agentNickname,
+                    role: record.agentRole
+                )
+            }
+            if let model = record.model {
+                currentModel = model
+            }
+            if let reasoning = record.reasoning {
+                currentReasoning = reasoning
+            }
+            let context = LocalActivityContext(
+                taskID: currentTaskID,
+                turnID: currentTurnID,
+                agent: currentAgent,
+                effectiveModel: currentModel,
+                reasoning: currentReasoning
+            )
+            state.context = context
+
             if record.type == "session_meta", let threadID = record.threadID {
                 facts.append(
                     available(
@@ -242,7 +286,8 @@ struct LocalActivityNormalizer {
                         reason: reason,
                         eventID: record.eventID,
                         eventTimestamp: record.timestamp,
-                        source: source
+                        source: source,
+                        context: context
                     )
                 )
                 state.lastTotalTokens = totalTokens
@@ -288,7 +333,8 @@ struct LocalActivityNormalizer {
                         reason: "durable-tool-events-are-incomplete",
                         eventID: record.eventID,
                         eventTimestamp: record.timestamp,
-                        source: source
+                        source: source,
+                        context: context
                     )
                 )
             }

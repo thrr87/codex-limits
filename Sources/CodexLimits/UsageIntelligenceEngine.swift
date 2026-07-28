@@ -414,6 +414,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let bankedResets: BankedResetSummary?
     let accountTokenActivity: AccountTokenActivitySnapshot
     let localTokenActivity: LocalTokenActivitySnapshot
+    let usageReceipts: UsageReceiptSnapshot
     let localTaskProjections: [ThreadProjection]
 
     var fetchedAt: Date? { account?.fetchedAt }
@@ -592,6 +593,12 @@ enum UsageIntelligenceEngine {
                 interval: DateInterval(start: input.now, end: input.now)
             )
         }
+        let usageReceipts = UsageReceiptAggregator.evaluate(
+            facts: input.localActivityFacts,
+            projections: input.localTaskProjections,
+            interval: localTokenActivity.interval,
+            observation: input.localActivityObservation
+        )
         return UsageReaderSnapshot(
             account: input.account,
             accountSource: .account,
@@ -620,6 +627,7 @@ enum UsageIntelligenceEngine {
             ),
             accountTokenActivity: accountTokenActivity,
             localTokenActivity: localTokenActivity,
+            usageReceipts: usageReceipts,
             localTaskProjections: input.localTaskProjections
         )
     }

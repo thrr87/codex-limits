@@ -223,6 +223,7 @@ struct AnalyticsWorkspaceBody: View {
         case .facts:
             FactsWorkspace(
                 reader: reader,
+                store: store,
                 resetReminderState: resetReminderState,
                 setResetReminderEnabled: setResetReminderEnabled,
                 setResetReminderLeadTime: setResetReminderLeadTime
@@ -497,14 +498,8 @@ private struct GraphsWorkspace: View {
                 .foregroundStyle(.secondary)
                 .help("Project, Task Tree, model, and reasoning filters do not change Usage remaining.")
                 .accessibilityLabel("Account scope")
-        } else if store.state.graph == .tokenActivity {
-            Label("All local activity", systemImage: "laptopcomputer")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("This total includes all supported local activity.")
-                .accessibilityLabel("All local activity")
         } else {
-            WorkspaceFilterMenu(store: store)
+            WorkspaceFilterMenu(reader: reader, store: store)
         }
     }
 
@@ -587,7 +582,19 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var localSlice: LocalTokenActivitySlice {
-        reader.localTokenActivity.slice(in: visibleRange)
+        guard !store.state.filters.isEmpty else {
+            return reader.localTokenActivity.slice(in: visibleRange)
+        }
+        let receipts = reader.usageReceipts.slice(
+            in: visibleRange,
+            filters: store.state.filters
+        )
+        return LocalTokenActivitySlice(
+            tokens: receipts.totalTokens,
+            points: receipts.points,
+            coverage: receipts.coverage,
+            reason: receipts.reason
+        )
     }
 
     private var accountCoversVisibleRange: Bool {
@@ -1060,17 +1067,65 @@ private struct TokenSourceCard: View {
 }
 
 private struct WorkspaceFilterMenu: View {
+    let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+
+    private var range: DateInterval {
+        let bounds = reader.usageReceipts.interval
+        return store.effectiveRange(
+            within: bounds,
+            endingAt: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
+        )
+    }
+
+    private var options: UsageReceiptFilterOptions {
+        reader.usageReceipts.filterOptions(in: range)
+    }
 
     var body: some View {
         Menu {
-            if store.state.filters.isEmpty {
-                Text("All local activity")
-            } else {
-                filterValue("Project", store.state.filters.projectID)
-                filterValue("Task Tree", store.state.filters.taskTreeID)
-                filterValue("Model", store.state.filters.model)
-                filterValue("Reasoning", store.state.filters.reasoning)
+            Picker(
+                "Project",
+                selection: filterBinding(\.projectID)
+            ) {
+                Text("All Projects").tag(nil as String?)
+                ForEach(options.projects, id: \.self) { project in
+                    Text(project).tag(Optional(project))
+                }
+            }
+            Picker(
+                "Task Tree",
+                selection: filterBinding(\.taskTreeID)
+            ) {
+                Text("All Task Trees").tag(nil as String?)
+                ForEach(options.taskTrees, id: \.self) { task in
+                    Text("Task \(String(task.prefix(8)))")
+                        .tag(Optional(task))
+                }
+            }
+            Picker(
+                "Model",
+                selection: filterBinding(\.model)
+            ) {
+                Text("All Models").tag(nil as String?)
+                ForEach(options.models, id: \.self) { model in
+                    Text(model).tag(Optional(model))
+                }
+            }
+            Picker(
+                "Reasoning",
+                selection: filterBinding(\.reasoning)
+            ) {
+                Text("All Reasoning Levels").tag(nil as String?)
+                ForEach(options.reasoningLevels, id: \.self) { reasoning in
+                    Text(reasoning.capitalized)
+                        .tag(Optional(reasoning))
+                }
+            }
+            if !store.state.filters.isEmpty {
                 Divider()
                 Button("Clear filters") {
                     store.updateFilters(.all)
@@ -1085,11 +1140,17 @@ private struct WorkspaceFilterMenu: View {
         .accessibilityLabel("Local activity filters")
     }
 
-    @ViewBuilder
-    private func filterValue(_ label: String, _ value: String?) -> some View {
-        if let value {
-            Text("\(label): \(value)")
-        }
+    private func filterBinding(
+        _ keyPath: WritableKeyPath<WorkspaceFilters, String?>
+    ) -> Binding<String?> {
+        Binding(
+            get: { store.state.filters[keyPath: keyPath] },
+            set: { value in
+                var filters = store.state.filters
+                filters[keyPath: keyPath] = value
+                store.updateFilters(filters)
+            }
+        )
     }
 }
 
@@ -1630,6 +1691,7 @@ private struct ChartLegendItem: View {
 
 private struct FactsWorkspace: View {
     let reader: UsageReaderSnapshot
+    @ObservedObject var store: AnalyticsWorkspaceStore
     let resetReminderState: ResetReminderState
     let setResetReminderEnabled: (Bool) -> Void
     let setResetReminderLeadTime: (ResetReminderLeadTime) -> Void
@@ -1757,8 +1819,140 @@ private struct FactsWorkspace: View {
             }
 
             WorkspaceCard(title: "Usage Receipts") {
-                Text("No Usage Receipts are available.")
+                receiptContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var receiptContent: some View {
+        let slice = reader.usageReceipts.slice(
+            in: receiptRange,
+            filters: store.state.filters
+        )
+        if slice.receipts.isEmpty {
+            Text(slice.reason ?? "No Usage Receipts are available.")
+                .foregroundStyle(.secondary)
+        } else {
+            HStack {
+                Text("\(compactTokenCount(slice.totalTokens)) local tokens")
+                Spacer()
+                Text("\(slice.coverage.displayName) coverage")
                     .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .accessibilityElement(children: .combine)
+
+            if slice.unattributedTokens > 0 {
+                Text(
+                    "\(compactTokenCount(slice.unattributedTokens)) local tokens could not be matched to a Task."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            ForEach(receiptProjects(in: slice), id: \.self) { project in
+                DisclosureGroup {
+                    ForEach(
+                        slice.receipts.filter {
+                            $0.projectLabel == project
+                        }
+                    ) { receipt in
+                        receiptDisclosure(receipt)
+                    }
+                } label: {
+                    Label(
+                        project ?? "Project unavailable",
+                        systemImage: "folder"
+                    )
+                    .font(.headline)
+                }
+            }
+        }
+    }
+
+    private var receiptRange: DateInterval {
+        let bounds = reader.usageReceipts.interval
+        return store.effectiveRange(
+            within: bounds,
+            endingAt: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
+        )
+    }
+
+    private func receiptProjects(
+        in slice: UsageReceiptSlice
+    ) -> [String?] {
+        Array(Set(slice.receipts.map(\.projectLabel))).sorted {
+            ($0 ?? "") < ($1 ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private func receiptDisclosure(_ receipt: UsageReceipt) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                FactRow(
+                    label: "Local Token Activity",
+                    value: compactTokenCount(receipt.tokens)
+                )
+                FactRow(
+                    label: "Task Tree",
+                    value: "\(receipt.taskCount) \(receipt.taskCount == 1 ? "Task" : "Tasks")"
+                )
+                FactRow(
+                    label: "Range",
+                    value: receipt.intervalText
+                )
+                receiptBreakdown("Agents", values: receipt.agents)
+                receiptBreakdown("Turns", values: receipt.turns)
+                receiptBreakdown("Models", values: receipt.models)
+                receiptBreakdown(
+                    "Reasoning",
+                    values: receipt.reasoningLevels
+                )
+                FactRow(
+                    label: "Coverage",
+                    value: receipt.coverage.displayName,
+                    detail: receipt.reason
+                )
+            }
+            .padding(.leading, 4)
+        } label: {
+            HStack {
+                Text("Task \(receipt.displayTaskID)")
+                Spacer()
+                Text(compactTokenCount(receipt.tokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(receipt.accessibilityValue)
+        }
+    }
+
+    @ViewBuilder
+    private func receiptBreakdown(
+        _ label: String,
+        values: [UsageReceiptBreakdown]
+    ) -> some View {
+        if !values.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(values) { value in
+                    HStack {
+                        Text(value.label)
+                        Spacer()
+                        Text(compactTokenCount(value.tokens))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                }
             }
         }
     }

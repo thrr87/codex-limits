@@ -273,8 +273,8 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
                     agentRole: payload.agentRole,
                     agentNickname: payload.agentNickname,
                     turnID: turnID,
-                    model: payload.model ?? payload.threadSettings?.model,
-                    reasoning: payload.effort ?? payload.threadSettings?.reasoningEffort,
+                    model: payload.model,
+                    reasoning: payload.effort,
                     tokenUsage: tokenUsage,
                     startedAt: payload.startedAt,
                     completedAt: payload.completedAt,
@@ -442,11 +442,7 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
             integerString(tokenUsage?.reasoningOutputTokens),
             integerString(tokenUsage?.totalTokens)
         ])
-        components.append(contentsOf: [
-            payload.item?.type ?? "none",
-            payload.threadSettings?.model ?? "none",
-            payload.threadSettings?.reasoningEffort ?? "none"
-        ])
+        components.append(payload.item?.type ?? "none")
         return components.joined(separator: "|")
     }
 
@@ -536,7 +532,6 @@ private struct RolloutWire: Decodable {
         let timeToFirstTokenMs: Int64?
         let info: TokenInfo?
         let item: CompletedItem?
-        let threadSettings: ThreadSettings?
     }
 
     struct TokenInfo: Decodable {
@@ -554,10 +549,5 @@ private struct RolloutWire: Decodable {
 
     struct CompletedItem: Decodable {
         let type: String?
-    }
-
-    struct ThreadSettings: Decodable {
-        let model: String?
-        let reasoningEffort: String?
     }
 }

@@ -50,6 +50,7 @@ actor LocalActivityCollector {
         var activityEnd: Date?
         var discontinuityAt: Date?
         var factsLoaded: Bool
+        var requiresContextRebuild: Bool
     }
 
     private struct PersistedFile: Codable {
@@ -60,6 +61,8 @@ actor LocalActivityCollector {
         let activityStart: Date?
         let activityEnd: Date?
         let discontinuityAt: Date?
+        let projection: ThreadProjection?
+        let ancestorProjections: [ThreadProjection]?
     }
 
     private struct FactWrite {
@@ -168,6 +171,7 @@ actor LocalActivityCollector {
             )
         }
 
+        let projectionsBeforeRefresh = projections
         let listSucceeded = await refreshProjectionList(
             generation: refreshGeneration
         )
@@ -204,9 +208,13 @@ actor LocalActivityCollector {
             }
             do {
                 let previous = files[path]
+                let requiresContextRebuild =
+                    previous?.requiresContextRebuild == true
                 let batch = try tail.read(
                     fileURL: file,
-                    cursor: previous?.cursor,
+                    cursor: requiresContextRebuild
+                        ? nil
+                        : previous?.cursor,
                     observedAt: observedAt
                 )
                 bytesRead += batch.bytesRead
@@ -216,7 +224,8 @@ actor LocalActivityCollector {
                 }
                 if batch.records.isEmpty,
                    !batch.requiresRebuild,
-                   previous != nil {
+                   previous != nil,
+                   !requiresContextRebuild {
                     if previous?.cursor != batch.cursor {
                         files[path]?.cursor = batch.cursor
                         changedPaths.insert(path)
@@ -228,10 +237,13 @@ actor LocalActivityCollector {
                     sourceGeneration: batch.cursor.sourceGeneration,
                     observedAt: observedAt,
                     previousState: batch.requiresRebuild
+                        || requiresContextRebuild
                         ? nil
                         : previous?.normalization
                 )
-                let rewritesFacts = batch.requiresRebuild || previous == nil
+                let rewritesFacts = batch.requiresRebuild
+                    || requiresContextRebuild
+                    || previous == nil
                 let newFacts: [LocalActivityFact]
                 if rewritesFacts {
                     newFacts = factsAfterHistoryCutoff(normalized.facts)
@@ -248,7 +260,9 @@ actor LocalActivityCollector {
                     ? newFacts
                     : (previous?.facts ?? []) + newFacts
                 let activityBounds = tokenActivityBounds(combinedFacts)
-                let discontinuityAt = batch.requiresRebuild && previous != nil
+                let discontinuityAt = batch.requiresRebuild
+                    && previous != nil
+                    && !requiresContextRebuild
                     ? observedAt
                     : previous?.discontinuityAt
                 files[path] = FileState(
@@ -259,7 +273,8 @@ actor LocalActivityCollector {
                     activityStart: activityBounds?.start,
                     activityEnd: activityBounds?.end,
                     discontinuityAt: discontinuityAt,
-                    factsLoaded: true
+                    factsLoaded: true,
+                    requiresContextRebuild: false
                 )
                 changedPaths.insert(path)
                 scheduleFactWrite(
@@ -284,12 +299,21 @@ actor LocalActivityCollector {
         }
         let facts = activeStates.flatMap(\.facts)
         let activeTaskIDs = taskIDs(in: activeStates)
+        let projectionChainsBefore = projectionChainIdentities(
+            for: activeTaskIDs,
+            using: projectionsBeforeRefresh
+        )
         if await completeProjections(
             for: activeTaskIDs,
             listSucceeded: listSucceeded,
             generation: refreshGeneration
         ) == false {
             gapReason = gapReason ?? "Local task metadata is incomplete"
+        }
+        if projectionChainsBefore != projectionChainIdentities(
+            for: activeTaskIDs
+        ) {
+            markFilesChanged(for: activeTaskIDs)
         }
         guard refreshGeneration == stateGeneration else {
             return .unavailable("Account changed during local activity read")
@@ -332,7 +356,12 @@ actor LocalActivityCollector {
             }
         }
         let version = versions.sorted().first ?? "unknown"
-        let activeProjections = activeTaskIDs.compactMap {
+        let activeProjectionIDs = activeTaskIDs.reduce(
+            into: Set<String>()
+        ) { result, taskID in
+            result.formUnion(projectionChainIDs(for: taskID))
+        }
+        let activeProjections = activeProjectionIDs.compactMap {
             projections[$0]
         }.sorted {
             $0.taskID < $1.taskID
@@ -501,17 +530,7 @@ actor LocalActivityCollector {
     }
 
     private func taskIDs(in states: [FileState]) -> Set<String> {
-        Set(states.compactMap { state in
-            state.facts.compactMap { fact in
-                guard fact.key == .task,
-                      fact.availability == .available,
-                      case let .identifier(taskID) = fact.value else {
-                    return nil
-                }
-                return taskID
-            }
-            .last
-        })
+        Set(states.compactMap(taskID(in:)))
     }
 
     private func refreshProjectionList(generation: UInt64) async -> Bool? {
@@ -574,26 +593,122 @@ actor LocalActivityCollector {
         guard let projectionSource else { return true }
         guard !taskIDs.isEmpty else { return true }
         var failed = false
-        for taskID in taskIDs
-            .filter({ listSucceeded != true || projections[$0] == nil })
-            .sorted()
-            .prefix(10) {
-            do {
-                if let projection = try await projectionSource.read(
-                    threadID: taskID
-                ) {
-                    guard generation == stateGeneration else { return false }
-                    projections[taskID] = projection
-                } else {
+        var pending = taskIDs.sorted()
+        var inspected = Set<String>()
+        var reads = 0
+        while let taskID = pending.first {
+            pending.removeFirst()
+            guard inspected.insert(taskID).inserted else { continue }
+            let mustRead = projections[taskID] == nil
+                || (taskIDs.contains(taskID) && listSucceeded != true)
+            if mustRead {
+                guard reads < 20 else {
+                    failed = true
+                    break
+                }
+                reads += 1
+                do {
+                    if let projection = try await projectionSource.read(
+                        threadID: taskID
+                    ) {
+                        guard generation == stateGeneration else {
+                            return false
+                        }
+                        projections[taskID] = projection
+                    } else {
+                        failed = true
+                    }
+                } catch {
                     failed = true
                 }
-            } catch {
+            }
+            guard let projection = projections[taskID] else {
                 failed = true
+                continue
+            }
+            if let parentTaskID = projection.parentTaskID {
+                pending.append(parentTaskID)
             }
         }
-        return !failed
-            && taskIDs.allSatisfy { projections[$0] != nil }
-            && (listSucceeded == true || taskIDs.count <= 10)
+        return !failed && taskIDs.allSatisfy {
+            projectionChainIsComplete(for: $0)
+        }
+    }
+
+    private func projectionChainIDs(for taskID: String) -> Set<String> {
+        projectionChainIDs(for: taskID, using: projections)
+    }
+
+    private func projectionChainIDs(
+        for taskID: String,
+        using projections: [String: ThreadProjection]
+    ) -> Set<String> {
+        var result = Set<String>()
+        var current: String? = taskID
+        while let task = current, result.insert(task).inserted {
+            current = projections[task]?.parentTaskID
+        }
+        return result
+    }
+
+    private func projectionChainIsComplete(for taskID: String) -> Bool {
+        var visited = Set<String>()
+        var current: String? = taskID
+        while let task = current, visited.insert(task).inserted {
+            guard let projection = projections[task] else { return false }
+            current = projection.parentTaskID
+        }
+        return current == nil
+    }
+
+    private struct ProjectionIdentity: Equatable {
+        let taskID: String
+        let parentTaskID: String?
+        let projectLabel: String?
+        let createdAt: Date?
+        let updatedAt: Date?
+    }
+
+    private func projectionChainIdentities(
+        for taskIDs: Set<String>,
+        using projections: [String: ThreadProjection]? = nil
+    ) -> [String: [ProjectionIdentity]] {
+        let source = projections ?? self.projections
+        return taskIDs.reduce(into: [:]) { result, taskID in
+            result[taskID] = projectionChainIDs(
+                for: taskID,
+                using: source
+            )
+                .compactMap { source[$0] }
+                .map {
+                    ProjectionIdentity(
+                        taskID: $0.taskID,
+                        parentTaskID: $0.parentTaskID,
+                        projectLabel: $0.projectLabel,
+                        createdAt: $0.createdAt,
+                        updatedAt: $0.updatedAt
+                    )
+                }
+                .sorted { $0.taskID < $1.taskID }
+        }
+    }
+
+    private func markFilesChanged(for taskIDs: Set<String>) {
+        for (path, state) in files
+        where taskID(in: state).map(taskIDs.contains) == true {
+            changedPaths.insert(path)
+        }
+    }
+
+    private func taskID(in state: FileState) -> String? {
+        state.facts.compactMap { fact in
+            guard fact.key == .task,
+                  fact.availability == .available,
+                  case let .identifier(taskID) = fact.value else {
+                return nil
+            }
+            return taskID
+        }.last
     }
 
     private func activeProjections(
@@ -654,13 +769,26 @@ actor LocalActivityCollector {
                 }
                 let data = try JSONEncoder().encode(
                     PersistedFile(
-                        version: 4,
+                        version: 5,
                         path: path,
                         cursor: state.cursor,
                         normalization: state.normalization,
                         activityStart: state.activityStart,
                         activityEnd: state.activityEnd,
-                        discontinuityAt: state.discontinuityAt
+                        discontinuityAt: state.discontinuityAt,
+                        projection: state.normalization.context?.taskID.flatMap {
+                            projections[$0]?.withoutRolloutFileURL
+                        },
+                        ancestorProjections: state.normalization.context?.taskID
+                            .map { taskID in
+                                projectionChainIDs(for: taskID)
+                                    .subtracting([taskID])
+                            }
+                            .map { ancestorTaskIDs in
+                                ancestorTaskIDs.compactMap {
+                                    projections[$0]?.withoutRolloutFileURL
+                                }
+                            }
                     )
                 )
                 try data.write(
@@ -697,7 +825,7 @@ actor LocalActivityCollector {
                       PersistedFile.self,
                       from: data
                   ),
-                  file.version == 4,
+                  [4, 5].contains(file.version),
                   isSafeRelativePath(file.path) else {
                 restoreWarning = "Saved local activity could not be read"
                 continue
@@ -710,8 +838,15 @@ actor LocalActivityCollector {
                 activityStart: file.activityStart,
                 activityEnd: file.activityEnd,
                 discontinuityAt: file.discontinuityAt,
-                factsLoaded: false
+                factsLoaded: false,
+                requiresContextRebuild: file.version == 4
             )
+            if let projection = file.projection {
+                projections[projection.taskID] = projection
+            }
+            for projection in file.ancestorProjections ?? [] {
+                projections[projection.taskID] = projection
+            }
         }
         changedPaths.removeAll()
         pendingFactWrites.removeAll()

@@ -236,6 +236,10 @@ final class LocalActivityCollectorTests: XCTestCase {
             ]
         )
         let requests = CollectorProjectionRequests()
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
         let source = ReadOnlyThreadProjectionSource { request in
             await requests.record(request)
             return Data(#"""
@@ -252,8 +256,10 @@ final class LocalActivityCollectorTests: XCTestCase {
         }
         let collector = LocalActivityCollector(
             rootDirectory: fixture.root,
+            stateDirectory: stateDirectory,
             projectionSource: source
         )
+        await collector.selectPartition("stable-account")
 
         let observedAt = Date(timeIntervalSince1970: 1_785_232_920)
         let result = await collector.refresh(
@@ -265,6 +271,15 @@ final class LocalActivityCollectorTests: XCTestCase {
             observedAt: observedAt.addingTimeInterval(60)
         )
         let recordedRequests = await requests.values
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(
+            interval: try fixture.interval(),
+            observedAt: observedAt.addingTimeInterval(120)
+        )
 
         XCTAssertEqual(result.projections.map(\.taskID), ["task-1"])
         XCTAssertEqual(result.projections.map(\.projectLabel), ["atlas"])
@@ -287,6 +302,7 @@ final class LocalActivityCollectorTests: XCTestCase {
             ]
         )
         XCTAssertEqual(result.observation.coverage, .high)
+        XCTAssertEqual(restored.projections.map(\.projectLabel), ["atlas"])
     }
 
     func testRestoresDurableCursorForTheSameAccountPartition() async throws {
@@ -606,6 +622,221 @@ final class LocalActivityCollectorTests: XCTestCase {
             result.observation.reason,
             "Local task discovery is incomplete"
         )
+    }
+
+    func testResumedChildIncludesItsOlderRootProjection() async throws {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "child",
+            lines: [
+                fixture.session(threadID: "child", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let requests = CollectorProjectionRequests()
+        let source = ReadOnlyThreadProjectionSource { request in
+            await requests.record(request)
+            switch request {
+            case .list(cursor: nil, _, _, _):
+                return Data(#"""
+                {"result":{"data":[{
+                  "id":"child",
+                  "parentThreadId":"older-root",
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":"\#(file.path)",
+                  "createdAt":1785232800,
+                  "updatedAt":1785232920
+                }],"nextCursor":null}}
+                """#.utf8)
+            case .read(threadID: "older-root", includeTurns: false):
+                return Data(#"""
+                {"result":{"thread":{
+                  "id":"older-root",
+                  "parentThreadId":null,
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":null,
+                  "createdAt":1784628000,
+                  "updatedAt":1784628000
+                }}}
+                """#.utf8)
+            default:
+                XCTFail("Unexpected projection request: \(request)")
+                return Data()
+            }
+        }
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: nil,
+            projectionSource: source
+        )
+
+        let result = await collector.refresh(interval: try fixture.interval())
+        let recordedRequests = await requests.values
+
+        XCTAssertEqual(
+            result.projections.map(\.taskID),
+            ["child", "older-root"]
+        )
+        XCTAssertTrue(
+            recordedRequests.contains(
+                .read(threadID: "older-root", includeTurns: false)
+            )
+        )
+    }
+
+    func testVersionFourStateRebuildsContextFromTheRollout() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        _ = await first.refresh(interval: interval)
+        let partitionDirectory = stateDirectory.appendingPathComponent(
+            "stable-account",
+            isDirectory: true
+        )
+        let stateFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partitionDirectory,
+                includingPropertiesForKeys: nil
+            ).first { $0.pathExtension == "json" }
+        )
+        let factsFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partitionDirectory,
+                includingPropertiesForKeys: nil
+            ).first { $0.lastPathComponent.hasSuffix(".facts.jsonl") }
+        )
+        var state = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: stateFile)
+            ) as? [String: Any]
+        )
+        state["version"] = 4
+        state.removeValue(forKey: "projection")
+        if var normalization = state["normalization"] as? [String: Any] {
+            normalization.removeValue(forKey: "context")
+            state["normalization"] = normalization
+        }
+        try JSONSerialization.data(withJSONObject: state).write(
+            to: stateFile,
+            options: .atomic
+        )
+        let versionFourFacts = try String(
+            contentsOf: factsFile,
+            encoding: .utf8
+        ).split(separator: "\n").map { line -> String in
+            var fact = try XCTUnwrap(
+                JSONSerialization.jsonObject(
+                    with: Data(line.utf8)
+                ) as? [String: Any]
+            )
+            fact.removeValue(forKey: "context")
+            let data = try JSONSerialization.data(withJSONObject: fact)
+            return try XCTUnwrap(String(data: data, encoding: .utf8))
+        }.joined(separator: "\n") + "\n"
+        try versionFourFacts.write(
+            to: factsFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(interval: interval)
+        let migrated = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: stateFile)
+            ) as? [String: Any]
+        )
+        let receiptSlice = UsageReceiptAggregator.evaluate(
+            facts: restored.facts,
+            projections: restored.projections,
+            interval: interval,
+            observation: restored.observation
+        ).slice(in: interval, filters: .all)
+
+        XCTAssertGreaterThan(restored.bytesRead, 0)
+        XCTAssertEqual(
+            restored.facts.filter { $0.key == .token }.compactMap(\.numericDelta),
+            [500]
+        )
+        XCTAssertEqual(receiptSlice.receipts.first?.rootTaskID, "task-1")
+        XCTAssertEqual(receiptSlice.receipts.first?.tokens, 500)
+        XCTAssertEqual(migrated["version"] as? Int, 5)
+    }
+
+    func testAncestorFoundByLaterListSurvivesRestart() async throws {
+        let fixture = try CollectorFixture()
+        let rollout = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "child",
+            lines: [
+                fixture.session(threadID: "child", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let responses = ParentProjectionResponses()
+        let source = ReadOnlyThreadProjectionSource { request in
+            try await responses.response(
+                to: request,
+                rolloutPath: rollout.path
+            )
+        }
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory,
+            projectionSource: source
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+
+        let incomplete = await collector.refresh(interval: interval)
+        let completed = await collector.refresh(interval: interval)
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(interval: interval)
+
+        XCTAssertEqual(incomplete.projections.map(\.taskID), ["child"])
+        XCTAssertEqual(
+            completed.projections.map(\.taskID),
+            ["child", "older-root"]
+        )
+        XCTAssertEqual(
+            restored.projections.map(\.taskID),
+            ["child", "older-root"]
+        )
+        XCTAssertEqual(restored.bytesRead, 0)
     }
 
     func testPersistedStateUsesPathsRelativeToTheTrustedRoot() async throws {
@@ -1104,6 +1335,56 @@ private actor CollectorProjectionRequests {
 
     func record(_ request: ThreadProjectionReadRequest) {
         values.append(request)
+    }
+}
+
+private actor ParentProjectionResponses {
+    private var listReads = 0
+
+    func response(
+        to request: ThreadProjectionReadRequest,
+        rolloutPath: String
+    ) throws -> Data {
+        switch request {
+        case .list(cursor: nil, _, _, _):
+            listReads += 1
+            if listReads > 1 {
+                return Data(#"""
+                {"result":{"data":[{
+                  "id":"child",
+                  "parentThreadId":"older-root",
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":"\#(rolloutPath)",
+                  "createdAt":1785232800,
+                  "updatedAt":1785232920
+                },{
+                  "id":"older-root",
+                  "parentThreadId":null,
+                  "cliVersion":"0.145.0",
+                  "cwd":"/synthetic/projects/atlas",
+                  "path":null,
+                  "createdAt":1784628000,
+                  "updatedAt":1784628000
+                }],"nextCursor":null}}
+                """#.utf8)
+            }
+            return Data(#"""
+            {"result":{"data":[{
+              "id":"child",
+              "parentThreadId":"older-root",
+              "cliVersion":"0.145.0",
+              "cwd":"/synthetic/projects/atlas",
+              "path":"\#(rolloutPath)",
+              "createdAt":1785232800,
+              "updatedAt":1785232920
+            }],"nextCursor":null}}
+            """#.utf8)
+        case .read(threadID: "older-root", includeTurns: false):
+            throw CocoaError(.fileReadCorruptFile)
+        default:
+            throw CocoaError(.fileReadUnknown)
+        }
     }
 }
 
