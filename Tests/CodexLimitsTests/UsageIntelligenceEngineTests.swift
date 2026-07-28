@@ -21,19 +21,317 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.menuBarText, "37%")
         XCTAssertEqual(reader.sourceState, .available)
         XCTAssertEqual(reader.accountSource, .account)
+        XCTAssertEqual(reader.fetchedAt, now)
+        XCTAssertEqual(reader.weeklyUsageRemaining, account.mainLimit)
+        XCTAssertEqual(reader.accountFacts, account.accountFacts)
+        XCTAssertEqual(reader.otherLimits, account.otherLimits)
         XCTAssertEqual(reader.chart.observedSource, .account)
         XCTAssertEqual(reader.guidance, nil)
         XCTAssertEqual(reader.interval?.limitID, "codex")
         XCTAssertEqual(reader.interval?.durationMinutes, 10_080)
         XCTAssertEqual(
             reader.interval?.startsAt,
-            account.mainLimit.window.startsAt
+            account.mainLimit!.window.startsAt
         )
         XCTAssertEqual(
             reader.interval?.resetsAt,
-            account.mainLimit.window.resetsAt
+            account.mainLimit!.window.resetsAt
         )
         XCTAssertTrue(reader.interval?.text.hasPrefix("Weekly window · ") == true)
+    }
+
+    func testTightlyBoundedLifetimeReadingsProduceExactAccountTokenActivity() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 1_600,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil
+            )
+        )
+        let boundary = UsageSample(
+            observedAt: account.mainLimit!.window.startsAt.addingTimeInterval(5 * 60),
+            remainingPercent: 100,
+            resetsAt: account.mainLimit!.window.resetsAt,
+            lifetimeTokens: 1_000
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 600)
+        XCTAssertEqual(reader.accountTokenActivity.method, .lifetimeDelta)
+        XCTAssertEqual(
+            reader.accountTokenActivity.interval,
+            DateInterval(start: boundary.observedAt, end: now)
+        )
+        XCTAssertNil(reader.accountTokenActivity.reason)
+    }
+
+    func testPreservedLifetimeReadingDoesNotExtendTheExactInterval() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let observedAt = now.addingTimeInterval(-600)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 1_600,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil,
+                lifetimeTokensObservedAt: observedAt
+            )
+        )
+        let boundary = UsageSample(
+            observedAt: account.mainLimit!.window.startsAt.addingTimeInterval(5 * 60),
+            remainingPercent: 100,
+            resetsAt: account.mainLimit!.window.resetsAt,
+            lifetimeTokens: 1_000
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(
+            reader.accountTokenActivity.interval,
+            DateInterval(start: boundary.observedAt, end: observedAt)
+        )
+    }
+
+    func testCompleteDailyBucketsProducePartialAccountTokenActivity() throws {
+        let fetchedAt = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: "2026-07-28T12:00:00Z")
+        )
+        let calendar = Calendar(identifier: .gregorian)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: fetchedAt,
+            tokenHistory: [
+                TokenDay(
+                    date: try XCTUnwrap(
+                        ISO8601DateFormatter().date(from: "2026-07-24T00:00:00Z")
+                    ),
+                    tokens: 100,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: try XCTUnwrap(
+                        ISO8601DateFormatter().date(from: "2026-07-25T00:00:00Z")
+                    ),
+                    tokens: 200,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: try XCTUnwrap(
+                        ISO8601DateFormatter().date(from: "2026-07-28T00:00:00Z")
+                    ),
+                    tokens: 900,
+                    completeness: .partial
+                )
+            ],
+            accountFacts: AccountFacts(
+                lifetimeTokens: 1_600,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil
+            )
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: fetchedAt,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .partial)
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 300)
+        XCTAssertEqual(reader.accountTokenActivity.method, .dailyBuckets)
+        XCTAssertEqual(
+            reader.accountTokenActivity.interval,
+            DateInterval(
+                start: try XCTUnwrap(
+                    ISO8601DateFormatter().date(from: "2026-07-24T00:00:00Z")
+                ),
+                end: try XCTUnwrap(
+                    calendar.date(
+                        byAdding: .day,
+                        value: 1,
+                        to: ISO8601DateFormatter().date(
+                            from: "2026-07-25T00:00:00Z"
+                        )!
+                    )
+                )
+            )
+        )
+        XCTAssertEqual(
+            reader.accountTokenActivity.reason,
+            "Only complete daily token totals are available"
+        )
+    }
+
+    func testAlignedCompleteDailyBucketsProduceExactAccountTokenActivity() throws {
+        let formatter = ISO8601DateFormatter()
+        let fetchedAt = try XCTUnwrap(
+            formatter.date(from: "2026-07-28T00:00:00Z")
+        )
+        let dates = [
+            "2026-07-23T00:00:00Z",
+            "2026-07-24T00:00:00Z",
+            "2026-07-25T00:00:00Z",
+            "2026-07-26T00:00:00Z",
+            "2026-07-27T00:00:00Z"
+        ]
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: fetchedAt,
+            tokenHistory: try dates.map {
+                TokenDay(
+                    date: try XCTUnwrap(formatter.date(from: $0)),
+                    tokens: 100,
+                    completeness: .complete
+                )
+            }
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: fetchedAt,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 500)
+        XCTAssertEqual(reader.accountTokenActivity.method, .dailyBuckets)
+        XCTAssertEqual(
+            reader.accountTokenActivity.interval,
+            DateInterval(
+                start: account.mainLimit!.window.startsAt,
+                end: fetchedAt
+            )
+        )
+        XCTAssertNil(reader.accountTokenActivity.reason)
+    }
+
+    func testDecreasedLifetimeCounterWithholdsAccountTokenActivity() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 900,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil
+            )
+        )
+        let boundary = UsageSample(
+            observedAt: account.mainLimit!.window.startsAt,
+            remainingPercent: 100,
+            resetsAt: account.mainLimit!.window.resetsAt,
+            lifetimeTokens: 1_000
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .unavailable)
+        XCTAssertNil(reader.accountTokenActivity.tokens)
+        XCTAssertEqual(
+            reader.accountTokenActivity.reason,
+            "Lifetime token counter decreased"
+        )
+    }
+
+    func testInvalidLifetimeCounterWithholdsAccountTokenActivity() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: .max,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil
+            )
+        )
+        let boundary = UsageSample(
+            observedAt: account.mainLimit!.window.startsAt,
+            remainingPercent: 100,
+            resetsAt: account.mainLimit!.window.resetsAt,
+            lifetimeTokens: -1
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.accountTokenActivity.state, .unavailable)
+        XCTAssertNil(reader.accountTokenActivity.tokens)
+        XCTAssertEqual(
+            reader.accountTokenActivity.reason,
+            "Lifetime token reading is invalid"
+        )
     }
 
     func testFreshDenseHistoryProducesHighConfidenceGuidance() {
@@ -78,11 +376,11 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             reader.chart.target,
             [
                 UsageChartPoint(
-                    date: account.mainLimit.window.startsAt,
+                    date: account.mainLimit!.window.startsAt,
                     remaining: 100
                 ),
                 UsageChartPoint(
-                    date: account.mainLimit.window.resetsAt,
+                    date: account.mainLimit!.window.resetsAt,
                     remaining: 3
                 )
             ]
@@ -136,12 +434,12 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             UsageSample(
                 observedAt: now.addingTimeInterval(-1_200),
                 remainingPercent: 42,
-                resetsAt: account.mainLimit.window.resetsAt
+                resetsAt: account.mainLimit!.window.resetsAt
             ),
             UsageSample(
                 observedAt: now.addingTimeInterval(-600),
                 remainingPercent: 41,
-                resetsAt: account.mainLimit.window.resetsAt
+                resetsAt: account.mainLimit!.window.resetsAt
             )
         ]
 
@@ -200,7 +498,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             UsageSample(
                 observedAt: now.addingTimeInterval(-Double(minutesAgo) * 60),
                 remainingPercent: 55,
-                resetsAt: account.mainLimit.window.resetsAt
+                resetsAt: account.mainLimit!.window.resetsAt
             )
         }
 
@@ -265,7 +563,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             UsageSample(
                 observedAt: now.addingTimeInterval(-15 * 60),
                 remainingPercent: 85,
-                resetsAt: account.mainLimit.window.resetsAt
+                resetsAt: account.mainLimit!.window.resetsAt
             )
         )
 
@@ -309,7 +607,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         let step: TimeInterval = 30 * 60
         let now = Date(timeIntervalSince1970: 7_000_000)
         let account = makeSnapshot(remaining: 70, fetchedAt: now)
-        let start = account.mainLimit.window.startsAt
+        let start = account.mainLimit!.window.startsAt
         let samples = stride(
             from: start.timeIntervalSince1970,
             through: now.timeIntervalSince1970,
@@ -318,7 +616,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             UsageSample(
                 observedAt: Date(timeIntervalSince1970: $0),
                 remainingPercent: 70,
-                resetsAt: account.mainLimit.window.resetsAt
+                resetsAt: account.mainLimit!.window.resetsAt
             )
         }
 
@@ -375,7 +673,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
     func testQuietDenseHistoryLeavesRoomToUseMore() {
         let now = Date(timeIntervalSince1970: 9_000_000)
         let account = makeSnapshot(remaining: 40, fetchedAt: now)
-        let historicalReset = account.mainLimit.window.startsAt
+        let historicalReset = account.mainLimit!.window.startsAt
         let historical = [
             UsageSample(
                 observedAt: historicalReset.addingTimeInterval(-5 * 86_400),
@@ -465,7 +763,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
     private func makeSnapshot(
         remaining: Double,
         fetchedAt: Date,
-        tokenHistory: [TokenDay] = []
+        tokenHistory: [TokenDay] = [],
+        accountFacts: AccountFacts? = nil
     ) -> UsageSnapshot {
         let window = UsageWindow(
             remainingPercent: remaining,
@@ -477,7 +776,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             otherLimits: [],
             tokenHistory: tokenHistory,
             emergencyResetCount: 0,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            accountFacts: accountFacts
         )
     }
 
@@ -486,7 +786,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         firstOffset: TimeInterval,
         step: TimeInterval
     ) -> [UsageSample] {
-        let window = account.mainLimit.window
+        let window = account.mainLimit!.window
         let first = window.startsAt.addingTimeInterval(firstOffset)
         let elapsed = account.fetchedAt.timeIntervalSince(window.startsAt)
         return stride(

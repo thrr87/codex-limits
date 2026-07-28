@@ -111,6 +111,38 @@ struct UsageChartSnapshot: Equatable, Sendable {
     let accessibilityValue: String
 }
 
+enum AccountTokenActivityState: String, Equatable, Sendable {
+    case exact
+    case partial
+    case unavailable
+}
+
+enum AccountTokenActivityMethod: String, Equatable, Sendable {
+    case lifetimeDelta
+    case dailyBuckets
+}
+
+struct AccountTokenActivitySnapshot: Equatable, Sendable {
+    let state: AccountTokenActivityState
+    let tokens: Int64?
+    let method: AccountTokenActivityMethod?
+    let interval: DateInterval?
+    let reason: String?
+
+    static func unavailable(
+        _ reason: String,
+        interval: DateInterval? = nil
+    ) -> AccountTokenActivitySnapshot {
+        AccountTokenActivitySnapshot(
+            state: .unavailable,
+            tokens: nil,
+            method: nil,
+            interval: interval,
+            reason: reason
+        )
+    }
+}
+
 struct UsageIntelligenceInput: Equatable, Sendable {
     let account: UsageSnapshot?
     let samples: [UsageSample]
@@ -118,6 +150,25 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let sourceState: UsageSourceState
     let now: Date
     let previousStatus: PaceStatus?
+    let accountEpochStartedAt: Date?
+
+    init(
+        account: UsageSnapshot?,
+        samples: [UsageSample],
+        safetyBuffer: Double,
+        sourceState: UsageSourceState,
+        now: Date,
+        previousStatus: PaceStatus?,
+        accountEpochStartedAt: Date? = nil
+    ) {
+        self.account = account
+        self.samples = samples
+        self.safetyBuffer = safetyBuffer
+        self.sourceState = sourceState
+        self.now = now
+        self.previousStatus = previousStatus
+        self.accountEpochStartedAt = accountEpochStartedAt
+    }
 }
 
 struct UsageReaderSnapshot: Equatable, Sendable {
@@ -130,6 +181,15 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let evidence: UsageEvidence
     let guidance: UsageGuidance?
     let chart: UsageChartSnapshot
+    let accountTokenActivity: AccountTokenActivitySnapshot
+
+    var fetchedAt: Date? { account?.fetchedAt }
+
+    var weeklyUsageRemaining: LimitReading? { account?.mainLimit }
+
+    var accountFacts: AccountFacts? { account?.accountFacts }
+
+    var otherLimits: [LimitReading] { account?.otherLimits ?? [] }
 
     var guidanceTitle: String {
         guidance?.title ?? "Not enough data"
@@ -207,15 +267,22 @@ private enum CurrentUsagePolicy {
 
 enum UsageIntelligenceEngine {
     static func evaluate(_ input: UsageIntelligenceInput) -> UsageReaderSnapshot {
-        let currentSamples = input.account.map { account in
+        let currentSamples = input.account.flatMap { account in
+            account.mainLimit.map { weeklyLimit in
             input.samples
-                .filter {
-                    $0.resetsAt == account.mainLimit.window.resetsAt
-                        && $0.observedAt >= account.mainLimit.window.startsAt
-                        && $0.observedAt <= account.fetchedAt
-                        && $0.observedAt <= input.now
+                .filter { sample in
+                    sample.resetsAt == weeklyLimit.window.resetsAt
+                        && sample.observedAt >= weeklyLimit.window.startsAt
+                        && sample.observedAt <= account.fetchedAt
+                        && sample.observedAt <= input.now
+                        && (
+                            input.accountEpochStartedAt.map {
+                                sample.observedAt >= $0
+                            } ?? true
+                        )
                 }
                 .sorted { $0.observedAt < $1.observedAt }
+            }
         } ?? []
         let evidence = evidence(
             account: input.account,
@@ -224,11 +291,12 @@ enum UsageIntelligenceEngine {
             now: input.now
         )
         let guidance: UsageGuidance? = input.account.flatMap { account in
+            guard let weeklyLimit = account.mainLimit else { return nil }
             guard evidence.confidence == .high || evidence.confidence == .medium else {
                 return nil
             }
             let forecast = ForecastEngine.evaluate(
-                window: account.mainLimit.window,
+                window: weeklyLimit.window,
                 samples: input.samples,
                 tokenHistory: account.tokenHistory,
                 safetyBuffer: input.safetyBuffer,
@@ -240,18 +308,18 @@ enum UsageIntelligenceEngine {
                 status: forecast.status,
                 title: title(for: forecast.status),
                 message: message(
-                    account: account,
+                    window: weeklyLimit.window,
                     forecast: forecast,
                     safetyBuffer: input.safetyBuffer,
                     now: input.now
                 ),
                 suggestedPace: suggestedPace(
                     forecast: forecast,
-                    reset: account.mainLimit.window.resetsAt,
+                    reset: weeklyLimit.window.resetsAt,
                     now: input.now
                 ),
                 runway: runway(
-                    account: account,
+                    window: weeklyLimit.window,
                     forecast: forecast,
                     now: input.now
                 ),
@@ -271,16 +339,18 @@ enum UsageIntelligenceEngine {
         return UsageReaderSnapshot(
             account: input.account,
             accountSource: .account,
-            interval: input.account.map {
+            interval: input.account.flatMap { account in
+                account.mainLimit.map {
                 UsageObservedInterval(
-                    limitID: $0.mainLimit.limitId,
-                    durationMinutes: $0.mainLimit.window.durationMinutes,
-                    startsAt: $0.mainLimit.window.startsAt,
-                    resetsAt: $0.mainLimit.window.resetsAt
+                    limitID: $0.limitId,
+                    durationMinutes: $0.window.durationMinutes,
+                    startsAt: $0.window.startsAt,
+                    resetsAt: $0.window.resetsAt
                 )
+                }
             },
-            menuBarText: input.account.map {
-                "\(Int($0.mainLimit.window.remainingPercent.rounded()))%"
+            menuBarText: input.account?.mainLimit.map {
+                "\(Int($0.window.remainingPercent.rounded()))%"
             } ?? "—",
             sourceState: input.sourceState,
             freshness: freshness(
@@ -290,7 +360,134 @@ enum UsageIntelligenceEngine {
             ),
             evidence: evidence,
             guidance: guidance,
-            chart: chart
+            chart: chart,
+            accountTokenActivity: accountTokenActivity(
+                account: input.account,
+                samples: currentSamples
+            )
+        )
+    }
+
+    private static func accountTokenActivity(
+        account: UsageSnapshot?,
+        samples: [UsageSample]
+    ) -> AccountTokenActivitySnapshot {
+        guard let account, let weeklyLimit = account.mainLimit else {
+            return .unavailable("Account token readings are unavailable")
+        }
+        let start = weeklyLimit.window.startsAt
+        let boundary = samples
+            .filter {
+                $0.lifetimeTokens != nil
+                    && abs($0.observedAt.timeIntervalSince(start))
+                        <= CurrentUsagePolicy.tightBoundary
+            }
+            .min {
+                abs($0.observedAt.timeIntervalSince(start))
+                    < abs($1.observedAt.timeIntervalSince(start))
+            }
+        if let currentTokens = account.accountFacts?.lifetimeTokens,
+           let boundary,
+           let boundaryTokens = boundary.lifetimeTokens {
+            let currentObservedAt = account.accountFacts?
+                .lifetimeTokensObservedAt ?? account.fetchedAt
+            guard currentObservedAt >= boundary.observedAt else {
+                return .unavailable(
+                    "No lifetime token reading after the weekly boundary"
+                )
+            }
+            guard currentTokens >= 0, boundaryTokens >= 0 else {
+                return .unavailable("Lifetime token reading is invalid")
+            }
+            guard currentTokens >= boundaryTokens else {
+                return .unavailable(
+                    "Lifetime token counter decreased",
+                    interval: DateInterval(
+                        start: boundary.observedAt,
+                        end: currentObservedAt
+                    )
+                )
+            }
+            let delta = currentTokens.subtractingReportingOverflow(
+                boundaryTokens
+            )
+            guard !delta.overflow else {
+                return .unavailable("Lifetime token reading is invalid")
+            }
+            return AccountTokenActivitySnapshot(
+                state: .exact,
+                tokens: delta.partialValue,
+                method: .lifetimeDelta,
+                interval: DateInterval(
+                    start: boundary.observedAt,
+                    end: currentObservedAt
+                ),
+                reason: nil
+            )
+        }
+
+        if let dailyActivity = dailyTokenActivity(
+            account: account,
+            window: weeklyLimit.window
+        ) {
+            return dailyActivity
+        }
+
+        return .unavailable(
+            account.accountFacts?.lifetimeTokens == nil
+                ? "Lifetime token readings are unavailable"
+                : "No lifetime token reading at the weekly boundary"
+        )
+    }
+
+    private static func dailyTokenActivity(
+        account: UsageSnapshot,
+        window: UsageWindow
+    ) -> AccountTokenActivitySnapshot? {
+        let intervalEnd = min(
+            account.fetchedAt,
+            window.resetsAt
+        )
+        let completeDays = account.tokenHistory
+            .filter { day in
+                let end = day.date.addingTimeInterval(24 * 60 * 60)
+                return day.completeness == .complete
+                    && day.tokens >= 0
+                    && day.date >= window.startsAt
+                    && end <= intervalEnd
+            }
+            .sorted { $0.date < $1.date }
+        guard let first = completeDays.first,
+              let last = completeDays.last else {
+            return nil
+        }
+        var total: Int64 = 0
+        for day in completeDays {
+            let result = total.addingReportingOverflow(day.tokens)
+            guard !result.overflow else { return nil }
+            total = result.partialValue
+        }
+        let lastDayEnd = last.date.addingTimeInterval(24 * 60 * 60)
+        let isContiguous = zip(
+            completeDays,
+            completeDays.dropFirst()
+        ).allSatisfy { previous, next in
+            next.date == previous.date.addingTimeInterval(24 * 60 * 60)
+        }
+        let exactlyMatchesInterval = isContiguous
+            && first.date == window.startsAt
+            && lastDayEnd == intervalEnd
+        return AccountTokenActivitySnapshot(
+            state: exactlyMatchesInterval ? .exact : .partial,
+            tokens: total,
+            method: .dailyBuckets,
+            interval: DateInterval(
+                start: first.date,
+                end: lastDayEnd
+            ),
+            reason: exactlyMatchesInterval
+                ? nil
+                : "Only complete daily token totals are available"
         )
     }
 
@@ -300,7 +497,7 @@ enum UsageIntelligenceEngine {
         guidance: UsageGuidance?,
         safetyBuffer: Double
     ) -> UsageChartSnapshot {
-        guard let account else {
+        guard let account, let weeklyLimit = account.mainLimit else {
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: [],
@@ -311,12 +508,16 @@ enum UsageIntelligenceEngine {
                 accessibilityValue: "Usage is not available."
             )
         }
-        let window = account.mainLimit.window
+        let window = weeklyLimit.window
         let target = [
             UsageChartPoint(date: window.startsAt, remaining: 100),
             UsageChartPoint(date: window.resetsAt, remaining: safetyBuffer)
         ]
-        let observed = observedPoints(account: account, samples: samples)
+        let observed = observedPoints(
+            account: account,
+            window: window,
+            samples: samples
+        )
         guard let forecast = guidance?.forecast else {
             return UsageChartSnapshot(
                 observedSource: .account,
@@ -334,11 +535,13 @@ enum UsageIntelligenceEngine {
             observed: observed,
             currentProjection: projection(
                 account: account,
+                window: window,
                 rate: forecast.currentPercentPerDay,
                 remainingAtReset: forecast.expectedRemainingAtReset
             ),
             historicalProjection: projection(
                 account: account,
+                window: window,
                 rate: forecast.historicalPercentPerDay,
                 remainingAtReset: forecast.historicalRemainingAtReset
             ),
@@ -350,9 +553,9 @@ enum UsageIntelligenceEngine {
 
     private static func observedPoints(
         account: UsageSnapshot,
+        window: UsageWindow,
         samples: [UsageSample]
     ) -> [UsageChartPoint] {
-        let window = account.mainLimit.window
         let current = UsageChartPoint(
             date: account.fetchedAt,
             remaining: window.remainingPercent
@@ -374,10 +577,10 @@ enum UsageIntelligenceEngine {
 
     private static func projection(
         account: UsageSnapshot,
+        window: UsageWindow,
         rate: Double,
         remainingAtReset: Double
     ) -> [UsageChartPoint] {
-        let window = account.mainLimit.window
         let current = UsageChartPoint(
             date: account.fetchedAt,
             remaining: window.remainingPercent
@@ -433,7 +636,7 @@ enum UsageIntelligenceEngine {
         sourceState: UsageSourceState,
         now: Date
     ) -> UsageEvidence {
-        guard let account else {
+        guard let account, let weeklyLimit = account.mainLimit else {
             return UsageEvidence(
                 coverage: .unavailable,
                 confidence: .unavailable,
@@ -441,7 +644,7 @@ enum UsageIntelligenceEngine {
                 policyVersion: CurrentUsagePolicy.version
             )
         }
-        let window = account.mainLimit.window
+        let window = weeklyLimit.window
         guard now >= window.startsAt, now < window.resetsAt else {
             return UsageEvidence(
                 coverage: .notApplicable,
@@ -556,16 +759,15 @@ enum UsageIntelligenceEngine {
     }
 
     private static func runway(
-        account: UsageSnapshot,
+        window: UsageWindow,
         forecast: Forecast,
         now: Date
     ) -> UsageRunway {
         guard forecast.currentPercentPerDay > 0 else { return .throughReset }
         let exhaustsAt = now.addingTimeInterval(
-            account.mainLimit.window.remainingPercent
-                / forecast.currentPercentPerDay * 86_400
+            window.remainingPercent / forecast.currentPercentPerDay * 86_400
         )
-        return exhaustsAt < account.mainLimit.window.resetsAt
+        return exhaustsAt < window.resetsAt
             ? .exhausts(exhaustsAt)
             : .throughReset
     }
@@ -591,14 +793,13 @@ enum UsageIntelligenceEngine {
     }
 
     private static func message(
-        account: UsageSnapshot,
+        window: UsageWindow,
         forecast: Forecast,
         safetyBuffer: Double,
         now: Date
     ) -> String {
         switch forecast.status {
         case .slowDown:
-            let window = account.mainLimit.window
             let timeLeft = window.resetsAt.timeIntervalSince(now)
             let timeToEmpty = window.remainingPercent
                 / max(forecast.safetyPercentPerDay, 0.01) * 86_400

@@ -29,6 +29,7 @@ final class UsageMonitor: ObservableObject {
     private static let historyPartitionKey = "historyAccountPartition"
     private static let historyFingerprintKey = "historyAccountFingerprintKey"
     private static let historyAuthStateKey = "historyAccountState"
+    private static let historyAccountEpochStartedAtKey = "historyAccountEpochStartedAt"
     private static let historySyncSelectedKey = "historySyncSelected"
     private static let historySyncAccountBindingKey = "historySyncAccountBinding"
     private let defaults: UserDefaults
@@ -48,6 +49,7 @@ final class UsageMonitor: ObservableObject {
     private var historyWasRestored = false
     private var restoredFileStoreAvailable = false
     private var historyAccountIdentity: String?
+    private var accountEpochStartedAt: Date?
     private var historyMatchesCurrentSnapshot = false
     private var legacySamplesAwaitingMigration: [UsageSample] = []
 
@@ -59,6 +61,9 @@ final class UsageMonitor: ObservableObject {
     ) {
         self.defaults = defaults
         self.fetchUsage = fetchUsage
+        accountEpochStartedAt = defaults.object(
+            forKey: Self.historyAccountEpochStartedAtKey
+        ) as? Date
         if defaults.data(forKey: Self.historySyncBookmarkKey) != nil {
             defaults.set(true, forKey: Self.historySyncSelectedKey)
         }
@@ -137,7 +142,10 @@ final class UsageMonitor: ObservableObject {
             let legacySamples = legacySamplesAwaitingMigration
             accountWasObserved = true
             historyMatchesCurrentSnapshot = true
-            await selectHistoryAccount(account)
+            await selectHistoryAccount(
+                account,
+                observedAt: result.snapshot.fetchedAt
+            )
             await prepareHistory(legacySamples: legacySamples)
             if !historyUsesFiles {
                 let historyState = await history.load(legacySamples: samples)
@@ -148,15 +156,22 @@ final class UsageMonitor: ObservableObject {
             apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
             let exchangeErrorMessage = historyState.errorMessage
             let newSnapshot = result.snapshot
-            let window = newSnapshot.mainLimit.window
-            let sample = UsageSample(
-                observedAt: newSnapshot.fetchedAt,
-                remainingPercent: window.remainingPercent,
-                resetsAt: window.resetsAt
-            )
-            let recordedState = await history.record(sample)
-            apply(recordedState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
-            if recordedState.errorMessage == nil {
+            if let window = newSnapshot.mainLimit?.window {
+                let sample = UsageSample(
+                    observedAt: newSnapshot.fetchedAt,
+                    remainingPercent: window.remainingPercent,
+                    resetsAt: window.resetsAt,
+                    lifetimeTokens: freshLifetimeTokens(in: newSnapshot)
+                )
+                let recordedState = await history.record(sample)
+                apply(
+                    recordedState,
+                    configuredFolderName: configuredSyncDirectory?.lastPathComponent
+                )
+                if recordedState.errorMessage == nil {
+                    syncErrorMessage = exchangeErrorMessage
+                }
+            } else {
                 syncErrorMessage = exchangeErrorMessage
             }
             accountSnapshot = newSnapshot
@@ -242,7 +257,10 @@ final class UsageMonitor: ObservableObject {
         apply(await history.disconnect())
     }
 
-    private func selectHistoryAccount(_ observation: CodexAccountObservation) async {
+    private func selectHistoryAccount(
+        _ observation: CodexAccountObservation,
+        observedAt: Date
+    ) async {
         let partition: AccountHistoryPartition
         let authState: String
         let previousAuthState = defaults.string(forKey: Self.historyAuthStateKey)
@@ -263,6 +281,13 @@ final class UsageMonitor: ObservableObject {
             } else {
                 partition = .unknown(transitionID: UUID())
             }
+        }
+        if previousAuthState != authState || accountEpochStartedAt == nil {
+            accountEpochStartedAt = observedAt
+            defaults.set(
+                observedAt,
+                forKey: Self.historyAccountEpochStartedAtKey
+            )
         }
         defaults.set(authState, forKey: Self.historyAuthStateKey)
         guard partition != historyPartition else { return }
@@ -302,7 +327,8 @@ final class UsageMonitor: ObservableObject {
                 otherLimits: snapshot.otherLimits,
                 tokenHistory: [],
                 emergencyResetCount: snapshot.emergencyResetCount,
-                fetchedAt: snapshot.fetchedAt
+                fetchedAt: snapshot.fetchedAt,
+                accountFacts: snapshot.accountFacts
             )
         }
         recalculate()
@@ -356,7 +382,8 @@ final class UsageMonitor: ObservableObject {
     }
 
     var canRebuildAvailableHistory: Bool {
-        accountSnapshot != nil && historyDeletionStatus != .pendingSync
+        accountSnapshot?.mainLimit != nil
+            && historyDeletionStatus != .pendingSync
     }
 
     func rebuildAvailableHistory() async {
@@ -370,15 +397,20 @@ final class UsageMonitor: ObservableObject {
             }
             accountWasObserved = true
             historyMatchesCurrentSnapshot = true
-            await selectHistoryAccount(account)
-            let snapshot = result.snapshot
-            let window = snapshot.mainLimit.window
-            let sample = UsageSample(
-                observedAt: snapshot.fetchedAt,
-                remainingPercent: window.remainingPercent,
-                resetsAt: window.resetsAt
+            await selectHistoryAccount(
+                account,
+                observedAt: result.snapshot.fetchedAt
             )
-            apply(await history.rebuildAvailableHistory([sample]))
+            let snapshot = result.snapshot
+            if let window = snapshot.mainLimit?.window {
+                let sample = UsageSample(
+                    observedAt: snapshot.fetchedAt,
+                    remainingPercent: window.remainingPercent,
+                    resetsAt: window.resetsAt,
+                    lifetimeTokens: freshLifetimeTokens(in: snapshot)
+                )
+                apply(await history.rebuildAvailableHistory([sample]))
+            }
             accountSnapshot = snapshot
             sourceState = .available
             recalculate(now: snapshot.fetchedAt)
@@ -407,12 +439,21 @@ final class UsageMonitor: ObservableObject {
                 safetyBuffer: buffer,
                 sourceState: sourceState,
                 now: now,
-                previousStatus: previousStatus
+                previousStatus: previousStatus,
+                accountEpochStartedAt: accountEpochStartedAt
             )
         )
         if let status = readerSnapshot.guidance?.status {
             previousStatus = status
         }
+    }
+
+    private func freshLifetimeTokens(in snapshot: UsageSnapshot) -> Int64? {
+        guard let facts = snapshot.accountFacts,
+              facts.lifetimeTokensObservedAt == snapshot.fetchedAt else {
+            return nil
+        }
+        return facts.lifetimeTokens
     }
 
     private func persist() {
@@ -506,7 +547,10 @@ final class UsageMonitor: ObservableObject {
             }
             accountWasObserved = true
             historyMatchesCurrentSnapshot = true
-            await selectHistoryAccount(account)
+            await selectHistoryAccount(
+                account,
+                observedAt: result.snapshot.fetchedAt
+            )
             guard historyAccountIdentity != nil else {
                 syncErrorMessage = "Codex account details are unavailable, so history sync is off."
                 return false

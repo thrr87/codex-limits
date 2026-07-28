@@ -951,11 +951,24 @@ actor UsageHistory {
     }
 
     private func normalized(_ samples: [UsageSample]) -> [UsageSample] {
-        return Array(Set(samples.filter {
+        let valid = samples.filter {
             $0.observedAt <= $0.resetsAt
                 && $0.remainingPercent.isFinite
                 && (0 ... 100).contains($0.remainingPercent)
-        })).sorted {
+                && ($0.lifetimeTokens.map { $0 >= 0 } ?? true)
+        }
+        var byIdentity: [UsageSample: UsageSample] = [:]
+        for sample in valid {
+            guard let existing = byIdentity[sample] else {
+                byIdentity[sample] = sample
+                continue
+            }
+            if let newTokens = sample.lifetimeTokens,
+               newTokens > (existing.lifetimeTokens ?? .min) {
+                byIdentity[sample] = sample
+            }
+        }
+        return byIdentity.values.sorted {
             if $0.observedAt != $1.observedAt { return $0.observedAt < $1.observedAt }
             if $0.remainingPercent != $1.remainingPercent {
                 return $0.remainingPercent > $1.remainingPercent

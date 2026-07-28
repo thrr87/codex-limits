@@ -78,6 +78,60 @@ final class UsageHistoryTests: XCTestCase {
         XCTAssertEqual(restoredFirst.samples, [firstSample])
     }
 
+    func testLifetimeTokenEnrichmentKeepsTheExistingSampleIdentity() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let observedAt = Date(timeIntervalSince1970: 1_900_000)
+        let resetsAt = Date(timeIntervalSince1970: 2_000_000)
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+        _ = await history.record(
+            UsageSample(
+                observedAt: observedAt,
+                remainingPercent: 80,
+                resetsAt: resetsAt
+            )
+        )
+
+        let state = await history.record(
+            UsageSample(
+                observedAt: observedAt,
+                remainingPercent: 80,
+                resetsAt: resetsAt,
+                lifetimeTokens: 1_500
+            )
+        )
+
+        XCTAssertEqual(state.samples.count, 1)
+        XCTAssertEqual(state.samples.first?.lifetimeTokens, 1_500)
+    }
+
+    func testNegativeLifetimeTokenReadingIsRejectedDuringNormalization() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+
+        let state = await history.record(
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: 1_900_000),
+                remainingPercent: 80,
+                resetsAt: Date(timeIntervalSince1970: 2_000_000),
+                lifetimeTokens: -1
+            )
+        )
+
+        XCTAssertTrue(state.samples.isEmpty)
+    }
+
     func testSharedFolderAcceptsTheSameAccountAndRejectsAnotherAccount() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

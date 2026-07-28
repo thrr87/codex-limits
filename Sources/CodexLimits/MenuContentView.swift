@@ -27,11 +27,19 @@ struct MenuContentView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                Text(account.mainLimit.window.remainingPercent, format: .number.precision(.fractionLength(0)))
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                Text("% remaining")
-                    .foregroundStyle(.secondary)
+                if let weeklyLimit = account.mainLimit {
+                    Text(
+                        weeklyLimit.window.remainingPercent,
+                        format: .number.precision(.fractionLength(0))
+                    )
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                    Text("% remaining")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Weekly usage unavailable")
+                        .font(.headline)
+                }
                 Text(reader.accountSource.rawValue)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
@@ -51,60 +59,70 @@ struct MenuContentView: View {
                 .accessibilityLabel("Refresh usage")
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(reader.guidanceTitle)
-                    .font(.headline)
-                    .foregroundStyle(
-                        reader.guidance.map { statusColor($0.status) } ?? .secondary
-                    )
-                Text(reader.guidanceMessage)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(reader.evidenceText)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                if let interval = reader.interval {
-                    Text(interval.text)
+            if let weeklyLimit = account.mainLimit {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(reader.guidanceTitle)
+                        .font(.headline)
+                        .foregroundStyle(
+                            reader.guidance.map { statusColor($0.status) } ?? .secondary
+                        )
+                    Text(reader.guidanceMessage)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(reader.evidenceText)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
-                }
-                if let caveat = reader.guidance?.caveat {
-                    Text(caveat)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            BurnDownChart(
-                window: account.mainLimit.window,
-                chart: reader.chart
-            )
-
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
-                GridRow {
-                    Text("Reset")
-                        .foregroundStyle(.secondary)
-                    Text(account.mainLimit.window.resetsAt.formatted(date: .abbreviated, time: .shortened))
-                }
-                GridRow {
-                    Text("Suggested pace")
-                        .foregroundStyle(.secondary)
-                    Text(reader.suggestedPaceText)
-                }
-                GridRow {
-                    Text("Runway")
-                        .foregroundStyle(.secondary)
-                    Text(reader.guidance?.runway.text ?? "Not enough data")
-                }
-                if let range = reader.guidance?.remainingAtResetRange {
-                    GridRow {
-                        Text("Range")
+                    if let interval = reader.interval {
+                        Text(interval.text)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let caveat = reader.guidance?.caveat {
+                        Text(caveat)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text(range.text)
                     }
                 }
+
+                BurnDownChart(
+                    window: weeklyLimit.window,
+                    chart: reader.chart
+                )
+
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
+                    GridRow {
+                        Text("Reset")
+                            .foregroundStyle(.secondary)
+                        Text(
+                            weeklyLimit.window.resetsAt.formatted(
+                                date: .abbreviated,
+                                time: .shortened
+                            )
+                        )
+                    }
+                    GridRow {
+                        Text("Suggested pace")
+                            .foregroundStyle(.secondary)
+                        Text(reader.suggestedPaceText)
+                    }
+                    GridRow {
+                        Text("Runway")
+                            .foregroundStyle(.secondary)
+                        Text(reader.guidance?.runway.text ?? "Not enough data")
+                    }
+                    if let range = reader.guidance?.remainingAtResetRange {
+                        GridRow {
+                            Text("Range")
+                                .foregroundStyle(.secondary)
+                            Text(range.text)
+                        }
+                    }
+                }
+                .font(.callout)
+            } else {
+                Text("Weekly usage is not available right now.")
+                    .foregroundStyle(.secondary)
             }
-            .font(.callout)
 
             if !account.otherLimits.isEmpty {
                 Divider()
