@@ -146,6 +146,7 @@ struct BankedResetSummary: Equatable, Sendable {
     let availableCount: Int
     let detailCoverage: ResetDetailCoverage
     let knownExpiryCount: Int
+    let nextKnownResetID: String?
     let nextKnownExpiry: Date?
     let observedAt: Date
     let freshness: UsageFreshness
@@ -641,6 +642,12 @@ enum UsageIntelligenceEngine {
             available.map { ($0.id, $0) },
             uniquingKeysWith: { _, latest in latest }
         ).values
+        let nextKnown = unique.min {
+            if $0.expiresAt == $1.expiresAt {
+                return $0.id < $1.id
+            }
+            return $0.expiresAt < $1.expiresAt
+        }
         let knownExpiryCount = min(
             unique.count,
             account.emergencyResetCount
@@ -659,8 +666,11 @@ enum UsageIntelligenceEngine {
             availableCount: account.emergencyResetCount,
             detailCoverage: coverage,
             knownExpiryCount: knownExpiryCount,
+            nextKnownResetID: account.emergencyResetCount > 0
+                ? nextKnown?.id
+                : nil,
             nextKnownExpiry: account.emergencyResetCount > 0
-                ? unique.map(\.expiresAt).min()
+                ? nextKnown?.expiresAt
                 : nil,
             observedAt: account.fetchedAt,
             freshness: freshness,

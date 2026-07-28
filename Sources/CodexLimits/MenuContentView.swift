@@ -24,8 +24,14 @@ struct MenuContentView: View {
                 reader: monitor.readerSnapshot,
                 isRefreshing: monitor.isRefreshing,
                 isCompact: layout.isCompact,
+                resetReminderState: monitor.resetReminderState,
                 refresh: {
                     Task { await monitor.refresh() }
+                },
+                setResetReminderEnabled: { isEnabled in
+                    Task {
+                        await monitor.setResetReminderEnabled(isEnabled)
+                    }
                 },
                 settings: showSettings
             )
@@ -82,7 +88,18 @@ struct MenuContentView: View {
         ) {
             AnalyticsWorkspaceBody(
                 reader: monitor.readerSnapshot,
-                store: workspace
+                store: workspace,
+                resetReminderState: monitor.resetReminderState,
+                setResetReminderEnabled: { isEnabled in
+                    Task {
+                        await monitor.setResetReminderEnabled(isEnabled)
+                    }
+                },
+                setResetReminderLeadTime: { leadTime in
+                    Task {
+                        await monitor.setResetReminderLeadTime(leadTime)
+                    }
+                }
             )
         }
     }
@@ -175,6 +192,28 @@ struct AnalyticsWorkspacePresentationView<Content: View>: View {
 struct AnalyticsWorkspaceBody: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    let resetReminderState: ResetReminderState
+    let setResetReminderEnabled: (Bool) -> Void
+    let setResetReminderLeadTime: (ResetReminderLeadTime) -> Void
+
+    init(
+        reader: UsageReaderSnapshot,
+        store: AnalyticsWorkspaceStore,
+        resetReminderState: ResetReminderState = ResetReminderState(
+            isEnabled: false,
+            leadTime: .hours24,
+            authorization: .unknown,
+            delivery: .off
+        ),
+        setResetReminderEnabled: @escaping (Bool) -> Void = { _ in },
+        setResetReminderLeadTime: @escaping (ResetReminderLeadTime) -> Void = { _ in }
+    ) {
+        self.reader = reader
+        self.store = store
+        self.resetReminderState = resetReminderState
+        self.setResetReminderEnabled = setResetReminderEnabled
+        self.setResetReminderLeadTime = setResetReminderLeadTime
+    }
 
     @ViewBuilder
     var body: some View {
@@ -182,7 +221,12 @@ struct AnalyticsWorkspaceBody: View {
         case .graphs:
             GraphsWorkspace(reader: reader, store: store)
         case .facts:
-            FactsWorkspace(reader: reader)
+            FactsWorkspace(
+                reader: reader,
+                resetReminderState: resetReminderState,
+                setResetReminderEnabled: setResetReminderEnabled,
+                setResetReminderLeadTime: setResetReminderLeadTime
+            )
         case .insights:
             InsightsWorkspace(reader: reader)
         }
@@ -193,7 +237,9 @@ private struct WorkspaceHeader: View {
     let reader: UsageReaderSnapshot
     let isRefreshing: Bool
     let isCompact: Bool
+    let resetReminderState: ResetReminderState
     let refresh: () -> Void
+    let setResetReminderEnabled: (Bool) -> Void
     let settings: () -> Void
 
     var body: some View {
@@ -284,16 +330,49 @@ private struct WorkspaceHeader: View {
         }
         if let summary = reader.bankedResets {
             TimelineView(.periodic(from: .now, by: 60)) { context in
-                HeaderFact(
-                    label: "Banked resets",
-                    value: summary.headerValue(at: context.date)
-                )
-                .help(summary.inspectionText(at: context.date))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Banked resets")
-                .accessibilityValue(
-                    "\(summary.headerValue(at: context.date)) · \(summary.inspectionText(at: context.date))"
-                )
+                HStack(spacing: 5) {
+                    HeaderFact(
+                        label: "Banked resets",
+                        value: summary.headerValue(at: context.date)
+                    )
+                    .help(summary.inspectionText(at: context.date))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Banked resets")
+                    .accessibilityValue(
+                        "\(summary.headerValue(at: context.date)) · \(summary.inspectionText(at: context.date))"
+                    )
+
+                    if summary.currentNextKnownExpiry(at: context.date) != nil
+                        || resetReminderState.isEnabled {
+                        Button {
+                            setResetReminderEnabled(
+                                !resetReminderState.isEnabled
+                            )
+                        } label: {
+                            Image(
+                                systemName: resetReminderState.isEnabled
+                                    ? "bell.fill"
+                                    : "bell"
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(
+                            resetReminderState.isEnabled
+                                ? Color.accentColor
+                                : Color.secondary
+                        )
+                        .help(resetReminderState.controlHelp)
+                        .accessibilityLabel("Reset Reminder")
+                        .accessibilityValue(
+                            "\(resetReminderState.isEnabled ? "On" : "Off"). \(resetReminderState.statusText)"
+                        )
+                        .accessibilityHint(
+                            resetReminderState.isEnabled
+                                ? "Turn reminder off."
+                                : "Turn reminder on."
+                        )
+                    }
+                }
             }
         } else {
             HeaderFact(label: "Banked resets", value: "Unavailable")
@@ -1551,6 +1630,9 @@ private struct ChartLegendItem: View {
 
 private struct FactsWorkspace: View {
     let reader: UsageReaderSnapshot
+    let resetReminderState: ResetReminderState
+    let setResetReminderEnabled: (Bool) -> Void
+    let setResetReminderLeadTime: (ResetReminderLeadTime) -> Void
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 14) {
@@ -1607,6 +1689,46 @@ private struct FactsWorkspace: View {
                                     at: context.date
                                 )
                             )
+                            Divider()
+                            Toggle(
+                                "Reset Reminder",
+                                isOn: Binding(
+                                    get: {
+                                        resetReminderState.isEnabled
+                                    },
+                                    set: setResetReminderEnabled
+                                )
+                            )
+                            .disabled(
+                                !resetReminderState.isEnabled
+                                    && summary.currentNextKnownExpiry(
+                                        at: context.date
+                                    ) == nil
+                            )
+                            .help(resetReminderState.controlHelp)
+
+                            Picker(
+                                "Remind me",
+                                selection: Binding(
+                                    get: {
+                                        resetReminderState.leadTime
+                                    },
+                                    set: setResetReminderLeadTime
+                                )
+                            ) {
+                                ForEach(ResetReminderLeadTime.allCases) {
+                                    leadTime in
+                                    Text(
+                                        "\(leadTime.displayName) before"
+                                    )
+                                    .tag(leadTime)
+                                }
+                            }
+                            .disabled(!resetReminderState.isEnabled)
+
+                            Text(resetReminderState.statusText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 } else {

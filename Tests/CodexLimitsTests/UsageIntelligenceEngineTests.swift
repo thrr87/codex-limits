@@ -1151,6 +1151,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             availableCount: 1,
             detailCoverage: .complete,
             knownExpiryCount: 1,
+            nextKnownResetID: "reset-1",
             nextKnownExpiry: now.addingTimeInterval(60),
             observedAt: now,
             freshness: .fresh,

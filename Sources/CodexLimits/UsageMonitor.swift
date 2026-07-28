@@ -22,6 +22,7 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var syncErrorMessage: String?
     @Published private(set) var historyDeletionStatus: UsageHistory.DeletionStatus = .none
     @Published private(set) var isUpdatingHistory = false
+    @Published private(set) var resetReminderState: ResetReminderState
 
     private static let stateKey = "usageState"
     private static let historyInstallationIDKey = "historyInstallationID"
@@ -38,6 +39,7 @@ final class UsageMonitor: ObservableObject {
     private let history: UsageHistory
     private let fetchUsage: () async throws -> CodexFetchResult
     private let localActivityCollector: LocalActivityCollector?
+    private let resetReminderCoordinator: ResetReminderCoordinator
     private var historyPartition: AccountHistoryPartition
     private var accountSnapshot: UsageSnapshot?
     private var sourceState: UsageSourceState = .available
@@ -80,11 +82,21 @@ final class UsageMonitor: ObservableObject {
         historyDirectory: URL? = nil,
         startsAutomatically: Bool = true,
         localActivityCollector: LocalActivityCollector? = nil,
+        resetReminderScheduler: (any ResetReminderScheduling)? = nil,
+        resetReminderNow: @escaping () -> Date = Date.init,
         fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch
     ) {
         self.defaults = defaults
         self.fetchUsage = fetchUsage
         self.localActivityCollector = localActivityCollector
+        let resetReminderCoordinator = ResetReminderCoordinator(
+            defaults: defaults,
+            scheduler: resetReminderScheduler
+                ?? UserNotificationResetReminderScheduler(),
+            now: resetReminderNow
+        )
+        self.resetReminderCoordinator = resetReminderCoordinator
+        resetReminderState = resetReminderCoordinator.state
         accountEpochStartedAt = defaults.object(
             forKey: Self.historyAccountEpochStartedAtKey
         ) as? Date
@@ -129,6 +141,8 @@ final class UsageMonitor: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        await resetReminderCoordinator.restore()
+        publishResetReminderState()
         if let cutoff = defaults.object(
             forKey: Self.localHistoryDeletionCutoffKey
         ) as? Date {
@@ -179,6 +193,7 @@ final class UsageMonitor: ObservableObject {
                 )
                 recalculate(now: result.snapshot.fetchedAt)
                 persist()
+                await reconcileResetReminder()
                 return
             }
             let legacySamples = legacySamplesAwaitingMigration
@@ -224,6 +239,7 @@ final class UsageMonitor: ObservableObject {
             )
             recalculate(now: newSnapshot.fetchedAt)
             persist()
+            await reconcileResetReminder()
         } catch {
             await exchangeRestoredHistoryIfAvailable()
             sourceState = .failed(
@@ -248,6 +264,22 @@ final class UsageMonitor: ObservableObject {
     func updateSafetyBuffer(_ value: Double) {
         recalculate(safetyBuffer: value)
         persist()
+    }
+
+    func setResetReminderEnabled(_ isEnabled: Bool) async {
+        await resetReminderCoordinator.setEnabled(
+            isEnabled,
+            target: resetReminderTarget()
+        )
+        publishResetReminderState()
+    }
+
+    func setResetReminderLeadTime(_ leadTime: ResetReminderLeadTime) async {
+        await resetReminderCoordinator.setLeadTime(
+            leadTime,
+            target: resetReminderTarget()
+        )
+        publishResetReminderState()
     }
 
     func connectHistoryFolder(_ directory: URL) async {
@@ -522,6 +554,7 @@ final class UsageMonitor: ObservableObject {
             )
             recalculate(now: snapshot.fetchedAt)
             persist()
+            await reconcileResetReminder()
         } catch let error as CodexClientError {
             sourceState = .failed(error.localizedDescription)
             recalculate()
@@ -556,6 +589,26 @@ final class UsageMonitor: ObservableObject {
         if let status = readerSnapshot.guidance?.status {
             previousStatus = status
         }
+    }
+
+    private func reconcileResetReminder() async {
+        await resetReminderCoordinator.reconcile(
+            target: resetReminderTarget()
+        )
+        publishResetReminderState()
+    }
+
+    private func resetReminderTarget(now: Date = Date()) -> ResetReminderTarget? {
+        guard let summary = readerSnapshot.bankedResets,
+              let id = summary.nextKnownResetID,
+              let expiresAt = summary.currentNextKnownExpiry(at: now) else {
+            return nil
+        }
+        return ResetReminderTarget(id: id, expiresAt: expiresAt)
+    }
+
+    private func publishResetReminderState() {
+        resetReminderState = resetReminderCoordinator.state
     }
 
     private func freshLifetimeTokens(in snapshot: UsageSnapshot) -> Int64? {
