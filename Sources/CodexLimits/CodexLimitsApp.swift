@@ -3,6 +3,9 @@ import SwiftUI
 @main
 struct CodexLimitsApp: App {
     @StateObject private var monitor: UsageMonitor
+    #if CODEX_LIMITS_QA
+    @StateObject private var assistedInsights: CodexAssistedInsightStore
+    #endif
     private let analyticsDefaults: UserDefaults
 
     init() {
@@ -46,6 +49,22 @@ struct CodexLimitsApp: App {
                 localActivityCollector: collector
             )
         )
+        _assistedInsights = StateObject(
+            wrappedValue: CodexAssistedInsightStore(
+                service: QACodexAssistedService(),
+                sourceReader: QACodexSourceContentReader(),
+                availabilityOverride: CodexAssistedModelProfile(
+                    id: "gpt-5.6-luna",
+                    model: "gpt-5.6-luna",
+                    reasoningEffort: "medium"
+                ),
+                strongerProfileOverride: CodexAssistedModelProfile(
+                    id: "gpt-5.6-luna",
+                    model: "gpt-5.6-luna",
+                    reasoningEffort: "high"
+                )
+            )
+        )
         #else
         LoginItem.enableByDefault()
         analyticsDefaults = .standard
@@ -59,7 +78,8 @@ struct CodexLimitsApp: App {
         Window("Codex Limits QA", id: "qa-window") {
             MenuContentView(
                 monitor: monitor,
-                defaults: analyticsDefaults
+                defaults: analyticsDefaults,
+                assistedInsights: assistedInsights
             )
         }
         .defaultPosition(.center)
@@ -84,3 +104,67 @@ struct CodexLimitsApp: App {
         }
     }
 }
+
+#if CODEX_LIMITS_QA
+private actor QACodexAssistedService: CodexAssistedInsightServicing {
+    private let medium = CodexAssistedModelProfile(
+        id: "gpt-5.6-luna",
+        model: "gpt-5.6-luna",
+        reasoningEffort: "medium"
+    )
+
+    func eligibleProfile() async throws -> CodexAssistedModelProfile? {
+        medium
+    }
+
+    func eligibleStrongerProfile() async throws
+        -> CodexAssistedModelProfile? {
+        CodexAssistedModelProfile(
+            id: medium.id,
+            model: medium.model,
+            reasoningEffort: "high"
+        )
+    }
+
+    func analyze(
+        payload _: CodexMetadataAnalysisPayload,
+        profile _: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome {
+        .failed(CodexAnalyticsOverhead(
+            durationSeconds: 0,
+            accountMovement: nil
+        ))
+    }
+
+    func analyzeSource(
+        payload _: CodexSourceAnalysisPayload,
+        metadata _: CodexMetadataAnalysisPayload,
+        profile _: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome {
+        .failed(CodexAnalyticsOverhead(
+            durationSeconds: 0,
+            accountMovement: nil
+        ))
+    }
+
+    func cancelAnalysis() async {}
+}
+
+private actor QACodexSourceContentReader: CodexSourceContentReading {
+    func prepare(
+        selection: CodexSourceSelection
+    ) async throws -> CodexSourceContentDraft {
+        CodexSourceContentDraft(
+            selection: selection,
+            values: [
+                .prompts: ["Build a bounded analytics view"],
+                .responses: ["The selected work is ready for review"],
+                .code: ["struct UsageView: View"],
+                .paths: ["/example/UsageView.swift"],
+                .commands: ["swift test"],
+                .toolOutput: ["All checks passed"]
+            ]
+        )
+    }
+}
+#endif

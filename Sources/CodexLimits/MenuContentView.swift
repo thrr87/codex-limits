@@ -10,14 +10,15 @@ struct MenuContentView: View {
 
     init(
         monitor: UsageMonitor,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        assistedInsights: CodexAssistedInsightStore? = nil
     ) {
         self.monitor = monitor
         _workspace = StateObject(
             wrappedValue: AnalyticsWorkspaceStore(defaults: defaults)
         )
         _assistedInsights = StateObject(
-            wrappedValue: CodexAssistedInsightStore()
+            wrappedValue: assistedInsights ?? CodexAssistedInsightStore()
         )
     }
 
@@ -3594,6 +3595,7 @@ struct InsightsWorkspace: View {
     @ObservedObject var store: AnalyticsWorkspaceStore
     @ObservedObject var assistedInsights: CodexAssistedInsightStore
     @State private var showsAssistedInfo = false
+    @State private var showsSourcePreflight = false
 
     private var snapshot: DeterministicInsightsSnapshot { reader.insights }
     private var assistedPayload: CodexMetadataAnalysisPayload {
@@ -3608,6 +3610,31 @@ struct InsightsWorkspace: View {
             accountPartitionID: reader.accountPartitionID,
             payload: assistedPayload
         )
+    }
+    private var sourceSelection: CodexSourceSelection? {
+        let selected = CodexSourceSelection.make(
+            reader: reader,
+            exploration: store.state
+        )
+        #if CODEX_LIMITS_QA
+        if selected == nil {
+            let range = assistedPayload.range
+            let start = range.map {
+                Date(timeIntervalSince1970: TimeInterval($0.start))
+            } ?? Date().addingTimeInterval(-3_600)
+            let end = range.map {
+                Date(timeIntervalSince1970: TimeInterval($0.end))
+            } ?? Date()
+            return CodexSourceSelection(
+                interval: DateInterval(start: start, end: end),
+                rootTaskIDs: ["qa-root"],
+                taskIDs: ["qa-task"],
+                projectLabel: "codex-limits",
+                turnIDsByTask: ["qa-task": ["qa-turn"]]
+            )
+        }
+        #endif
+        return selected
     }
 
     var body: some View {
@@ -3643,7 +3670,10 @@ struct InsightsWorkspace: View {
                 }
             }
 
-            if assistedInsights.showsCard(for: assistedScope) {
+            if assistedInsights.showsCard(
+                for: assistedScope,
+                sourceSelection: sourceSelection
+            ) {
                 codexAssistedCard
             }
         }
@@ -3652,13 +3682,56 @@ struct InsightsWorkspace: View {
                 accountPartitionID: reader.accountPartitionID
             )
         }
+        .onChange(of: sourceSelection) { _, selection in
+            assistedInsights.invalidateSourcePreflight(for: selection)
+            guard selection != nil else {
+                showsSourcePreflight = false
+                return
+            }
+            if assistedInsights.sourcePreflight == nil {
+                showsSourcePreflight = false
+            }
+        }
+        .sheet(
+            isPresented: $showsSourcePreflight,
+            onDismiss: {
+                assistedInsights.cancelSourcePreflight()
+            }
+        ) {
+            if let draft = assistedInsights.sourcePreflight {
+                SourceAnalysisPreflightView(
+                    draft: draft,
+                    cancel: {
+                        assistedInsights.cancelSourcePreflight()
+                        showsSourcePreflight = false
+                    },
+                    analyze: { categories in
+                        Task {
+                            let started =
+                                await assistedInsights.startSourceAnalysis(
+                                    metadata: assistedPayload,
+                                    scope: assistedScope,
+                                    selection: draft.selection,
+                                    categories: categories
+                                )
+                            if started {
+                                showsSourcePreflight = false
+                            }
+                        }
+                    }
+                )
+            }
+        }
     }
 
     @ViewBuilder
     private var codexAssistedCard: some View {
         WorkspaceCard(title: "Codex-assisted") {
             VStack(alignment: .leading, spacing: 10) {
-                if let result = assistedInsights.result(for: assistedScope) {
+                if let result = assistedInsights.result(
+                    for: assistedScope,
+                    sourceSelection: sourceSelection
+                ) {
                     Text(result.title)
                         .font(.headline)
                     Text(result.summary)
@@ -3713,10 +3786,10 @@ struct InsightsWorkspace: View {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Codex is analyzing metadata.")
+                        Text(assistedInsights.progressText)
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Codex is analyzing metadata")
+                    .accessibilityLabel(assistedInsights.progressText)
                     Button(
                         assistedInsights.isCancelling ? "Stopping…" : "Cancel"
                     ) {
@@ -3746,11 +3819,11 @@ struct InsightsWorkspace: View {
 
                 if assistedInsights.showsAnalyzeAction,
                    !assistedInsights.isRunning {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 10) {
                         Button(
                             assistedInsights.result(for: assistedScope) == nil
-                                ? "Analyze with Codex"
-                                : "Analyze again"
+                                ? "Analyze metadata"
+                                : "Analyze metadata again"
                         ) {
                             assistedInsights.startAnalysis(
                                 payload: assistedPayload,
@@ -3760,6 +3833,25 @@ struct InsightsWorkspace: View {
                         .accessibilityHint(
                             "Sends bounded metadata to Codex and uses your allowance"
                         )
+
+                        if let sourceSelection {
+                            Button("Analyze Source Content") {
+                                Task {
+                                    await assistedInsights.prepareSourceAnalysis(
+                                        selection: sourceSelection
+                                    )
+                                    guard assistedInsights.sourcePreflight
+                                            != nil else {
+                                        return
+                                    }
+                                    showsSourcePreflight = true
+                                }
+                            }
+                            .disabled(assistedInsights.isPreparingSource)
+                            .accessibilityHint(
+                                "Reads the selected Codex Tasks locally, then shows a preflight before sending anything"
+                            )
+                        }
 
                         Button {
                             showsAssistedInfo.toggle()
@@ -3776,6 +3868,37 @@ struct InsightsWorkspace: View {
                                 .padding(14)
                         }
                     }
+                }
+
+                if assistedInsights.isPreparingSource {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Preparing Source Content…")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityElement(children: .combine)
+                } else if let error = assistedInsights.sourcePreparationError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if assistedInsights.showsStrongerRetry,
+                   let label = assistedInsights.strongerRetryLabel {
+                    Button(label) {
+                        Task {
+                            _ = await assistedInsights
+                                .retrySourceWithStrongerProfile()
+                        }
+                    }
+                    .accessibilityHint(
+                        "Runs the same accepted Source Content again with a stronger profile and uses more allowance"
+                    )
+                    Text("This uses more Codex allowance. It never runs on its own.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .accessibilityElement(children: .contain)
@@ -3939,6 +4062,123 @@ struct InsightsWorkspace: View {
 
     @ViewBuilder
     private func insightEvidenceRow(
+        _ label: String,
+        _ value: String
+    ) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct SourceAnalysisPreflightView: View {
+    let draft: CodexSourceContentDraft
+    let cancel: () -> Void
+    let analyze: (Set<CodexSourceContentCategory>) -> Void
+    @State private var selectedCategories:
+        Set<CodexSourceContentCategory>
+
+    init(
+        draft: CodexSourceContentDraft,
+        cancel: @escaping () -> Void,
+        analyze: @escaping (Set<CodexSourceContentCategory>) -> Void
+    ) {
+        self.draft = draft
+        self.cancel = cancel
+        self.analyze = analyze
+        _selectedCategories = State(
+            initialValue: Set(draft.availableCategories)
+        )
+    }
+
+    private var period: String {
+        let style = Date.FormatStyle(date: .abbreviated, time: .shortened)
+            .locale(Locale(identifier: "en_US"))
+        return "\(draft.selection.interval.start.formatted(style))–\(draft.selection.interval.end.formatted(style))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Review Source Content")
+                    .font(.title2.weight(.semibold))
+                Text(
+                    "Codex will receive only the scope and categories selected below."
+                )
+                .foregroundStyle(.secondary)
+            }
+
+            Grid(
+                alignment: .leading,
+                horizontalSpacing: 18,
+                verticalSpacing: 6
+            ) {
+                if let project = draft.selection.projectLabel {
+                    preflightRow("Project", project)
+                }
+                preflightRow("Period", period)
+                preflightRow(
+                    "Task Trees",
+                    draft.selection.rootTaskIDs.count.formatted()
+                )
+                preflightRow(
+                    "Tasks",
+                    draft.selection.taskIDs.count.formatted()
+                )
+            }
+            .font(.callout)
+
+            VStack(alignment: .leading, spacing: 9) {
+                Text("Content sent")
+                    .font(.headline)
+                ForEach(draft.availableCategories, id: \.self) { category in
+                    Toggle(
+                        category.displayName,
+                        isOn: Binding(
+                            get: {
+                                selectedCategories.contains(category)
+                            },
+                            set: { isSelected in
+                                if isSelected {
+                                    selectedCategories.insert(category)
+                                } else {
+                                    selectedCategories.remove(category)
+                                }
+                            }
+                        )
+                    )
+                }
+            }
+            .accessibilityElement(children: .contain)
+
+            Text(
+                "Uses GPT-5.6 Luna Medium and your Codex allowance."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            HStack {
+                Button("Cancel", role: .cancel, action: cancel)
+                Spacer()
+                Button("Analyze with Codex") {
+                    analyze(selectedCategories)
+                }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedCategories.isEmpty)
+                    .accessibilityHint(
+                        "Sends the selected categories to Codex"
+                    )
+            }
+        }
+        .padding(22)
+        .frame(width: 460)
+    }
+
+    @ViewBuilder
+    private func preflightRow(
         _ label: String,
         _ value: String
     ) -> some View {

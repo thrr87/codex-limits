@@ -21,21 +21,39 @@ enum CodexAssistedModelCatalog {
     static func selectProfile(
         from models: [CodexAdvertisedModel]
     ) -> CodexAssistedModelProfile? {
-        models.first { model in
-            guard !model.hidden,
-                  model.id.caseInsensitiveCompare(modelID) == .orderedSame,
-                  model.model.caseInsensitiveCompare(modelID) == .orderedSame,
-                  model.supportedReasoningEfforts.contains(where: {
-                      $0.caseInsensitiveCompare("medium") == .orderedSame
-                  }) else {
-                return false
+        selectProfile(from: models, preferredEfforts: ["medium"])
+    }
+
+    static func selectStrongerProfile(
+        from models: [CodexAdvertisedModel]
+    ) -> CodexAssistedModelProfile? {
+        selectProfile(
+            from: models,
+            preferredEfforts: ["high", "xhigh", "max", "ultra"]
+        )
+    }
+
+    private static func selectProfile(
+        from models: [CodexAdvertisedModel],
+        preferredEfforts: [String]
+    ) -> CodexAssistedModelProfile? {
+        guard let model = models.first(where: {
+            !$0.hidden
+                && $0.id.caseInsensitiveCompare(modelID) == .orderedSame
+                && $0.model.caseInsensitiveCompare(modelID) == .orderedSame
+        }) else {
+            return nil
+        }
+        let effort = preferredEfforts.first { candidate in
+            model.supportedReasoningEfforts.contains {
+                $0.caseInsensitiveCompare(candidate) == .orderedSame
             }
-            return true
-        }.map {
+        }
+        return effort.map {
             CodexAssistedModelProfile(
-                id: $0.id,
-                model: $0.model,
-                reasoningEffort: "medium"
+                id: model.id,
+                model: model.model,
+                reasoningEffort: $0
             )
         }
     }
@@ -316,6 +334,7 @@ enum CodexAssistedRequestError: Error {
 
 enum CodexAssistedRequestFactory {
     static let maximumMetadataBytes = 8_192
+    static let maximumSourceBytes = 65_536
     static let toolProvidingFeatures: Set<String> = [
         "apps",
         "artifact",
@@ -444,6 +463,42 @@ enum CodexAssistedRequestFactory {
     ) throws -> [String: Any] {
         let data = try metadataData(payload)
         let metadata = String(decoding: data, as: UTF8.self)
+        return turnStart(
+            id: id,
+            threadID: threadID,
+            profile: profile,
+            text: requestText(metadata: metadata),
+            outputSchema: metadataOutputSchema
+        )
+    }
+
+    static func sourceTurnStart(
+        id: Int,
+        threadID: String,
+        profile: CodexAssistedModelProfile,
+        payload: CodexSourceAnalysisPayload
+    ) throws -> [String: Any] {
+        let data = try sourceData(payload)
+        let source = String(decoding: data, as: UTF8.self)
+        return turnStart(
+            id: id,
+            threadID: threadID,
+            profile: profile,
+            text: """
+            Analyze only this accepted, bounded Codex payload. Source Content categories and scope match the user’s preflight:
+            \(source)
+            """,
+            outputSchema: sourceOutputSchema
+        )
+    }
+
+    private static func turnStart(
+        id: Int,
+        threadID: String,
+        profile: CodexAssistedModelProfile,
+        text: String,
+        outputSchema: [String: Any]
+    ) -> [String: Any] {
         return [
             "id": id,
             "method": "turn/start",
@@ -451,7 +506,7 @@ enum CodexAssistedRequestFactory {
                 "threadId": threadID,
                 "input": [[
                     "type": "text",
-                    "text": requestText(metadata: metadata)
+                    "text": text
                 ]],
                 "model": profile.model,
                 "effort": profile.reasoningEffort,
@@ -511,20 +566,33 @@ enum CodexAssistedRequestFactory {
     static func metadataData(
         _ payload: CodexMetadataAnalysisPayload
     ) throws -> Data {
+        try encode(payload, maximumBytes: maximumMetadataBytes)
+    }
+
+    static func sourceData(
+        _ payload: CodexSourceAnalysisPayload
+    ) throws -> Data {
+        try encode(payload, maximumBytes: maximumSourceBytes)
+    }
+
+    private static func encode<T: Encodable>(
+        _ payload: T,
+        maximumBytes: Int
+    ) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(payload)
-        guard data.count <= maximumMetadataBytes else {
+        guard data.count <= maximumBytes else {
             throw CodexAssistedRequestError.payloadTooLarge
         }
         return data
     }
 
     private static let baseInstructions =
-        "Analyze only the JSON metadata in the user message. Do not use tools, files, commands, network access, other tasks, or outside knowledge."
+        "Analyze only the JSON supplied in the user message. Do not use tools, files, commands, network access, other tasks, or outside knowledge."
 
     private static let developerInstructions =
-        "Choose the single most useful supported insight kind. Do not write a claim. The app builds the reader-facing text from measured values. If no listed kind has High-confidence evidence, return an error."
+        "Return only the current output schema. For metadata, choose the single most useful supported insight kind. For Source Content, choose only a High-confidence pattern supported by at least two exact category and one-based item references. Never quote or reproduce Source Content. If the evidence does not meet that bar, return an error."
 
     private static func requestText(metadata: String) -> String {
         """
@@ -534,7 +602,7 @@ enum CodexAssistedRequestFactory {
         """
     }
 
-    private static let outputSchema: [String: Any] = [
+    private static let metadataOutputSchema: [String: Any] = [
         "type": "object",
         "additionalProperties": false,
         "required": ["insightKind"],
@@ -542,6 +610,45 @@ enum CodexAssistedRequestFactory {
             "insightKind": [
                 "type": "string",
                 "enum": CodexAssistedInsightKind.allCases.map(\.rawValue)
+            ]
+        ]
+    ]
+
+    private static let sourceOutputSchema: [String: Any] = [
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sourceInsightKind", "evidence"],
+        "properties": [
+            "sourceInsightKind": [
+                "type": "string",
+                "enum": CodexSourceInsightKind.allCases.map(\.rawValue)
+            ],
+            "evidence": [
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 6,
+                "items": [
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["category", "itemNumbers"],
+                    "properties": [
+                        "category": [
+                            "type": "string",
+                            "enum": CodexSourceContentCategory.allCases
+                                .map(\.rawValue)
+                        ],
+                        "itemNumbers": [
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "uniqueItems": true,
+                            "items": [
+                                "type": "integer",
+                                "minimum": 1
+                            ]
+                        ]
+                    ]
+                ]
             ]
         ]
     ]
@@ -588,6 +695,8 @@ enum CodexAssistedAnalysisOutcome: Equatable, Sendable {
 struct CodexAssistedAnalysisScope: Equatable, Sendable {
     let accountPartitionID: String?
     let payload: CodexMetadataAnalysisPayload
+    let sourceSelectionFingerprint: String?
+    let sourceCategories: [String]?
     let timeRange: AnalyticsTimeRange
     let visibleRange: DateInterval?
     let filters: WorkspaceFilters
@@ -601,6 +710,8 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
     ) {
         self.accountPartitionID = accountPartitionID
         self.payload = payload
+        sourceSelectionFingerprint = nil
+        sourceCategories = nil
         timeRange = exploration.timeRange
         visibleRange = exploration.visibleRange
         filters = exploration.filters
@@ -613,6 +724,8 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
         let identity = Identity(
             accountPartitionID: accountPartitionID,
             payloadFingerprint: payload.fingerprint,
+            sourceSelectionFingerprint: sourceSelectionFingerprint,
+            sourceCategories: sourceCategories,
             timeRange: timeRange,
             visibleRange: visibleRange,
             filters: filters,
@@ -630,9 +743,52 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
             .joined()
     }
 
+    func sourceBacked(
+        selection: CodexSourceSelection,
+        categories: Set<CodexSourceContentCategory>
+    ) -> CodexAssistedAnalysisScope {
+        CodexAssistedAnalysisScope(
+            accountPartitionID: accountPartitionID,
+            payload: self.payload,
+            sourceSelectionFingerprint: selection.fingerprint,
+            sourceCategories: categories.map(\.rawValue).sorted(),
+            timeRange: timeRange,
+            visibleRange: visibleRange,
+            filters: filters,
+            pinnedUsageBaselineID: pinnedUsageBaselineID,
+            pinnedUsageBaselineAccountPartitionID:
+                pinnedUsageBaselineAccountPartitionID
+        )
+    }
+
+    private init(
+        accountPartitionID: String?,
+        payload: CodexMetadataAnalysisPayload,
+        sourceSelectionFingerprint: String?,
+        sourceCategories: [String]?,
+        timeRange: AnalyticsTimeRange,
+        visibleRange: DateInterval?,
+        filters: WorkspaceFilters,
+        pinnedUsageBaselineID: String?,
+        pinnedUsageBaselineAccountPartitionID: String?
+    ) {
+        self.accountPartitionID = accountPartitionID
+        self.payload = payload
+        self.sourceSelectionFingerprint = sourceSelectionFingerprint
+        self.sourceCategories = sourceCategories
+        self.timeRange = timeRange
+        self.visibleRange = visibleRange
+        self.filters = filters
+        self.pinnedUsageBaselineID = pinnedUsageBaselineID
+        self.pinnedUsageBaselineAccountPartitionID =
+            pinnedUsageBaselineAccountPartitionID
+    }
+
     private struct Identity: Codable {
         let accountPartitionID: String?
         let payloadFingerprint: String
+        let sourceSelectionFingerprint: String?
+        let sourceCategories: [String]?
         let timeRange: AnalyticsTimeRange
         let visibleRange: DateInterval?
         let filters: WorkspaceFilters
@@ -844,11 +1000,36 @@ enum CodexAssistedEvidenceResolver {
 
 protocol CodexAssistedInsightServicing: Sendable {
     func eligibleProfile() async throws -> CodexAssistedModelProfile?
+    func eligibleStrongerProfile() async throws -> CodexAssistedModelProfile?
     func analyze(
         payload: CodexMetadataAnalysisPayload,
         profile: CodexAssistedModelProfile
     ) async -> CodexAssistedAnalysisOutcome
+    func analyzeSource(
+        payload: CodexSourceAnalysisPayload,
+        metadata: CodexMetadataAnalysisPayload,
+        profile: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome
     func cancelAnalysis() async
+}
+
+extension CodexAssistedInsightServicing {
+    func eligibleStrongerProfile() async throws -> CodexAssistedModelProfile? {
+        nil
+    }
+
+    func analyzeSource(
+        payload _: CodexSourceAnalysisPayload,
+        metadata _: CodexMetadataAnalysisPayload,
+        profile _: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome {
+        .failed(
+            CodexAnalyticsOverhead(
+                durationSeconds: 0,
+                accountMovement: nil
+            )
+        )
+    }
 }
 
 enum CodexAssistedRunState: Equatable, Sendable {
@@ -864,10 +1045,23 @@ final class CodexAssistedInsightStore: ObservableObject {
     @Published private(set) var showsAnalyzeAction = false
     @Published private(set) var runState: CodexAssistedRunState = .idle
     @Published private(set) var isCancelling = false
+    @Published private(set) var sourcePreflight: CodexSourceContentDraft?
+    @Published private(set) var isPreparingSource = false
+    @Published private(set) var sourcePreparationError: String?
 
     private let service: any CodexAssistedInsightServicing
+    private let sourceReader: any CodexSourceContentReading
     private let history: CodexAssistedHistory?
+    private var availabilityOverride: CodexAssistedModelProfile?
+    private var strongerProfileOverride: CodexAssistedModelProfile?
     private var profile: CodexAssistedModelProfile?
+    private var strongerProfile: CodexAssistedModelProfile?
+    private var lastSourceRequest: (
+        payload: CodexSourceAnalysisPayload,
+        metadata: CodexMetadataAnalysisPayload,
+        scope: CodexAssistedAnalysisScope,
+        selection: CodexSourceSelection
+    )?
     private var didCheckAvailability = false
     private var availabilityAccountPartitionID: String?
     private var analysisTask: Task<Void, Never>?
@@ -878,13 +1072,22 @@ final class CodexAssistedInsightStore: ObservableObject {
     private var analysisID: UUID?
     private var analysisStartedAt: Date?
     private var latestDeletionCutoff = Date.distantPast
+    private var analysisUsesSource = false
+    private var sourcePreparationID: UUID?
+    private var sourcePreparationSelection: CodexSourceSelection?
+    private var sourcePreparationTask:
+        Task<CodexSourceContentDraft, Error>?
 
     init(
         service: any CodexAssistedInsightServicing,
+        sourceReader: any CodexSourceContentReading = CodexSourceContentReader(),
         history: CodexAssistedHistory? = nil
     ) {
         self.service = service
+        self.sourceReader = sourceReader
         self.history = history
+        availabilityOverride = nil
+        strongerProfileOverride = nil
         deletionCancellable = NotificationCenter.default.publisher(
             for: .codexAssistedHistoryDeleted
         )
@@ -902,9 +1105,26 @@ final class CodexAssistedInsightStore: ObservableObject {
     convenience init() {
         self.init(
             service: CodexAssistedClient.shared,
+            sourceReader: CodexSourceContentReader(),
             history: CodexAssistedHistory.shared
         )
     }
+
+    #if CODEX_LIMITS_QA
+    convenience init(
+        service: any CodexAssistedInsightServicing,
+        sourceReader: any CodexSourceContentReading,
+        availabilityOverride: CodexAssistedModelProfile,
+        strongerProfileOverride: CodexAssistedModelProfile?
+    ) {
+        self.init(
+            service: service,
+            sourceReader: sourceReader
+        )
+        self.availabilityOverride = availabilityOverride
+        self.strongerProfileOverride = strongerProfileOverride
+    }
+    #endif
 
     var result: CodexAssistedAnalysisResult? {
         guard case let .succeeded(result) = runState else { return nil }
@@ -925,7 +1145,15 @@ final class CodexAssistedInsightStore: ObservableObject {
         if storageWriteFailed {
             return "Codex finished, but the analysis could not be saved. Try again when you choose."
         }
-        return "Codex could not analyze this metadata. Try again when you choose."
+        return analysisUsesSource
+            ? "Codex could not analyze this selection. Try again when you choose."
+            : "Codex could not analyze this metadata. Try again when you choose."
+    }
+
+    var progressText: String {
+        analysisUsesSource
+            ? "Codex is analyzing the selected Source Content."
+            : "Codex is analyzing metadata."
     }
 
     var overhead: CodexAnalyticsOverhead? {
@@ -936,6 +1164,19 @@ final class CodexAssistedInsightStore: ObservableObject {
             return result.overhead
         case let .failed(overhead), let .cancelled(overhead):
             return overhead
+        }
+    }
+
+    var showsStrongerRetry: Bool {
+        guard case .failed = runState else { return false }
+        return lastSourceRequest != nil
+            && strongerProfile != nil
+            && analysisTask == nil
+    }
+
+    var strongerRetryLabel: String? {
+        strongerProfile.map {
+            "Retry with Luna \($0.reasoningEffort.capitalized)"
         }
     }
 
@@ -953,6 +1194,19 @@ final class CodexAssistedInsightStore: ObservableObject {
             || result(for: scope) != nil
     }
 
+    func showsCard(
+        for scope: CodexAssistedAnalysisScope,
+        sourceSelection: CodexSourceSelection?
+    ) -> Bool {
+        showsAnalyzeAction
+            || isRunning
+            || overhead != nil
+            || result(
+                for: scope,
+                sourceSelection: sourceSelection
+            ) != nil
+    }
+
     func result(
         for scope: CodexAssistedAnalysisScope
     ) -> CodexAssistedAnalysisResult? {
@@ -962,6 +1216,39 @@ final class CodexAssistedInsightStore: ObservableObject {
         return persistedResults.last {
             $0.scopeFingerprint == scope.fingerprint
         }?.result
+    }
+
+    func result(
+        for scope: CodexAssistedAnalysisScope,
+        sourceSelection: CodexSourceSelection?
+    ) -> CodexAssistedAnalysisResult? {
+        let selectionFingerprint = sourceSelection?.fingerprint
+        var candidates: [CodexAssistedAnalysisResult] = []
+        if let result,
+           resultScope == scope
+            || (
+                selectionFingerprint != nil
+                    && resultScope?.sourceSelectionFingerprint
+                    == selectionFingerprint
+            ) {
+            candidates.append(result)
+        }
+        candidates.append(
+            contentsOf: persistedResults.compactMap {
+                guard $0.scopeFingerprint == scope.fingerprint
+                    || (
+                        selectionFingerprint != nil
+                            && $0.sourceSelectionFingerprint
+                            == selectionFingerprint
+                    ) else {
+                    return nil
+                }
+                return $0.result
+            }
+        )
+        return candidates.max {
+            $0.observedAt < $1.observedAt
+        }
     }
 
     func checkAvailability(
@@ -980,24 +1267,37 @@ final class CodexAssistedInsightStore: ObservableObject {
                 accountPartitionID: accountPartitionID
             )
         }
+        if let availabilityOverride {
+            profile = availabilityOverride
+            strongerProfile = strongerProfileOverride
+            showsAnalyzeAction = true
+            didCheckAvailability = true
+            return
+        }
         do {
             let eligible = try await service.eligibleProfile()
             try Task.checkCancellation()
             profile = eligible
+            strongerProfile = eligible == nil
+                ? nil
+                : try? await service.eligibleStrongerProfile()
             showsAnalyzeAction = profile != nil
             didCheckAvailability = true
         } catch is CancellationError {
             profile = nil
+            strongerProfile = nil
             showsAnalyzeAction = false
             didCheckAvailability = false
         } catch {
             guard !Task.isCancelled else {
                 profile = nil
+                strongerProfile = nil
                 showsAnalyzeAction = false
                 didCheckAvailability = false
                 return
             }
             profile = nil
+            strongerProfile = nil
             showsAnalyzeAction = false
             didCheckAvailability = true
         }
@@ -1012,50 +1312,172 @@ final class CodexAssistedInsightStore: ObservableObject {
               showsAnalyzeAction else {
             return
         }
-        resultScope = scope
-        let currentAnalysisID = UUID()
-        let startedAt = Date()
-        analysisID = currentAnalysisID
-        analysisStartedAt = startedAt
-        storageWriteFailed = false
-        isCancelling = false
-        runState = .running
-        analysisTask = Task { [weak self] in
-            guard let self else { return }
-            let outcome = await service.analyze(
+        lastSourceRequest = nil
+        analysisUsesSource = false
+        start(scope: scope) { [service] in
+            await service.analyze(
                 payload: payload,
                 profile: profile
             )
-            guard analysisID == currentAnalysisID,
-                  startedAt > latestDeletionCutoff else {
-                return
-            }
-            do {
-                try await persist(outcome: outcome, scope: scope)
-            } catch {
-                guard resultScope == scope else { return }
-                storageWriteFailed = true
-                runState = .failed(outcome.overhead)
-                isCancelling = false
-                analysisTask = nil
-                analysisID = nil
-                analysisStartedAt = nil
-                return
-            }
-            guard resultScope == scope else { return }
-            switch outcome {
-            case let .succeeded(result):
-                runState = .succeeded(result)
-            case let .failed(overhead):
-                runState = .failed(overhead)
-            case let .cancelled(overhead):
-                runState = .cancelled(overhead)
-            }
-            isCancelling = false
-            analysisTask = nil
-            analysisID = nil
-            analysisStartedAt = nil
         }
+    }
+
+    func prepareSourceAnalysis(
+        selection: CodexSourceSelection
+    ) async {
+        guard showsAnalyzeAction, !isRunning, !isPreparingSource else {
+            return
+        }
+        lastSourceRequest = nil
+        isPreparingSource = true
+        let preparationID = UUID()
+        sourcePreparationID = preparationID
+        sourcePreparationSelection = selection
+        sourcePreparationError = nil
+        sourcePreflight = nil
+        let preparationTask = Task { [sourceReader] in
+            try await sourceReader.prepare(selection: selection)
+        }
+        sourcePreparationTask = preparationTask
+        do {
+            let draft = try await preparationTask.value
+            try Task.checkCancellation()
+            guard sourcePreparationID == preparationID else { return }
+            sourcePreflight = draft
+        } catch is CancellationError {
+            guard sourcePreparationID == preparationID else { return }
+            sourcePreflight = nil
+        } catch {
+            guard sourcePreparationID == preparationID else { return }
+            sourcePreflight = nil
+            sourcePreparationError =
+                "Source Content is unavailable for this selection."
+        }
+        if sourcePreparationID == preparationID {
+            sourcePreparationID = nil
+            sourcePreparationSelection = nil
+            sourcePreparationTask = nil
+            isPreparingSource = false
+        }
+    }
+
+    func cancelSourcePreflight() {
+        sourcePreparationTask?.cancel()
+        sourcePreparationTask = nil
+        sourcePreparationID = nil
+        sourcePreparationSelection = nil
+        isPreparingSource = false
+        sourcePreflight = nil
+        sourcePreparationError = nil
+    }
+
+    func invalidateSourcePreflight(
+        for selection: CodexSourceSelection?
+    ) {
+        guard let selection else {
+            lastSourceRequest = nil
+            cancelSourcePreflight()
+            return
+        }
+        if lastSourceRequest?.selection != selection {
+            lastSourceRequest = nil
+        }
+        if sourcePreflight?.selection == selection
+            || sourcePreparationSelection == selection {
+            return
+        }
+        cancelSourcePreflight()
+    }
+
+    @discardableResult
+    func startSourceAnalysis(
+        metadata: CodexMetadataAnalysisPayload,
+        scope: CodexAssistedAnalysisScope,
+        selection: CodexSourceSelection,
+        categories: Set<CodexSourceContentCategory>
+    ) async -> Bool {
+        guard analysisTask == nil,
+              let profile,
+              showsAnalyzeAction,
+              let draft = sourcePreflight,
+              draft.selection == selection,
+              let payload = try? CodexSourceAnalysisPayload(
+                  draft: draft,
+                  categories: categories
+              ) else {
+            return false
+        }
+        guard (try? await service.eligibleProfile()) == profile else {
+            self.profile = nil
+            strongerProfile = nil
+            showsAnalyzeAction = false
+            sourcePreflight = nil
+            return false
+        }
+        guard sourcePreflight == draft,
+              draft.selection == selection else {
+            return false
+        }
+        sourcePreflight = nil
+        sourcePreparationError = nil
+        let sourceScope = scope.sourceBacked(
+            selection: selection,
+            categories: categories
+        )
+        lastSourceRequest = (
+            payload,
+            metadata,
+            sourceScope,
+            selection
+        )
+        analysisUsesSource = true
+        start(
+            scope: sourceScope
+        ) { [service] in
+            await service.analyzeSource(
+                payload: payload,
+                metadata: metadata,
+                profile: profile
+            )
+        }
+        return true
+    }
+
+    @discardableResult
+    func retrySourceWithStrongerProfile() async -> Bool {
+        guard showsStrongerRetry,
+              let lastSourceRequest else {
+            return false
+        }
+        guard (try? await service.eligibleProfile()) == profile else {
+            profile = nil
+            strongerProfile = nil
+            showsAnalyzeAction = false
+            self.lastSourceRequest = nil
+            return false
+        }
+        guard
+              let advertised = try? await service.eligibleStrongerProfile(),
+              advertised == strongerProfile else {
+            strongerProfile = nil
+            self.lastSourceRequest = nil
+            return false
+        }
+        guard self.lastSourceRequest?.payload.fingerprint
+            == lastSourceRequest.payload.fingerprint,
+              self.lastSourceRequest?.selection
+            == lastSourceRequest.selection else {
+            return false
+        }
+        analysisUsesSource = true
+        start(scope: lastSourceRequest.scope) { [service] in
+            await service.analyzeSource(
+                payload: lastSourceRequest.payload,
+                metadata: lastSourceRequest.metadata,
+                profile: advertised
+            )
+        }
+        return true
     }
 
     func cancelAnalysis() async {
@@ -1085,12 +1507,71 @@ final class CodexAssistedInsightStore: ObservableObject {
         analysisID = nil
         analysisStartedAt = nil
         profile = nil
+        strongerProfile = nil
+        lastSourceRequest = nil
         didCheckAvailability = false
         showsAnalyzeAction = false
         runState = .idle
         isCancelling = false
         storageWriteFailed = false
+        analysisUsesSource = false
         persistedResults = []
+        sourcePreflight = nil
+        sourcePreparationError = nil
+        isPreparingSource = false
+        sourcePreparationID = nil
+        sourcePreparationSelection = nil
+        sourcePreparationTask?.cancel()
+        sourcePreparationTask = nil
+    }
+
+    private func start(
+        scope: CodexAssistedAnalysisScope,
+        operation: @escaping @Sendable () async -> CodexAssistedAnalysisOutcome
+    ) {
+        resultScope = scope
+        let currentAnalysisID = UUID()
+        let startedAt = Date()
+        analysisID = currentAnalysisID
+        analysisStartedAt = startedAt
+        storageWriteFailed = false
+        isCancelling = false
+        runState = .running
+        analysisTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await operation()
+            guard analysisID == currentAnalysisID,
+                  startedAt > latestDeletionCutoff else {
+                return
+            }
+            do {
+                try await persist(outcome: outcome, scope: scope)
+            } catch {
+                guard resultScope == scope else { return }
+                storageWriteFailed = true
+                runState = .failed(outcome.overhead)
+                isCancelling = false
+                analysisTask = nil
+                analysisID = nil
+                analysisStartedAt = nil
+                return
+            }
+            guard resultScope == scope else { return }
+            switch outcome {
+            case let .succeeded(result):
+                runState = .succeeded(result)
+                lastSourceRequest = nil
+            case let .failed(overhead):
+                runState = .failed(overhead)
+            case let .cancelled(overhead):
+                runState = .cancelled(overhead)
+                lastSourceRequest = nil
+            }
+            isCancelling = false
+            analysisTask = nil
+            analysisID = nil
+            analysisStartedAt = nil
+        }
     }
 
     private func persist(
@@ -1131,6 +1612,8 @@ final class CodexAssistedInsightStore: ObservableObject {
 
     private func clearDeletedHistory(cutoff: Date) {
         latestDeletionCutoff = max(latestDeletionCutoff, cutoff)
+        cancelSourcePreflight()
+        lastSourceRequest = nil
         persistedResults.removeAll {
             $0.result.observedAt <= cutoff
         }
@@ -1182,6 +1665,11 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
         let turnID: String
     }
 
+    private enum AnalysisPayload {
+        case metadata(CodexMetadataAnalysisPayload)
+        case source(CodexSourceAnalysisPayload)
+    }
+
     private let makeConnection: @Sendable () throws -> CodexAppServerConnection
     private let timeoutNanoseconds: UInt64
     private let now: @Sendable () -> Date
@@ -1200,6 +1688,20 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
     }
 
     func eligibleProfile() async throws -> CodexAssistedModelProfile? {
+        try await eligibleProfile(
+            selecting: CodexAssistedModelCatalog.selectProfile
+        )
+    }
+
+    func eligibleStrongerProfile() async throws -> CodexAssistedModelProfile? {
+        try await eligibleProfile(
+            selecting: CodexAssistedModelCatalog.selectStrongerProfile
+        )
+    }
+
+    private func eligibleProfile(
+        selecting: ([CodexAdvertisedModel]) -> CodexAssistedModelProfile?
+    ) async throws -> CodexAssistedModelProfile? {
         try Task.checkCancellation()
         let connection = try makeConnection()
         defer { connection.stop() }
@@ -1221,9 +1723,7 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
                 throw CodexAssistedClientError.invalidResponse
             }
             models.append(contentsOf: page.compactMap(Self.decodeModel))
-            if let profile = CodexAssistedModelCatalog.selectProfile(
-                from: models
-            ) {
+            if let profile = selecting(models) {
                 return try await hasRunnableAccount(on: connection)
                     ? profile
                     : nil
@@ -1240,10 +1740,39 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
         payload: CodexMetadataAnalysisPayload,
         profile: CodexAssistedModelProfile
     ) async -> CodexAssistedAnalysisOutcome {
+        await analyze(
+            requestPayload: .metadata(payload),
+            evidencePayload: payload,
+            profile: profile
+        )
+    }
+
+    func analyzeSource(
+        payload: CodexSourceAnalysisPayload,
+        metadata: CodexMetadataAnalysisPayload,
+        profile: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome {
+        await analyze(
+            requestPayload: .source(payload),
+            evidencePayload: metadata,
+            profile: profile
+        )
+    }
+
+    private func analyze(
+        requestPayload: AnalysisPayload,
+        evidencePayload: CodexMetadataAnalysisPayload,
+        profile: CodexAssistedModelProfile
+    ) async -> CodexAssistedAnalysisOutcome {
         let startedAt = now()
         let connection: CodexAppServerConnection
         do {
-            _ = try CodexAssistedRequestFactory.metadataData(payload)
+            switch requestPayload {
+            case let .metadata(payload):
+                _ = try CodexAssistedRequestFactory.metadataData(payload)
+            case let .source(payload):
+                _ = try CodexAssistedRequestFactory.sourceData(payload)
+            }
             connection = try makeConnection()
         } catch {
             return .failed(
@@ -1293,15 +1822,24 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
                 throw CodexAssistedClientError.invalidResponse
             }
 
-            let turnResponse = try await request(
-                try CodexAssistedRequestFactory.turnStart(
+            let turnRequest: [String: Any]
+            switch requestPayload {
+            case let .metadata(payload):
+                turnRequest = try CodexAssistedRequestFactory.turnStart(
                     id: requestID(),
                     threadID: threadID,
                     profile: profile,
                     payload: payload
-                ),
-                on: connection
-            )
+                )
+            case let .source(payload):
+                turnRequest = try CodexAssistedRequestFactory.sourceTurnStart(
+                    id: requestID(),
+                    threadID: threadID,
+                    profile: profile,
+                    payload: payload
+                )
+            }
+            let turnResponse = try await request(turnRequest, on: connection)
             guard let turnResult =
                     turnResponse["result"] as? [String: Any],
                   let turn = turnResult["turn"] as? [String: Any],
@@ -1314,16 +1852,30 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
                 threadID: threadID,
                 turnID: turnID
             )
-            let decoded = try await readResult(
+            let responseText = try await readResult(
                 from: connection,
                 threadID: threadID,
                 turnID: turnID
             )
-            guard let evidence = CodexAssistedEvidenceResolver.resolve(
-                kind: decoded,
-                payload: payload
-            ) else {
-                throw CodexAssistedRequestError.invalidResult
+            let evidence: CodexAssistedEvidenceEnvelope
+            switch requestPayload {
+            case .metadata:
+                let decoded = try CodexAssistedResultDecoder.decode(
+                    responseText
+                )
+                guard let resolved = CodexAssistedEvidenceResolver.resolve(
+                    kind: decoded,
+                    payload: evidencePayload
+                ) else {
+                    throw CodexAssistedRequestError.invalidResult
+                }
+                evidence = resolved
+            case let .source(payload):
+                evidence = try CodexSourceResultDecoder.decode(
+                    responseText,
+                    payload: payload,
+                    metadata: evidencePayload
+                )
             }
             let completedAt = now()
             let overhead = await measuredOverhead(
@@ -1542,7 +2094,7 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
         from connection: CodexAppServerConnection,
         threadID: String,
         turnID: String
-    ) async throws -> CodexAssistedInsightKind {
+    ) async throws -> String {
         var agentMessage: String?
         while let object = try await nextObject(from: connection) {
             try Task.checkCancellation()
@@ -1588,7 +2140,7 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
                     ?? Self.agentMessage(in: turn) else {
                 throw CodexAssistedClientError.analysisFailed
             }
-            return try CodexAssistedResultDecoder.decode(text)
+            return text
         }
         throw CodexAssistedClientError.connectionLost
     }

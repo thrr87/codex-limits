@@ -12,6 +12,8 @@ struct CodexAssistedHistoryResult: Codable, Equatable, Sendable {
     let id: UUID
     let accountPartitionID: String
     let scopeFingerprint: String
+    let sourceSelectionFingerprint: String?
+    let sourceCategories: [String]?
     let result: CodexAssistedAnalysisResult
 }
 
@@ -89,6 +91,9 @@ actor CodexAssistedHistory {
                 id: UUID(),
                 accountPartitionID: accountPartitionID,
                 scopeFingerprint: scope.fingerprint,
+                sourceSelectionFingerprint:
+                    scope.sourceSelectionFingerprint,
+                sourceCategories: scope.sourceCategories,
                 result: result
             )
         )
@@ -152,6 +157,9 @@ actor CodexAssistedHistory {
                     id: UUID(),
                     accountPartitionID: accountPartitionID,
                     scopeFingerprint: scope.fingerprint,
+                    sourceSelectionFingerprint:
+                        scope.sourceSelectionFingerprint,
+                    sourceCategories: scope.sourceCategories,
                     result: result
                 )
             )
