@@ -372,6 +372,7 @@ struct SettingsView: View {
     @AppStorage(UsageMonitor.safetyBufferKey) private var safetyBuffer = 3.0
     @AppStorage(LoginItem.preferenceKey) private var launchAtLogin = true
     @State private var loginItemError: String?
+    @State private var confirmsHistoryDeletion = false
 
     var body: some View {
         Form {
@@ -399,6 +400,9 @@ struct SettingsView: View {
 
                 if let folderName = monitor.syncFolderName {
                     LabeledContent("Folder", value: folderName)
+                    if monitor.historyDeletionStatus == .pendingSync {
+                        Button("Choose Folder…", action: chooseHistoryFolder)
+                    }
                     Button("Stop Syncing") {
                         Task { await monitor.stopHistorySync() }
                     }
@@ -419,10 +423,53 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Section("Analytics history") {
+                Text("Codex Limits keeps analytics history on this Mac until you delete it.")
+                    .foregroundStyle(.secondary)
+
+                if monitor.historyDeletionStatus == .pendingSync {
+                    Label("Deletion pending", systemImage: "exclamationmark.triangle")
+                    Text("Make the sync folder available, or choose it again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Retry deletion") {
+                        Task { await monitor.retryHistoryDeletion() }
+                    }
+                    .disabled(monitor.isUpdatingHistory)
+                } else if monitor.historyDeletionStatus == .complete {
+                    Label("Analytics history deleted", systemImage: "checkmark.circle")
+
+                    if monitor.canRebuildAvailableHistory {
+                        Button("Rebuild available history") {
+                            Task { await monitor.rebuildAvailableHistory() }
+                        }
+                        .disabled(monitor.isUpdatingHistory)
+                        Text("Rebuild uses Codex data that still exists. It may restore only part of your history.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Button("Delete analytics history…", role: .destructive) {
+                    confirmsHistoryDeletion = true
+                }
+                .disabled(monitor.isUpdatingHistory)
+            }
         }
         .formStyle(.grouped)
         .padding()
         .frame(width: 380)
+        .alert("Delete analytics history?", isPresented: $confirmsHistoryDeletion) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete analytics history", role: .destructive) {
+                Task { await monitor.deleteAnalyticsHistory() }
+            }
+        } message: {
+            Text(
+                "This removes all Codex Limits analytics history from this Mac and the selected sync folder, including history from other Macs. It keeps your settings. You may not be able to rebuild all history."
+            )
+        }
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {

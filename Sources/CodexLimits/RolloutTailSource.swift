@@ -411,23 +411,23 @@ struct IncrementalRolloutTailSource: RolloutTailSource {
     ) -> String {
         let payload = wire.payload
         let tokenUsage = payload.info?.totalTokenUsage
-        var components = [
-            String(absoluteLineOffset),
-            threadID ?? "unknown",
-            wire.ordinal.map(String.init) ?? "no-ordinal",
-            wire.timestamp ?? "unknown",
-            wire.type,
-            payload.type ?? "none",
-            payload.id ?? "none",
-            payload.parentThreadId ?? "none",
-            payload.cliVersion ?? "none",
-            payload.historyMode ?? "none",
-            payload.agentRole ?? "none",
-            payload.agentNickname ?? "none",
-            payload.turnId ?? "none",
-            payload.model ?? "none",
-            payload.effort ?? "none"
-        ]
+        var components: [String] = []
+        components.reserveCapacity(28)
+        components.append(String(absoluteLineOffset))
+        components.append(threadID ?? "unknown")
+        components.append(wire.ordinal.map(String.init) ?? "no-ordinal")
+        components.append(wire.timestamp ?? "unknown")
+        components.append(wire.type)
+        components.append(payload.type ?? "none")
+        components.append(payload.id ?? "none")
+        components.append(payload.parentThreadId ?? "none")
+        components.append(payload.cliVersion ?? "none")
+        components.append(payload.historyMode ?? "none")
+        components.append(payload.agentRole ?? "none")
+        components.append(payload.agentNickname ?? "none")
+        components.append(payload.turnId ?? "none")
+        components.append(payload.model ?? "none")
+        components.append(payload.effort ?? "none")
         components.append(contentsOf: [
             integerString(payload.startedAt),
             integerString(payload.completedAt),

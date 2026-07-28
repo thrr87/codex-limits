@@ -62,4 +62,64 @@ final class CodexClientTests: XCTestCase {
             )
         }
     }
+
+    func testDecodesStableChatGPTAccountIdentity() throws {
+        let response = Data(#"""
+        {"id":4,"result":{
+          "account":{"type":"chatgpt","email":"User@example.com","planType":"pro"},
+          "requiresOpenaiAuth":true
+        }}
+        """#.utf8)
+
+        let account = try CodexClient.decodeAccount(response)
+
+        XCTAssertEqual(account, .stable(identity: "User@example.com"))
+    }
+
+    func testAccountReadErrorKeepsValidUsageWithoutAnAccountObservation() throws {
+        let rateLimits = Data(#"""
+        {"id":2,"result":{
+          "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
+          "rateLimitsByLimitId":{
+            "codex":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}}
+          }
+        }}
+        """#.utf8)
+        let usage = Data(#"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8)
+        let accountError = Data(
+            #"{"id":4,"error":{"code":-32601,"message":"Method not found"}}"#.utf8
+        )
+
+        let result = try CodexClient.decodeResult(
+            rateLimitsResponse: rateLimits,
+            usageResponse: usage,
+            accountResponse: accountError,
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.snapshot.mainLimit.window.remainingPercent, 80)
+        XCTAssertNil(result.account)
+    }
+
+    func testProtocolLoopTreatsAccountReadErrorAsOptional() async throws {
+        let output = Pipe()
+        let input = Pipe()
+        let lines = [
+            #"{"id":1,"result":{}}"#,
+            #"{"id":2,"result":{"rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},"rateLimitsByLimitId":{"codex":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}}}}}"#,
+            #"{"id":3,"result":{"dailyUsageBuckets":[]}}"#,
+            #"{"id":4,"error":{"code":-32601,"message":"Method not found"}}"#
+        ].joined(separator: "\n") + "\n"
+        try output.fileHandleForWriting.write(contentsOf: Data(lines.utf8))
+        try output.fileHandleForWriting.close()
+
+        let result = try await CodexClient.readResult(
+            from: output.fileHandleForReading,
+            writingTo: input.fileHandleForWriting,
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.snapshot.mainLimit.window.remainingPercent, 80)
+        XCTAssertNil(result.account)
+    }
 }

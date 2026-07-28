@@ -1,5 +1,15 @@
 import Foundation
 
+enum CodexAccountObservation: Equatable, Sendable {
+    case stable(identity: String)
+    case unknown(state: String)
+}
+
+struct CodexFetchResult: Sendable {
+    let snapshot: UsageSnapshot
+    let account: CodexAccountObservation?
+}
+
 enum CodexClientError: LocalizedError {
     case cliNotFound
     case invalidResponse
@@ -27,7 +37,7 @@ enum CodexClient {
         "/usr/local/bin/codex"
     ]
 
-    static func fetch() async throws -> UsageSnapshot {
+    static func fetch() async throws -> CodexFetchResult {
         guard let executable = executablePaths.first(where: {
             FileManager.default.isExecutableFile(atPath: $0)
         }) else {
@@ -51,9 +61,9 @@ enum CodexClient {
                 to: input.fileHandleForWriting
             )
             let fetchedAt = Date()
-            let snapshot = try await withThrowingTaskGroup(of: UsageSnapshot.self) { group in
+            let result = try await withThrowingTaskGroup(of: CodexFetchResult.self) { group in
                 group.addTask {
-                    try await readSnapshot(
+                    try await readResult(
                         from: output.fileHandleForReading,
                         writingTo: input.fileHandleForWriting,
                         fetchedAt: fetchedAt
@@ -71,7 +81,7 @@ enum CodexClient {
             }
             try? input.fileHandleForWriting.close()
             if process.isRunning { process.terminate() }
-            return snapshot
+            return result
         } catch {
             try? input.fileHandleForWriting.close()
             if process.isRunning { process.terminate() }
@@ -138,6 +148,40 @@ enum CodexClient {
         )
     }
 
+    static func decodeAccount(_ response: Data) throws -> CodexAccountObservation {
+        let value = try JSONDecoder().decode(
+            RPCResponse<AccountResult>.self,
+            from: response
+        )
+        guard let result = value.result else {
+            throw CodexClientError.invalidResponse
+        }
+        if result.account?.type == "chatgpt",
+           let email = result.account?.email?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !email.isEmpty {
+            return .stable(identity: email)
+        }
+        let state = result.account?.type
+            ?? (result.requiresOpenaiAuth ? "signed-out" : "no-account")
+        return .unknown(state: state)
+    }
+
+    static func decodeResult(
+        rateLimitsResponse: Data,
+        usageResponse: Data,
+        accountResponse: Data,
+        fetchedAt: Date
+    ) throws -> CodexFetchResult {
+        CodexFetchResult(
+            snapshot: try decode(
+                rateLimitsResponse: rateLimitsResponse,
+                usageResponse: usageResponse,
+                fetchedAt: fetchedAt
+            ),
+            account: try? decodeAccount(accountResponse)
+        )
+    }
+
     private static func windows(from snapshot: RateLimitSnapshot) -> [UsageWindow] {
         [snapshot.primary, snapshot.secondary].compactMap { window in
             guard let window,
@@ -161,13 +205,14 @@ enum CodexClient {
         try handle.write(contentsOf: Data((message + "\n").utf8))
     }
 
-    private static func readSnapshot(
+    static func readResult(
         from output: FileHandle,
         writingTo input: FileHandle,
         fetchedAt: Date
-    ) async throws -> UsageSnapshot {
+    ) async throws -> CodexFetchResult {
         var rateLimitsResponse: Data?
         var usageResponse: Data?
+        var accountResponse: Data?
 
         for try await line in output.bytes.lines {
             try Task.checkCancellation()
@@ -175,24 +220,33 @@ enum CodexClient {
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let id = object["id"] as? Int else { continue }
 
-            if object["error"] != nil { throw CodexClientError.invalidResponse }
+            if object["error"] != nil, id != 4 {
+                throw CodexClientError.invalidResponse
+            }
             switch id {
             case 1:
                 try write(#"{"method":"initialized"}"#, to: input)
                 try write(#"{"id":2,"method":"account/rateLimits/read"}"#, to: input)
                 try write(#"{"id":3,"method":"account/usage/read"}"#, to: input)
+                try write(
+                    #"{"id":4,"method":"account/read","params":{"refreshToken":false}}"#,
+                    to: input
+                )
             case 2:
                 rateLimitsResponse = data
             case 3:
                 usageResponse = data
+            case 4:
+                accountResponse = data
             default:
                 continue
             }
 
-            if let rateLimitsResponse, let usageResponse {
-                return try decode(
+            if let rateLimitsResponse, let usageResponse, let accountResponse {
+                return try decodeResult(
                     rateLimitsResponse: rateLimitsResponse,
                     usageResponse: usageResponse,
+                    accountResponse: accountResponse,
                     fetchedAt: fetchedAt
                 )
             }
@@ -230,6 +284,16 @@ private struct RateLimitWindow: Decodable {
 
 private struct UsageResult: Decodable {
     let dailyUsageBuckets: [TokenBucket]?
+}
+
+private struct AccountResult: Decodable {
+    let account: AccountValue?
+    let requiresOpenaiAuth: Bool
+}
+
+private struct AccountValue: Decodable {
+    let type: String
+    let email: String?
 }
 
 private struct TokenBucket: Decodable {
