@@ -376,6 +376,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let localActivityObservation: LocalActivityObservation
     let localTaskProjections: [ThreadProjection]
     let compatibleTokenSources: Set<LocalTokenDefinitionSource>
+    let analyticsExploration: AnalyticsExplorationState
+    let insightDispositions: [String: InsightDisposition]
 
     init(
         account: UsageSnapshot?,
@@ -392,7 +394,9 @@ struct UsageIntelligenceInput: Equatable, Sendable {
             "Codex local records are unavailable"
         ),
         localTaskProjections: [ThreadProjection] = [],
-        compatibleTokenSources: Set<LocalTokenDefinitionSource> = []
+        compatibleTokenSources: Set<LocalTokenDefinitionSource> = [],
+        analyticsExploration: AnalyticsExplorationState = .initial,
+        insightDispositions: [String: InsightDisposition] = [:]
     ) {
         self.account = account
         self.samples = samples
@@ -408,6 +412,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         self.localActivityObservation = localActivityObservation
         self.localTaskProjections = localTaskProjections
         self.compatibleTokenSources = compatibleTokenSources
+        self.analyticsExploration = analyticsExploration
+        self.insightDispositions = insightDispositions
     }
 }
 
@@ -429,6 +435,8 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let activityTimeline: ActivityTimelineSnapshot
     let activeTimeAvailability: ActiveTimeAvailabilitySnapshot
     let localTaskProjections: [ThreadProjection]
+    let accountPartitionID: String?
+    var insights: DeterministicInsightsSnapshot
 
     var fetchedAt: Date? { account?.fetchedAt }
 
@@ -618,7 +626,7 @@ enum UsageIntelligenceEngine {
             interval: localTokenActivity.interval,
             observation: input.localActivityObservation
         )
-        let usagePerToken: UsagePerTokenSnapshot
+        let sourceUsagePerToken: UsagePerTokenSnapshot
         if let partitionID = input.accountPartitionID,
            let weekly = input.account?.mainLimit {
             let evidence = WeeklyUsageEvidenceBuilder.build(
@@ -630,18 +638,29 @@ enum UsageIntelligenceEngine {
                 currentReset: weekly.window.resetsAt,
                 compatibleTokenSources: input.compatibleTokenSources
             )
-            usagePerToken = UsagePerTokenEngine.evaluate(
+            sourceUsagePerToken = UsagePerTokenEngine.evaluate(
                 current: evidence.current,
                 history: evidence.history,
                 pinnedBaselineID: nil
             )
         } else {
-            usagePerToken = UsagePerTokenEngine.evaluate(
+            sourceUsagePerToken = UsagePerTokenEngine.evaluate(
                 current: nil,
                 history: [],
                 pinnedBaselineID: nil
             )
         }
+        let currentPartition = sourceUsagePerToken.current?
+            .accountPartitionID
+        let pinnedBaselineID =
+            input.analyticsExploration
+                .pinnedUsageBaselineAccountPartitionID
+                == currentPartition
+            ? input.analyticsExploration.pinnedUsageBaselineID
+            : nil
+        let usagePerToken = sourceUsagePerToken.selectingBaseline(
+            pinnedBaselineID
+        )
         let activeTimeSlice = activityTimeline.slice(
             in: activityTimeline.interval,
             filters: .all
@@ -663,19 +682,41 @@ enum UsageIntelligenceEngine {
             usageRemainingPercent:
                 input.account?.mainLimit?.window.remainingPercent ?? .nan
         )
-        return UsageReaderSnapshot(
-            account: input.account,
-            accountSource: .account,
-            interval: input.account.flatMap { account in
-                account.mainLimit.map {
+        let observedInterval = input.account.flatMap { account in
+            account.mainLimit.map {
                 UsageObservedInterval(
                     limitID: $0.limitId,
                     durationMinutes: $0.window.durationMinutes,
                     startsAt: $0.window.startsAt,
                     resetsAt: $0.window.resetsAt
                 )
-                }
-            },
+            }
+        }
+        let insightInput = DeterministicInsightInput(
+            sourceState: input.sourceState,
+            freshness: currentFreshness,
+            fetchedAt: input.account?.fetchedAt,
+            accountPartitionID: input.accountPartitionID,
+            guidance: guidance,
+            guidanceEvidence: evidence,
+            observedInterval: observedInterval,
+            usagePerToken: usagePerToken,
+            selectedRange: DeterministicInsightInput.effectiveRange(
+                usagePerToken: usagePerToken,
+                observedInterval: observedInterval,
+                fetchedAt: input.account?.fetchedAt,
+                exploration: input.analyticsExploration
+            ),
+            filters: input.analyticsExploration.filters
+        )
+        let insights = DeterministicInsightEngine.evaluate(
+            insightInput,
+            dispositions: input.insightDispositions
+        )
+        return UsageReaderSnapshot(
+            account: input.account,
+            accountSource: .account,
+            interval: observedInterval,
             menuBarText: input.account?.mainLimit.map {
                 "\(Int($0.window.remainingPercent.rounded()))%"
             } ?? "—",
@@ -695,7 +736,9 @@ enum UsageIntelligenceEngine {
             usageReceipts: usageReceipts,
             activityTimeline: activityTimeline,
             activeTimeAvailability: activeTimeAvailability,
-            localTaskProjections: input.localTaskProjections
+            localTaskProjections: input.localTaskProjections,
+            accountPartitionID: input.accountPartitionID,
+            insights: insights
         )
     }
 

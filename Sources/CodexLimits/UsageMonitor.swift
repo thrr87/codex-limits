@@ -605,12 +605,33 @@ final class UsageMonitor: ObservableObject {
                 localActivityHistoryFacts:
                     localActivityCollection.facts,
                 localActivityObservation: localActivityCollection.observation,
-                localTaskProjections: localActivityCollection.projections
+                localTaskProjections: localActivityCollection.projections,
+                analyticsExploration:
+                    AnalyticsWorkspaceStore.restoredState(
+                        from: defaults
+                    ),
+                insightDispositions:
+                    AnalyticsWorkspaceStore
+                        .restoredInsightDispositions(from: defaults)
             )
         )
         if let status = readerSnapshot.guidance?.status {
             previousStatus = status
         }
+    }
+
+    func analyticsPreferencesDidChange(
+        exploration: AnalyticsExplorationState,
+        dispositions: [String: InsightDisposition]
+    ) {
+        let input = DeterministicInsightInput(
+            reader: readerSnapshot,
+            exploration: exploration
+        )
+        readerSnapshot.insights = DeterministicInsightEngine.evaluate(
+            input,
+            dispositions: dispositions
+        )
     }
 
     private func reconcileResetReminder() async {

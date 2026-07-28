@@ -106,22 +106,48 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
 @MainActor
 final class AnalyticsWorkspaceStore: ObservableObject {
     static let persistenceKey = "analyticsWorkspaceExploration"
+    static let insightDispositionsPersistenceKey =
+        "analyticsInsightDispositions"
 
     @Published private(set) var state: AnalyticsExplorationState
+    @Published private(set) var insightDispositions:
+        [String: InsightDisposition]
 
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        if let data = defaults.data(forKey: Self.persistenceKey),
-           let restored = try? JSONDecoder().decode(
-               AnalyticsExplorationState.self,
-               from: data
-           ) {
-            state = restored
-        } else {
-            state = .initial
+        state = Self.restoredState(from: defaults)
+        insightDispositions = Self.restoredInsightDispositions(
+            from: defaults
+        )
+    }
+
+    static func restoredState(
+        from defaults: UserDefaults
+    ) -> AnalyticsExplorationState {
+        guard let data = defaults.data(forKey: Self.persistenceKey),
+              let restored = try? JSONDecoder().decode(
+                AnalyticsExplorationState.self,
+                from: data
+              ) else {
+            return .initial
         }
+        return restored
+    }
+
+    static func restoredInsightDispositions(
+        from defaults: UserDefaults
+    ) -> [String: InsightDisposition] {
+        guard let data = defaults.data(
+            forKey: Self.insightDispositionsPersistenceKey
+        ), let restored = try? JSONDecoder().decode(
+            [String: InsightDisposition].self,
+            from: data
+        ) else {
+            return [:]
+        }
+        return restored
     }
 
     func selectSection(_ section: AnalyticsSection) {
@@ -152,6 +178,27 @@ final class AnalyticsWorkspaceStore: ObservableObject {
             $0.pinnedUsageBaselineID = intervalID
             $0.pinnedUsageBaselineAccountPartitionID =
                 intervalID == nil ? nil : accountPartitionID
+        }
+    }
+
+    func setInsightDisposition(
+        _ disposition: InsightDisposition,
+        for insightID: String
+    ) {
+        guard !insightID.isEmpty else { return }
+        var next = insightDispositions
+        if disposition == .active {
+            next.removeValue(forKey: insightID)
+        } else {
+            next[insightID] = disposition
+        }
+        guard next != insightDispositions else { return }
+        insightDispositions = next
+        if let data = try? JSONEncoder().encode(next) {
+            defaults.set(
+                data,
+                forKey: Self.insightDispositionsPersistenceKey
+            )
         }
     }
 

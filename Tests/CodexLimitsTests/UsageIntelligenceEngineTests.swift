@@ -351,6 +351,47 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(estimate.upperSeconds, 7.5 * 60 * 60)
         XCTAssertEqual(estimate.confidence, .medium)
         XCTAssertEqual(estimate.referenceIntervalIDs.count, 4)
+        let pinnedID = try XCTUnwrap(
+            reader.usagePerToken.history.last?.id
+        )
+        var pinnedExploration = AnalyticsExplorationState.initial
+        pinnedExploration.pinnedUsageBaselineID = pinnedID
+        pinnedExploration.pinnedUsageBaselineAccountPartitionID =
+            "account-a"
+        let pinnedReader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: currentFacts,
+                localActivityHistoryFacts: historyFacts,
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localTaskProjections: projections,
+                compatibleTokenSources: [
+                    LocalTokenDefinitionSource(
+                        sourceVersion: "0.145.0",
+                        schemaVersion: "rollout-jsonl-v1"
+                    )
+                ],
+                analyticsExploration: pinnedExploration
+            )
+        )
+
+        XCTAssertEqual(
+            pinnedReader.usagePerToken.comparison?.baseline.id,
+            pinnedID
+        )
+        XCTAssertTrue(
+            pinnedReader.usagePerToken.comparison?.baseline.isPinned
+                == true
+        )
 
         let changedHistoryFacts = historyFacts.map { fact in
             guard fact.key == .token,
@@ -781,6 +822,18 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertNotNil(reader.guidance?.runway)
         XCTAssertNil(reader.guidance?.remainingAtResetRange)
         XCTAssertNil(reader.guidance?.caveat)
+        XCTAssertEqual(
+            reader.insights.insights.first(where: {
+                $0.kind == .pace
+            })?.title,
+            "Slow down"
+        )
+        XCTAssertEqual(
+            reader.insights.insights.first(where: {
+                $0.kind == .pace
+            })?.source,
+            "Derived estimate"
+        )
         XCTAssertEqual(
             reader.chart.target,
             [

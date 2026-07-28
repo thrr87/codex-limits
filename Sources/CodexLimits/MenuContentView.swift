@@ -89,6 +89,12 @@ struct MenuContentView: View {
             AnalyticsWorkspaceBody(
                 reader: monitor.readerSnapshot,
                 store: workspace,
+                analyticsPreferencesChanged: {
+                    monitor.analyticsPreferencesDidChange(
+                        exploration: workspace.state,
+                        dispositions: workspace.insightDispositions
+                    )
+                },
                 resetReminderState: monitor.resetReminderState,
                 setResetReminderEnabled: { isEnabled in
                     Task {
@@ -192,6 +198,7 @@ struct AnalyticsWorkspacePresentationView<Content: View>: View {
 struct AnalyticsWorkspaceBody: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    let analyticsPreferencesChanged: () -> Void
     let resetReminderState: ResetReminderState
     let setResetReminderEnabled: (Bool) -> Void
     let setResetReminderLeadTime: (ResetReminderLeadTime) -> Void
@@ -199,6 +206,7 @@ struct AnalyticsWorkspaceBody: View {
     init(
         reader: UsageReaderSnapshot,
         store: AnalyticsWorkspaceStore,
+        analyticsPreferencesChanged: @escaping () -> Void = {},
         resetReminderState: ResetReminderState = ResetReminderState(
             isEnabled: false,
             leadTime: .hours24,
@@ -210,6 +218,7 @@ struct AnalyticsWorkspaceBody: View {
     ) {
         self.reader = reader
         self.store = store
+        self.analyticsPreferencesChanged = analyticsPreferencesChanged
         self.resetReminderState = resetReminderState
         self.setResetReminderEnabled = setResetReminderEnabled
         self.setResetReminderLeadTime = setResetReminderLeadTime
@@ -217,19 +226,27 @@ struct AnalyticsWorkspaceBody: View {
 
     @ViewBuilder
     var body: some View {
-        switch store.state.section {
-        case .graphs:
-            GraphsWorkspace(reader: reader, store: store)
-        case .facts:
-            FactsWorkspace(
-                reader: reader,
-                store: store,
-                resetReminderState: resetReminderState,
-                setResetReminderEnabled: setResetReminderEnabled,
-                setResetReminderLeadTime: setResetReminderLeadTime
-            )
-        case .insights:
-            InsightsWorkspace(reader: reader)
+        Group {
+            switch store.state.section {
+            case .graphs:
+                GraphsWorkspace(reader: reader, store: store)
+            case .facts:
+                FactsWorkspace(
+                    reader: reader,
+                    store: store,
+                    resetReminderState: resetReminderState,
+                    setResetReminderEnabled: setResetReminderEnabled,
+                    setResetReminderLeadTime: setResetReminderLeadTime
+                )
+            case .insights:
+                InsightsWorkspace(reader: reader, store: store)
+            }
+        }
+        .onChange(of: store.state) { _, _ in
+            analyticsPreferencesChanged()
+        }
+        .onChange(of: store.insightDispositions) { _, _ in
+            analyticsPreferencesChanged()
         }
     }
 }
@@ -3559,24 +3576,41 @@ private func sourceNames(
     return sources.map(sourceName).joined(separator: " · ")
 }
 
-private struct InsightsWorkspace: View {
+struct InsightsWorkspace: View {
     let reader: UsageReaderSnapshot
+    @ObservedObject var store: AnalyticsWorkspaceStore
+
+    private var snapshot: DeterministicInsightsSnapshot { reader.insights }
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 14) {
-            WorkspaceCard(title: "Deterministic") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(reader.guidanceTitle)
-                        .font(.headline)
-                    Text(reader.guidanceMessage)
+            if snapshot.insights.isEmpty {
+                WorkspaceCard(title: "Deterministic") {
+                    Text("No new insights for this range.")
                         .foregroundStyle(.secondary)
-                    Text(reader.evidenceText)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    if let interval = reader.interval {
-                        Text(interval.text)
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
+                }
+            } else {
+                ForEach(snapshot.activeInsights) { insight in
+                    insightCard(insight)
+                }
+                ForEach(snapshot.expectedInsights) { insight in
+                    insightCard(insight)
+                }
+            }
+
+            if !snapshot.checks.isEmpty {
+                WorkspaceCard(title: "Checks") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(snapshot.checks) { check in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(check.kind.rawValue)
+                                    .font(.callout.weight(.medium))
+                                Text(check.reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .accessibilityElement(children: .combine)
+                        }
                     }
                 }
             }
@@ -3586,6 +3620,118 @@ private struct InsightsWorkspace: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func insightCard(
+        _ insight: DeterministicInsight
+    ) -> some View {
+        WorkspaceCard(title: insight.kind.rawValue) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(insight.title)
+                        .font(.headline)
+                    Spacer()
+                    if insight.disposition == .expected {
+                        Text("Expected")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(insight.message)
+                    .foregroundStyle(.secondary)
+                Text(insight.measurement)
+                    .font(.callout.weight(.medium))
+
+                Grid(
+                    alignment: .leading,
+                    horizontalSpacing: 16,
+                    verticalSpacing: 5
+                ) {
+                    insightEvidenceRow(
+                        "Source",
+                        "\(insight.source) · \(insight.freshnessText)"
+                    )
+                    insightEvidenceRow(
+                        "Evidence",
+                        insight.evidenceSources.joined(separator: " · ")
+                    )
+                    insightEvidenceRow(
+                        "Coverage",
+                        insight.coverage.displayName
+                    )
+                    insightEvidenceRow(
+                        "Confidence",
+                        insight.confidence.displayName
+                    )
+                    if let period = insight.periodText {
+                        insightEvidenceRow("Period", period)
+                    }
+                }
+                .font(.caption)
+
+                if let caveat = insight.caveat {
+                    Text(caveat)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let scopeNote = insight.scopeNote {
+                    Text(scopeNote)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+
+                HStack(spacing: 14) {
+                    if insight.disposition == .expected {
+                        Button("Show again") {
+                            store.setInsightDisposition(
+                                .active,
+                                for: insight.id
+                            )
+                        }
+                        .accessibilityHint(
+                            "Returns this insight to the active list"
+                        )
+                    } else {
+                        Button("Mark expected") {
+                            store.setInsightDisposition(
+                                .expected,
+                                for: insight.id
+                            )
+                        }
+                        .accessibilityHint(
+                            "Keeps the measured evidence and marks the change as expected"
+                        )
+                    }
+                    Button("Dismiss") {
+                        store.setInsightDisposition(
+                            .dismissed,
+                            for: insight.id
+                        )
+                    }
+                    .accessibilityHint(
+                        "Hides this insight without changing source history"
+                    )
+                }
+                .buttonStyle(.borderless)
+                .font(.callout)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(insight.accessibilitySummary)
+        }
+    }
+
+    @ViewBuilder
+    private func insightEvidenceRow(
+        _ label: String,
+        _ value: String
+    ) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
