@@ -401,6 +401,8 @@ final class UsageMonitor: ObservableObject {
                 otherLimits: snapshot.otherLimits,
                 tokenHistory: [],
                 emergencyResetCount: snapshot.emergencyResetCount,
+                bankedResetCountAvailable: snapshot.bankedResetCountAvailable,
+                bankedResetDetails: snapshot.bankedResetDetails,
                 fetchedAt: snapshot.fetchedAt,
                 accountFacts: snapshot.accountFacts
             )

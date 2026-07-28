@@ -174,6 +174,28 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.connectionCount, 1)
     }
 
+    func testSparseRateLimitNotificationCannotReplaceFullResetDetail() async throws {
+        let server = PersistentAppServerFixture(
+            sendsSparseRateLimitUpdate: true,
+            includesChangingResetDetails: true
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+
+        let result = try await client.fetch(
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.snapshot.emergencyResetCount, 1)
+        XCTAssertEqual(
+            result.snapshot.bankedResetDetails?.map(\.id),
+            ["reset-2"]
+        )
+        XCTAssertEqual(server.rateLimitReadCount, 2)
+    }
+
     func testSparseAccountNotificationTriggersFullReconciliation() async throws {
         let server = PersistentAppServerFixture(
             sendsSparseAccountUpdate: true
@@ -396,6 +418,109 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(result.tokenHistory.map(\.tokens), [1_000, 250])
         XCTAssertEqual(result.emergencyResetCount, 3)
         XCTAssertEqual(result.fetchedAt, fetchedAt)
+    }
+
+    func testDecodesAuthoritativeResetCountAndReorderedDetailRows() throws {
+        let rateLimits = Data(#"""
+        {"id":2,"result":{
+          "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
+          "rateLimitResetCredits":{
+            "availableCount":3,
+            "credits":[
+              {"id":"later","resetType":"codexRateLimits","status":"available","grantedAt":1900000,"expiresAt":2100000,"title":"Full reset","description":"Ready"},
+              {"id":"earlier","resetType":"codexRateLimits","status":"available","grantedAt":1900000,"expiresAt":2050000,"title":"Full reset","description":"Ready"}
+            ]
+          }
+        }}
+        """#.utf8)
+        let usage = Data(#"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8)
+
+        let result = try CodexClient.decode(
+            rateLimitsResponse: rateLimits,
+            usageResponse: usage,
+            fetchedAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+
+        XCTAssertEqual(result.emergencyResetCount, 3)
+        XCTAssertEqual(result.bankedResetDetails?.map(\.id), ["later", "earlier"])
+        XCTAssertEqual(
+            result.bankedResetDetails?.map(\.expiresAt),
+            [
+                Date(timeIntervalSince1970: 2_100_000),
+                Date(timeIntervalSince1970: 2_050_000)
+            ]
+        )
+    }
+
+    func testDistinguishesMissingAndFetchedEmptyResetDetail() throws {
+        let usage = Data(#"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8)
+        let missing = try CodexClient.decode(
+            rateLimitsResponse: Data(#"""
+            {"id":2,"result":{
+              "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
+              "rateLimitResetCredits":{"availableCount":2,"credits":null}
+            }}
+            """#.utf8),
+            usageResponse: usage,
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+        let empty = try CodexClient.decode(
+            rateLimitsResponse: Data(#"""
+            {"id":2,"result":{
+              "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
+              "rateLimitResetCredits":{"availableCount":0,"credits":[]}
+            }}
+            """#.utf8),
+            usageResponse: usage,
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(missing.emergencyResetCount, 2)
+        XCTAssertNil(missing.bankedResetDetails)
+        XCTAssertEqual(empty.emergencyResetCount, 0)
+        XCTAssertEqual(empty.bankedResetDetails, [])
+    }
+
+    func testMissingResetCreditContainerDoesNotClaimZeroIsAuthoritative() throws {
+        let result = try CodexClient.decode(
+            rateLimitsResponse: Data(#"""
+            {"id":2,"result":{
+              "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}}
+            }}
+            """#.utf8),
+            usageResponse: Data(
+                #"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8
+            ),
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.emergencyResetCount, 0)
+        XCTAssertEqual(result.bankedResetCountAvailable, false)
+    }
+
+    func testMalformedOptionalResetRowDoesNotDiscardCountOrValidDetail() throws {
+        let result = try CodexClient.decode(
+            rateLimitsResponse: Data(#"""
+            {"id":2,"result":{
+              "rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000}},
+              "rateLimitResetCredits":{
+                "availableCount":2,
+                "credits":[
+                  {"id":"broken","resetType":"codexRateLimits","grantedAt":1900000,"title":"Full reset"},
+                  {"id":42,"status":"available","expiresAt":"2100000"},
+                  {"id":"valid","status":"available","expiresAt":2100000}
+                ]
+              }
+            }}
+            """#.utf8),
+            usageResponse: Data(
+                #"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8
+            ),
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.emergencyResetCount, 2)
+        XCTAssertEqual(result.bankedResetDetails?.map(\.id), ["valid"])
     }
 
     func testDecodesTokenSummaryCreditsAndSpendControlAsIndependentFacts() throws {
@@ -729,6 +854,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
     private let omitsWeeklyWindow: Bool
     private let delaysFirstRateLimitResponse: Bool
     private let initializeUserAgent: String?
+    private let includesChangingResetDetails: Bool
     private var connections = 0
     private var initializations = 0
     private var rateLimitReads = 0
@@ -776,7 +902,8 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         sendsMalformedRateLimitLine: Bool = false,
         omitsWeeklyWindow: Bool = false,
         delaysFirstRateLimitResponse: Bool = false,
-        initializeUserAgent: String? = nil
+        initializeUserAgent: String? = nil,
+        includesChangingResetDetails: Bool = false
     ) {
         self.dropsFirstConnection = dropsFirstConnection
         self.stallsFirstConnection = stallsFirstConnection
@@ -789,6 +916,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         self.omitsWeeklyWindow = omitsWeeklyWindow
         self.delaysFirstRateLimitResponse = delaysFirstRateLimitResponse
         self.initializeUserAgent = initializeUserAgent
+        self.includesChangingResetDetails = includesChangingResetDetails
     }
 
     func makeConnection() throws -> CodexAppServerConnection {
@@ -807,7 +935,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                     let method = request["method"] as? String else {
                     continue
                 }
-                let response: String
+                var response: String
                 switch method {
                 case "initialize":
                     lock.withLock { initializations += 1 }
@@ -837,6 +965,36 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                         let used = read == 1 ? 20 : (read == 2 ? 30 : 40)
                         let duration = omitsWeeklyWindow ? 300 : 10_080
                         response = #"{"id":\#(id),"result":{"rateLimits":{"limitId":"codex","secondary":{"usedPercent":\#(used),"windowDurationMins":\#(duration),"resetsAt":2000000}},"rateLimitsByLimitId":{"codex":{"limitId":"codex","secondary":{"usedPercent":\#(used),"windowDurationMins":\#(duration),"resetsAt":2000000}}}}}"#
+                    }
+                    if includesChangingResetDetails,
+                       !sendsMalformedRateLimitLine {
+                        var object = try! XCTUnwrap(
+                            JSONSerialization.jsonObject(
+                                with: Data(response.utf8)
+                            ) as? [String: Any]
+                        )
+                        var result = try! XCTUnwrap(
+                            object["result"] as? [String: Any]
+                        )
+                        result["rateLimitResetCredits"] = [
+                            "availableCount": 1,
+                            "credits": [[
+                                "id": "reset-\(read)",
+                                "resetType": "codexRateLimits",
+                                "status": "available",
+                                "grantedAt": 1_900_000,
+                                "expiresAt": 2_100_000,
+                                "title": "Full reset",
+                                "description": "Ready"
+                            ]]
+                        ]
+                        object["result"] = result
+                        response = String(
+                            data: try! JSONSerialization.data(
+                                withJSONObject: object
+                            ),
+                            encoding: .utf8
+                        )!
                     }
                     if sendsRateUpdateDuringReconciliation, read == 2 {
                         let notification = #"{"method":"account/rateLimits/updated","params":{"rateLimits":{"secondary":{"usedPercent":40}}}}"#

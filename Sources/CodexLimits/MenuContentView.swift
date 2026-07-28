@@ -282,10 +282,22 @@ private struct WorkspaceHeader: View {
                 )
             )
         }
-        HeaderFact(
-            label: "Banked resets",
-            value: "\(reader.account?.emergencyResetCount ?? 0)"
-        )
+        if let summary = reader.bankedResets {
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                HeaderFact(
+                    label: "Banked resets",
+                    value: summary.headerValue(at: context.date)
+                )
+                .help(summary.inspectionText(at: context.date))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Banked resets")
+                .accessibilityValue(
+                    "\(summary.headerValue(at: context.date)) · \(summary.inspectionText(at: context.date))"
+                )
+            }
+        } else {
+            HeaderFact(label: "Banked resets", value: "Unavailable")
+        }
         TimelineView(.periodic(from: .now, by: 60)) { context in
             HeaderFact(
                 label: "Freshness",
@@ -1552,14 +1564,53 @@ private struct FactsWorkspace: View {
             }
 
             WorkspaceCard(title: "Banked resets") {
-                let count = reader.account?.emergencyResetCount ?? 0
-                FactRow(
-                    label: "Available",
-                    value: "\(count) \(count == 1 ? "banked reset" : "banked resets")"
-                )
-                if count > 0 {
-                    Text("Expiry details are not available.")
-                        .font(.caption)
+                if let summary = reader.bankedResets {
+                    TimelineView(.periodic(from: .now, by: 60)) { context in
+                        VStack(alignment: .leading, spacing: 10) {
+                            FactRow(
+                                label: "Available",
+                                value: "\(summary.availableCount)"
+                            )
+                            FactRow(
+                                label: "Reset detail",
+                                value: summary.detailCoverage.displayName,
+                                detail: resetDetailText(summary)
+                            )
+                            if let expiry = summary.currentNextKnownExpiry(
+                                at: context.date
+                            ) {
+                                FactRow(
+                                    label: summary.detailCoverage == .complete
+                                        ? "Next expiry"
+                                        : "Next known expiry",
+                                    value: summary.timeUntilNextKnownExpiry(
+                                        at: context.date
+                                    ).map { "In \($0)" } ?? "Unavailable",
+                                    detail: expiry.formatted(
+                                        date: .abbreviated,
+                                        time: .shortened
+                                    )
+                                )
+                            } else if summary.availableCount > 0 {
+                                Text(
+                                    summary.nextKnownExpiry == nil
+                                        ? "Expiry dates unavailable"
+                                        : "Expiry dates need refresh"
+                                )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            FactRow(
+                                label: "Source",
+                                value: "Account",
+                                detail: summary.sourceStatusText(
+                                    at: context.date
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    Text("Banked resets are unavailable.")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1654,6 +1705,17 @@ private struct FactsWorkspace: View {
     private func observationDetail(_ date: Date?) -> String? {
         date.map {
             "Account · \($0.formatted(date: .abbreviated, time: .shortened))"
+        }
+    }
+
+    private func resetDetailText(_ summary: BankedResetSummary) -> String {
+        switch summary.detailCoverage {
+        case .complete:
+            return "Expiry dates known for every available reset"
+        case .partial:
+            return "\(summary.knownExpiryCount) of \(summary.availableCount) expiry dates known"
+        case .unavailable:
+            return "Expiry dates unavailable"
         }
     }
 

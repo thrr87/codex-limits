@@ -128,6 +128,135 @@ struct UsageGuidance: Equatable, Sendable {
     let forecast: Forecast
 }
 
+enum ResetDetailCoverage: String, Equatable, Sendable {
+    case complete
+    case partial
+    case unavailable
+
+    var displayName: String {
+        switch self {
+        case .complete: "Complete"
+        case .partial: "Partial"
+        case .unavailable: "Unavailable"
+        }
+    }
+}
+
+struct BankedResetSummary: Equatable, Sendable {
+    let availableCount: Int
+    let detailCoverage: ResetDetailCoverage
+    let knownExpiryCount: Int
+    let nextKnownExpiry: Date?
+    let observedAt: Date
+    let freshness: UsageFreshness
+    let sourceState: UsageSourceState
+
+    func inlineText(at now: Date) -> String {
+        let countText = "\(availableCount) \(availableCount == 1 ? "banked reset" : "banked resets")"
+        guard availableCount > 0 else { return countText }
+        guard let expiry = currentNextKnownExpiry(at: now) else {
+            if nextKnownExpiry != nil {
+                return "\(countText) · Expiry dates need refresh"
+            }
+            return "\(countText) · Expiry dates unavailable"
+        }
+        let time = Self.timeUntil(expiry, from: now)
+        switch detailCoverage {
+        case .complete:
+            return "\(countText) · Next expires in \(time)"
+        case .partial:
+            let known = "\(knownExpiryCount) \(knownExpiryCount == 1 ? "expiry" : "expiries") known"
+            return "\(countText) · \(known) · Next known in \(time)"
+        case .unavailable:
+            return "\(countText) · Expiry dates unavailable"
+        }
+    }
+
+    func headerValue(at now: Date) -> String {
+        inlineText(at: now)
+            .replacingOccurrences(
+                of: " \(availableCount == 1 ? "banked reset" : "banked resets")",
+                with: ""
+            )
+    }
+
+    func inspectionText(at now: Date) -> String {
+        let source: String
+        switch sourceState {
+        case .available:
+            source = "Account"
+        case .failed:
+            source = "Account source unavailable"
+        }
+        var parts = [
+            source,
+            "\(detailCoverage.displayName) reset detail"
+        ]
+        if let expiry = currentNextKnownExpiry(at: now) {
+            parts.insert(
+                "Next known expiry \(expiry.formatted(date: .abbreviated, time: .shortened))",
+                at: 0
+            )
+        } else if nextKnownExpiry != nil {
+            parts.insert("Expiry dates need refresh", at: 0)
+        } else if availableCount > 0 {
+            parts.insert("Expiry dates unavailable", at: 0)
+        }
+        let age = max(now.timeIntervalSince(observedAt), 0)
+        if freshness == .stale
+            || sourceState != .available
+            || age > UsageHistoryPolicy.tightBoundary {
+            parts.append("Stale")
+        } else if age < 60 {
+            parts.append("Updated just now")
+        } else {
+            parts.append("Updated \(Int(age / 60)) min ago")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    func currentNextKnownExpiry(at now: Date) -> Date? {
+        nextKnownExpiry.flatMap { $0 > now ? $0 : nil }
+    }
+
+    func timeUntilNextKnownExpiry(at now: Date) -> String? {
+        currentNextKnownExpiry(at: now).map {
+            Self.timeUntil($0, from: now)
+        }
+    }
+
+    func sourceStatusText(at now: Date) -> String {
+        let age = max(now.timeIntervalSince(observedAt), 0)
+        if sourceState != .available
+            || freshness == .stale
+            || age > UsageHistoryPolicy.tightBoundary {
+            return "Stale · Updated \(Self.ageText(age))"
+        }
+        return "Updated \(Self.ageText(age))"
+    }
+
+    private static func ageText(_ age: TimeInterval) -> String {
+        if age < 60 { return "just now" }
+        if age < 3_600 { return "\(Int(age / 60)) min ago" }
+        let hours = Int(age / 3_600)
+        return "\(hours) \(hours == 1 ? "hr" : "hrs") ago"
+    }
+
+    private static func timeUntil(_ expiry: Date, from now: Date) -> String {
+        let seconds = max(expiry.timeIntervalSince(now), 0)
+        let minutes = max(Int(ceil(seconds / 60)), 1)
+        if minutes < 60 {
+            return "\(minutes) min"
+        }
+        let hours = Int(ceil(Double(minutes) / 60))
+        if hours < 48 {
+            return "\(hours) \(hours == 1 ? "hr" : "hrs")"
+        }
+        let days = Int(ceil(Double(hours) / 24))
+        return "\(days) \(days == 1 ? "day" : "days")"
+    }
+}
+
 struct UsageChartPoint: Equatable, Identifiable, Sendable {
     let date: Date
     let remaining: Double
@@ -281,6 +410,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let evidence: UsageEvidence
     let guidance: UsageGuidance?
     let chart: UsageChartSnapshot
+    let bankedResets: BankedResetSummary?
     let accountTokenActivity: AccountTokenActivitySnapshot
     let localTokenActivity: LocalTokenActivitySnapshot
     let localTaskProjections: [ThreadProjection]
@@ -435,6 +565,11 @@ enum UsageIntelligenceEngine {
             guidance: guidance,
             safetyBuffer: input.safetyBuffer
         )
+        let currentFreshness = freshness(
+            account: input.account,
+            sourceState: input.sourceState,
+            now: input.now
+        )
         let accountTokenActivity = accountTokenActivity(
             account: input.account,
             samples: currentSamples
@@ -473,17 +608,63 @@ enum UsageIntelligenceEngine {
                 "\(Int($0.window.remainingPercent.rounded()))%"
             } ?? "—",
             sourceState: input.sourceState,
-            freshness: freshness(
-                account: input.account,
-                sourceState: input.sourceState,
-                now: input.now
-            ),
+            freshness: currentFreshness,
             evidence: evidence,
             guidance: guidance,
             chart: chart,
+            bankedResets: bankedResetSummary(
+                account: input.account,
+                freshness: currentFreshness,
+                sourceState: input.sourceState
+            ),
             accountTokenActivity: accountTokenActivity,
             localTokenActivity: localTokenActivity,
             localTaskProjections: input.localTaskProjections
+        )
+    }
+
+    private static func bankedResetSummary(
+        account: UsageSnapshot?,
+        freshness: UsageFreshness,
+        sourceState: UsageSourceState
+    ) -> BankedResetSummary? {
+        guard let account,
+              account.bankedResetCountAvailable != false else {
+            return nil
+        }
+        let available = (account.bankedResetDetails ?? [])
+            .filter {
+                $0.status.caseInsensitiveCompare("available") == .orderedSame
+                    && $0.expiresAt > account.fetchedAt
+            }
+        let unique = Dictionary(
+            available.map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        ).values
+        let knownExpiryCount = min(
+            unique.count,
+            account.emergencyResetCount
+        )
+        let coverage: ResetDetailCoverage
+        if account.emergencyResetCount == 0 {
+            coverage = .complete
+        } else if account.bankedResetDetails == nil || knownExpiryCount == 0 {
+            coverage = .unavailable
+        } else if knownExpiryCount >= account.emergencyResetCount {
+            coverage = .complete
+        } else {
+            coverage = .partial
+        }
+        return BankedResetSummary(
+            availableCount: account.emergencyResetCount,
+            detailCoverage: coverage,
+            knownExpiryCount: knownExpiryCount,
+            nextKnownExpiry: account.emergencyResetCount > 0
+                ? unique.map(\.expiresAt).min()
+                : nil,
+            observedAt: account.fetchedAt,
+            freshness: freshness,
+            sourceState: sourceState
         )
     }
 

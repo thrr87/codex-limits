@@ -662,6 +662,38 @@ actor CodexClient {
             spendControlObservedAt: spendControl.map { _ in fetchedAt },
             spendControlReachedObservedAt: spendControl?.reached.map { _ in fetchedAt }
         )
+        let resetCredits = rateResult.rateLimitResetCredits
+        guard (resetCredits?.availableCount ?? 0) >= 0 else {
+            throw CodexClientError.invalidResponse
+        }
+        let bankedResetDetails: [BankedResetDetail]? = resetCredits?
+            .credits?
+            .compactMap { detail -> BankedResetDetail? in
+            guard let id = detail.id?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ),
+                  !id.isEmpty,
+                  let status = detail.status,
+                  let expiresAt = detail.expiresAt,
+                  expiresAt >= 0 else {
+                return nil
+            }
+            return BankedResetDetail(
+                id: id,
+                resetType: detail.resetType,
+                status: status,
+                grantedAt: detail.grantedAt.flatMap {
+                    $0 >= 0
+                        ? Date(timeIntervalSince1970: TimeInterval($0))
+                        : nil
+                },
+                expiresAt: Date(
+                    timeIntervalSince1970: TimeInterval(expiresAt)
+                ),
+                title: detail.title,
+                description: detail.description
+            )
+        }
 
         return UsageSnapshot(
             mainLimit: mainWindow.map {
@@ -669,7 +701,9 @@ actor CodexClient {
             },
             otherLimits: others,
             tokenHistory: tokenHistory,
-            emergencyResetCount: rateResult.rateLimitResetCredits?.availableCount ?? 0,
+            emergencyResetCount: resetCredits?.availableCount ?? 0,
+            bankedResetCountAvailable: resetCredits != nil,
+            bankedResetDetails: bankedResetDetails,
             fetchedAt: fetchedAt,
             accountFacts: facts.isEmpty ? nil : facts
         )
@@ -723,6 +757,8 @@ actor CodexClient {
             otherLimits: current.snapshot.otherLimits,
             tokenHistory: current.snapshot.tokenHistory,
             emergencyResetCount: current.snapshot.emergencyResetCount,
+            bankedResetCountAvailable: current.snapshot.bankedResetCountAvailable,
+            bankedResetDetails: current.snapshot.bankedResetDetails,
             fetchedAt: current.snapshot.fetchedAt,
             accountFacts: facts
         )
@@ -787,6 +823,69 @@ private struct RateLimitsResult: Decodable {
 
 private struct ResetCredits: Decodable {
     let availableCount: Int
+    let credits: [ResetCreditDetail]?
+
+    private enum CodingKeys: String, CodingKey {
+        case availableCount
+        case credits
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        availableCount = try container.decode(
+            Int.self,
+            forKey: .availableCount
+        )
+        credits = try? container.decode(
+            [ResetCreditDetail].self,
+            forKey: .credits
+        )
+    }
+}
+
+private struct ResetCreditDetail: Decodable {
+    let id: String?
+    let resetType: String?
+    let status: String?
+    let grantedAt: Int64?
+    let expiresAt: Int64?
+    let title: String?
+    let description: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case resetType
+        case status
+        case grantedAt
+        case expiresAt
+        case title
+        case description
+    }
+
+    init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(
+            keyedBy: CodingKeys.self
+        ) else {
+            id = nil
+            resetType = nil
+            status = nil
+            grantedAt = nil
+            expiresAt = nil
+            title = nil
+            description = nil
+            return
+        }
+        id = try? container.decode(String.self, forKey: .id)
+        resetType = try? container.decode(String.self, forKey: .resetType)
+        status = try? container.decode(String.self, forKey: .status)
+        grantedAt = try? container.decode(Int64.self, forKey: .grantedAt)
+        expiresAt = try? container.decode(Int64.self, forKey: .expiresAt)
+        title = try? container.decode(String.self, forKey: .title)
+        description = try? container.decode(
+            String.self,
+            forKey: .description
+        )
+    }
 }
 
 private struct RateLimitSnapshot: Decodable {

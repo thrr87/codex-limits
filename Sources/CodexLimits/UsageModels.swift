@@ -119,6 +119,16 @@ struct LimitReading: Codable, Equatable, Identifiable, Sendable {
     var id: String { "\(limitId)-\(window.durationMinutes)" }
 }
 
+struct BankedResetDetail: Codable, Equatable, Sendable {
+    let id: String
+    let resetType: String?
+    let status: String
+    let grantedAt: Date?
+    let expiresAt: Date
+    let title: String?
+    let description: String?
+}
+
 struct AccountCreditFacts: Codable, Equatable, Sendable {
     let balance: String?
     let hasCredits: Bool
@@ -269,6 +279,8 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
     let otherLimits: [LimitReading]
     let tokenHistory: [TokenDay]
     let emergencyResetCount: Int
+    let bankedResetCountAvailable: Bool?
+    let bankedResetDetails: [BankedResetDetail]?
     let fetchedAt: Date
     let accountFacts: AccountFacts?
 
@@ -277,6 +289,8 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
         otherLimits: [LimitReading],
         tokenHistory: [TokenDay],
         emergencyResetCount: Int,
+        bankedResetCountAvailable: Bool? = true,
+        bankedResetDetails: [BankedResetDetail]? = nil,
         fetchedAt: Date,
         accountFacts: AccountFacts? = nil
     ) {
@@ -284,6 +298,8 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
         self.otherLimits = otherLimits
         self.tokenHistory = tokenHistory
         self.emergencyResetCount = emergencyResetCount
+        self.bankedResetCountAvailable = bankedResetCountAvailable
+        self.bankedResetDetails = bankedResetDetails
         self.fetchedAt = fetchedAt
         self.accountFacts = accountFacts
     }

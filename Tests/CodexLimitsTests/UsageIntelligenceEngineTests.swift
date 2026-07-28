@@ -995,11 +995,192 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    func testBankedResetSummaryUsesCountAndCompleteKnownExpiryDetail() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            emergencyResetCount: 2,
+            bankedResetDetails: [
+                resetDetail(id: "later", expiresAt: now.addingTimeInterval(8 * 86_400)),
+                resetDetail(id: "earlier", expiresAt: now.addingTimeInterval(3 * 86_400))
+            ]
+        )
+
+        let summary = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).bankedResets
+
+        XCTAssertEqual(summary?.availableCount, 2)
+        XCTAssertEqual(summary?.detailCoverage, .complete)
+        XCTAssertEqual(summary?.knownExpiryCount, 2)
+        XCTAssertEqual(
+            summary?.nextKnownExpiry,
+            now.addingTimeInterval(3 * 86_400)
+        )
+        XCTAssertEqual(
+            summary?.inlineText(at: now),
+            "2 banked resets · Next expires in 3 days"
+        )
+        XCTAssertTrue(
+            summary?.inspectionText(at: now).contains(
+                now.addingTimeInterval(3 * 86_400).formatted(
+                    date: .abbreviated,
+                    time: .shortened
+                )
+            ) == true
+        )
+    }
+
+    func testBankedResetSummaryExcludesExpiredDetailAndMarksPartialCoverage() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            emergencyResetCount: 3,
+            bankedResetDetails: [
+                resetDetail(id: "expired", expiresAt: now.addingTimeInterval(-60)),
+                resetDetail(id: "known", expiresAt: now.addingTimeInterval(8 * 86_400))
+            ]
+        )
+
+        let summary = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).bankedResets
+
+        XCTAssertEqual(summary?.detailCoverage, .partial)
+        XCTAssertEqual(summary?.knownExpiryCount, 1)
+        XCTAssertEqual(
+            summary?.nextKnownExpiry,
+            now.addingTimeInterval(8 * 86_400)
+        )
+        XCTAssertEqual(
+            summary?.inlineText(at: now),
+            "3 banked resets · 1 expiry known · Next known in 8 days"
+        )
+    }
+
+    func testBankedResetSummaryDistinguishesUnavailableDetailAndZeroCount() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let unavailable = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            emergencyResetCount: 2,
+            bankedResetDetails: nil
+        )
+        let zero = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            emergencyResetCount: 0,
+            bankedResetDetails: []
+        )
+
+        let unavailableSummary = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: unavailable,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).bankedResets
+        let zeroSummary = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: zero,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).bankedResets
+
+        XCTAssertEqual(unavailableSummary?.detailCoverage, .unavailable)
+        XCTAssertNil(unavailableSummary?.nextKnownExpiry)
+        XCTAssertEqual(
+            unavailableSummary?.inlineText(at: now),
+            "2 banked resets · Expiry dates unavailable"
+        )
+        XCTAssertEqual(zeroSummary?.detailCoverage, .complete)
+        XCTAssertEqual(zeroSummary?.knownExpiryCount, 0)
+        XCTAssertNil(zeroSummary?.nextKnownExpiry)
+        XCTAssertEqual(zeroSummary?.inlineText(at: now), "0 banked resets")
+    }
+
+    func testBankedResetSummaryWithholdsAnUnavailableCount() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            emergencyResetCount: 0,
+            bankedResetCountAvailable: false
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertNil(reader.bankedResets)
+    }
+
+    func testBankedResetCountdownStopsAfterTheKnownExpiryPasses() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let summary = BankedResetSummary(
+            availableCount: 1,
+            detailCoverage: .complete,
+            knownExpiryCount: 1,
+            nextKnownExpiry: now.addingTimeInterval(60),
+            observedAt: now,
+            freshness: .fresh,
+            sourceState: .available
+        )
+
+        XCTAssertEqual(
+            summary.inlineText(at: now.addingTimeInterval(61)),
+            "1 banked reset · Expiry dates need refresh"
+        )
+        XCTAssertNil(
+            summary.currentNextKnownExpiry(
+                at: now.addingTimeInterval(61)
+            )
+        )
+        XCTAssertTrue(
+            summary.inspectionText(
+                at: now.addingTimeInterval(61)
+            ).contains("Expiry dates need refresh")
+        )
+    }
+
     private func makeSnapshot(
         remaining: Double,
         fetchedAt: Date,
         tokenHistory: [TokenDay] = [],
-        accountFacts: AccountFacts? = nil
+        accountFacts: AccountFacts? = nil,
+        emergencyResetCount: Int = 0,
+        bankedResetCountAvailable: Bool? = true,
+        bankedResetDetails: [BankedResetDetail]? = nil
     ) -> UsageSnapshot {
         let window = UsageWindow(
             remainingPercent: remaining,
@@ -1010,9 +1191,26 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             mainLimit: LimitReading(limitId: "codex", name: "Codex", window: window),
             otherLimits: [],
             tokenHistory: tokenHistory,
-            emergencyResetCount: 0,
+            emergencyResetCount: emergencyResetCount,
+            bankedResetCountAvailable: bankedResetCountAvailable,
+            bankedResetDetails: bankedResetDetails,
             fetchedAt: fetchedAt,
             accountFacts: accountFacts
+        )
+    }
+
+    private func resetDetail(
+        id: String,
+        expiresAt: Date
+    ) -> BankedResetDetail {
+        BankedResetDetail(
+            id: id,
+            resetType: "codexRateLimits",
+            status: "available",
+            grantedAt: Date(timeIntervalSince1970: 1_900_000),
+            expiresAt: expiresAt,
+            title: "Full reset",
+            description: "Ready"
         )
     }
 
