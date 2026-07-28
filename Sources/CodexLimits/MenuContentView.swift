@@ -425,9 +425,9 @@ private struct GraphsWorkspace: View {
             case .tokenActivity:
                 TokenActivityWorkspace(reader: reader, store: store)
             case .usagePerToken:
-                UnavailableGraph(
-                    title: "Usage per token",
-                    message: "Usage per token is not available for this range."
+                UsagePerTokenWorkspace(
+                    sourceSnapshot: reader.usagePerToken,
+                    store: store
                 )
             case .concurrency:
                 ConcurrencyWorkspace(reader: reader, store: store)
@@ -493,7 +493,9 @@ private struct GraphsWorkspace: View {
             Label("Account", systemImage: "person.crop.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help("Project, Task Tree, model, and reasoning filters do not change Usage remaining.")
+                .help(
+                    "Project, Task Tree, model, and reasoning filters do not change \(store.state.graph.rawValue)."
+                )
                 .accessibilityLabel("Account scope")
         } else {
             WorkspaceFilterMenu(reader: reader, store: store)
@@ -555,6 +557,566 @@ private struct GraphsWorkspace: View {
                 message: "Try refreshing to check again."
             )
         }
+    }
+}
+
+struct UsagePerTokenWorkspace: View {
+    let sourceSnapshot: UsagePerTokenSnapshot
+    @ObservedObject var store: AnalyticsWorkspaceStore
+
+    @State private var selectedPointID: String?
+
+    private var activePinnedBaselineID: String? {
+        guard let current = sourceSnapshot.current,
+              store.state.pinnedUsageBaselineAccountPartitionID
+                == current.accountPartitionID else {
+            return nil
+        }
+        return store.state.pinnedUsageBaselineID
+    }
+
+    private var snapshot: UsagePerTokenSnapshot {
+        sourceSnapshot.selectingBaseline(
+            activePinnedBaselineID
+        )
+    }
+
+    private var allEvidence: [WeeklyUsageEvidence] {
+        snapshot.history + [snapshot.current].compactMap { $0 }
+    }
+
+    private var bounds: DateInterval? {
+        guard let first = allEvidence.map(\.interval.start).min(),
+              let last = allEvidence.map(\.interval.end).max(),
+              last > first else {
+            return nil
+        }
+        return DateInterval(start: first, end: last)
+    }
+
+    private var visibleRange: DateInterval? {
+        guard let bounds else { return nil }
+        if store.state.timeRange == .currentWindow,
+           let current = snapshot.current {
+            return current.interval
+        }
+        return store.effectiveRange(
+            within: bounds,
+            endingAt: snapshot.current?.interval.end ?? bounds.end
+        )
+    }
+
+    private var visiblePoints: [UsagePerTokenChartPoint] {
+        guard let visibleRange else { return [] }
+        return snapshot.points.filter {
+            $0.date >= visibleRange.start && $0.date <= visibleRange.end
+        }
+    }
+
+    private var selectedPoint: UsagePerTokenChartPoint? {
+        if let selectedPointID,
+           let point = visiblePoints.first(where: {
+               $0.id == selectedPointID
+           }) {
+            return point
+        }
+        return visiblePoints.last(where: \.isCurrent)
+            ?? visiblePoints.last
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline) {
+                    heading
+                    Spacer()
+                    baselineMenu
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    heading
+                    baselineMenu
+                }
+            }
+
+            if let comparison = snapshot.comparison,
+               let visibleRange {
+                chart(
+                    comparison: comparison,
+                    visibleRange: visibleRange
+                )
+                selectedPointDetail(comparison: comparison)
+                capacity(comparison.equivalentCapacity)
+            } else {
+                WorkspaceMessage(
+                    icon: "chart.xyaxis.line",
+                    title: snapshot.reason ?? "Usage per token is unavailable",
+                    message: unavailableMessage
+                ) {
+                    EmptyView()
+                }
+            }
+
+            if let current = snapshot.current {
+                currentFacts(current)
+            }
+        }
+        .onChange(of: store.state.pinnedUsageBaselineID) { _, _ in
+            selectedPointID = nil
+        }
+        .onChange(of: visibleRange) { _, range in
+            if let selectedPointID,
+               !visiblePoints.contains(where: { $0.id == selectedPointID }) {
+                self.selectedPointID = nil
+            }
+            if range == nil {
+                selectedPointID = nil
+            }
+        }
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Usage per token")
+                .font(.title3.weight(.semibold))
+            Text("Allowance Intensity compared with your Reference Baseline")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var baselineMenu: some View {
+        Menu {
+            Button("Previous 4 comparable weeks") {
+                store.pinUsageBaseline(nil)
+            }
+            Divider()
+            ForEach(snapshot.eligiblePinnedBaselines) { evidence in
+                Button(baselineLabel(evidence)) {
+                    store.pinUsageBaseline(
+                        evidence.id,
+                        accountPartitionID: evidence.accountPartitionID
+                    )
+                }
+            }
+        } label: {
+            Label(referenceLabel, systemImage: "pin")
+        }
+        .menuStyle(.borderlessButton)
+        .help("Choose a qualifying Reference Baseline")
+        .accessibilityLabel("Reference Baseline")
+        .accessibilityValue(referenceLabel)
+    }
+
+    private var referenceLabel: String {
+        if let baseline = snapshot.comparison?.baseline,
+           baseline.isPinned {
+            return "Pinned week"
+        }
+        if activePinnedBaselineID != nil {
+            return "Pinned week unavailable"
+        }
+        return "Previous 4 comparable weeks"
+    }
+
+    private var unavailableMessage: String {
+        if snapshot.current == nil {
+            return "Account Movement and Account Token Activity need the same bounded weekly interval."
+        }
+        if snapshot.reason != "Not enough comparable weeks" {
+            return "Raw account and local facts remain visible. The comparison stays hidden until the evidence meets this requirement."
+        }
+        return "A comparison needs four prior complete weeks with High comparability, or one qualifying pinned week."
+    }
+
+    private func chart(
+        comparison: UsagePerTokenComparison,
+        visibleRange: DateInterval
+    ) -> some View {
+        let maximum = max(
+            visiblePoints.map(\.multiplier).max() ?? 1,
+            1
+        )
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                ChartLegendItem(
+                    label: "Current · Account",
+                    color: .blue
+                )
+                ChartLegendItem(
+                    label: "Past weeks · Account",
+                    color: .secondary
+                )
+                ChartLegendItem(
+                    label: "Reference · 1×",
+                    color: .green,
+                    dash: [3, 3]
+                )
+            }
+
+            Chart {
+                RuleMark(y: .value("Reference", 1))
+                    .foregroundStyle(Color.green)
+                    .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
+
+                ForEach(visiblePoints) { point in
+                    LineMark(
+                        x: .value("Weekly interval", point.date),
+                        y: .value("Usage per token", point.multiplier)
+                    )
+                    .foregroundStyle(Color.secondary.opacity(0.65))
+                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+
+                    PointMark(
+                        x: .value("Weekly interval", point.date),
+                        y: .value("Usage per token", point.multiplier)
+                    )
+                    .foregroundStyle(point.isCurrent ? Color.blue : Color.secondary)
+                    .symbolSize(point.isCurrent ? 60 : 34)
+                }
+
+                if let selectedPoint {
+                    RuleMark(
+                        x: .value("Selected interval", selectedPoint.date)
+                    )
+                    .foregroundStyle(Color.primary.opacity(0.4))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                }
+            }
+            .chartXScale(domain: visibleRange.start ... visibleRange.end)
+            .chartYScale(domain: 0 ... max(1.25, maximum * 1.15))
+            .chartYAxis {
+                AxisMarks(position: .leading) { value in
+                    AxisGridLine()
+                        .foregroundStyle(Color.secondary.opacity(0.16))
+                    AxisValueLabel {
+                        if let multiplier = value.as(Double.self) {
+                            Text(
+                                multiplier,
+                                format: .number
+                                    .precision(.fractionLength(1))
+                            )
+                            + Text("×")
+                        }
+                    }
+                }
+            }
+            .chartLegend(.hidden)
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    Rectangle()
+                        .fill(.clear)
+                        .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case let .active(location):
+                                selectNearest(
+                                    at: location,
+                                    proxy: proxy,
+                                    geometry: geometry
+                                )
+                            case .ended:
+                                break
+                            }
+                        }
+                }
+            }
+            .frame(height: 270)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Usage per token")
+            .accessibilityValue(
+                selectedPoint.map {
+                    accessibilityPointSummary(
+                        $0,
+                        comparison: comparison
+                    )
+                }
+                    ?? "Current Usage per token is \(formattedMultiplier(comparison.multiplier)) the Reference Baseline. \(comparison.confidence.displayName) confidence."
+            )
+            .accessibilityHint(
+                "Use Previous point and Next point for exact values."
+            )
+        }
+    }
+
+    private func selectedPointDetail(
+        comparison: UsagePerTokenComparison
+    ) -> some View {
+        HStack(spacing: 10) {
+            if let selectedPoint {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(pointSummary(selectedPoint))
+                        .fontWeight(.semibold)
+                    Text(
+                        selectedPoint.evidence.interval.start.formatted(
+                            date: .abbreviated,
+                            time: .omitted
+                        )
+                        + "–"
+                        + selectedPoint.evidence.interval.end.formatted(
+                            date: .abbreviated,
+                            time: .omitted
+                        )
+                    )
+                    .foregroundStyle(.secondary)
+                    Text(
+                        "Local Token Activity \(selectedPoint.evidence.localTokenActivity.map(compactTokenCount) ?? "Unavailable") · Local Coverage \(localCoverageText(selectedPoint.evidence))"
+                    )
+                    .foregroundStyle(.secondary)
+                    Text(workloadSummary(selectedPoint.evidence))
+                        .foregroundStyle(.secondary)
+                    Text(
+                        "Reference \(baselineLabel(comparison.baseline)) · \(selectedPoint.evidence.coverage.displayName) coverage · \(selectedPoint.confidence.displayName) confidence"
+                    )
+                    .foregroundStyle(.tertiary)
+                    if let reason = selectedPoint.evidence.coverageReason {
+                        Text(reason)
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let caveat = selectedPoint.caveat {
+                        Text(caveat)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } else {
+                Text("Choose a point for exact details.")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                moveSelection(by: -1)
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .accessibilityLabel("Previous point")
+            Button {
+                moveSelection(by: 1)
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .accessibilityLabel("Next point")
+        }
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            .quaternary.opacity(0.7),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
+
+    private func capacity(
+        _ estimate: EquivalentCapacityEstimate
+    ) -> some View {
+        WorkspaceCard(title: "Equivalent Capacity") {
+            FactRow(
+                label: "Estimate",
+                value: "\(compactTokenCount(estimate.tokens)) account tokens",
+                detail: "Derived estimate under the observed workload mix"
+            )
+            FactRow(
+                label: "Range",
+                value: "\(compactTokenCount(estimate.lowerTokens))–\(compactTokenCount(estimate.upperTokens))",
+                detail: "Across the current and Reference Baseline intervals"
+            )
+            FactRow(
+                label: "Confidence",
+                value: estimate.confidence.displayName
+            )
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Equivalent Capacity")
+        .accessibilityValue(
+            "\(compactTokenCount(estimate.tokens)) account tokens, range \(compactTokenCount(estimate.lowerTokens)) to \(compactTokenCount(estimate.upperTokens)), \(estimate.confidence.displayName) confidence"
+        )
+    }
+
+    private func currentFacts(
+        _ current: WeeklyUsageEvidence
+    ) -> some View {
+        WorkspaceCard(title: "Current interval") {
+            FactRow(
+                label: "Range",
+                value: baselineLabel(current)
+            )
+            FactRow(
+                label: "Allowance Intensity",
+                value: current.allowancePointsPerMillionTokens.map {
+                    $0.formatted(
+                        .number.precision(.fractionLength(1 ... 2))
+                    ) + " percentage points per 1M account tokens"
+                } ?? "Unavailable",
+                detail: current.intensityUnavailableReason.map {
+                    "Derived estimate · \($0)"
+                } ?? "Derived estimate · Account Movement and Account Token Activity"
+            )
+            FactRow(
+                label: "Account Movement",
+                value: current.accountMovementPoints.formatted(
+                    .number.precision(.fractionLength(0 ... 2))
+                ) + " percentage points",
+                detail: "Account"
+            )
+            FactRow(
+                label: "Account Token Activity",
+                value: compactTokenCount(current.accountTokenActivity),
+                detail: "Account"
+            )
+            FactRow(
+                label: "Local Token Activity",
+                value: current.localTokenActivity.map(compactTokenCount)
+                    ?? "Unavailable",
+                detail: "Codex local records"
+            )
+            FactRow(
+                label: "Local Coverage",
+                value: current.localCoveragePercent.map {
+                    $0.formatted(
+                        .number.precision(.fractionLength(0 ... 1))
+                    ) + "%"
+                } ?? "Unavailable",
+                detail: localCoverageDetail(current)
+            )
+            if let cache = current.cachedInputShare {
+                FactRow(
+                    label: "Cached input share",
+                    value: cache.formatted(
+                        .percent.precision(.fractionLength(0 ... 1))
+                    )
+                )
+            }
+            FactRow(
+                label: "Boundary",
+                value: current.boundaryQuality.rawValue.capitalized
+            )
+        }
+    }
+
+    private func pointSummary(
+        _ point: UsagePerTokenChartPoint
+    ) -> String {
+        "\(formattedMultiplier(point.multiplier)) baseline · \(point.evidence.accountMovementPoints.formatted(.number.precision(.fractionLength(0 ... 2)))) percentage points · \(compactTokenCount(point.evidence.accountTokenActivity)) account tokens"
+    }
+
+    private func accessibilityPointSummary(
+        _ point: UsagePerTokenChartPoint,
+        comparison: UsagePerTokenComparison
+    ) -> String {
+        let reason = point.evidence.coverageReason.map {
+            " \($0)."
+        } ?? ""
+        let caveat = point.caveat.map {
+            " \($0)."
+        } ?? ""
+        return "\(pointSummary(point)). Local Token Activity \(point.evidence.localTokenActivity.map(compactTokenCount) ?? "Unavailable"). Local Coverage \(localCoverageText(point.evidence)). Workload mix: \(workloadSummary(point.evidence)). Reference \(baselineLabel(comparison.baseline)). \(point.evidence.coverage.displayName) coverage. \(point.confidence.displayName) confidence.\(reason)\(caveat)"
+    }
+
+    private func localCoverageText(
+        _ evidence: WeeklyUsageEvidence
+    ) -> String {
+        evidence.localCoveragePercent.map {
+            $0.formatted(
+                .number.precision(.fractionLength(0 ... 1))
+            ) + "%"
+        } ?? "Unavailable"
+    }
+
+    private func localCoverageDetail(
+        _ evidence: WeeklyUsageEvidence
+    ) -> String {
+        if let reason = evidence.coverageReason {
+            return "Derived estimate · \(reason)"
+        }
+        return "Derived estimate · Same bounded interval"
+    }
+
+    private func workloadSummary(
+        _ evidence: WeeklyUsageEvidence
+    ) -> String {
+        let model = dominantShare(evidence.modelShares)
+            .map { "\($0.0) \($0.1.formatted(.percent.precision(.fractionLength(0))))" }
+            ?? "Model mix unavailable"
+        let modelCoverage = evidence.modelAttributionPercent < 99.9
+            ? " · Model metadata \(evidence.modelAttributionPercent.formatted(.percent.scale(1).precision(.fractionLength(0))))"
+            : ""
+        let reasoning = dominantShare(evidence.reasoningShares)
+            .map { "\($0.0) \($0.1.formatted(.percent.precision(.fractionLength(0))))" }
+            ?? "Reasoning mix unavailable"
+        let reasoningCoverage = evidence.reasoningAttributionPercent < 99.9
+            ? " · Reasoning metadata \(evidence.reasoningAttributionPercent.formatted(.percent.scale(1).precision(.fractionLength(0))))"
+            : ""
+        let cache = evidence.cachedInputShare.map {
+            "Cached input \($0.formatted(.percent.precision(.fractionLength(0))))"
+        } ?? "Cached input unavailable"
+        return "\(model)\(modelCoverage) · \(reasoning)\(reasoningCoverage) · \(cache)"
+    }
+
+    private func dominantShare(
+        _ shares: [String: Double]
+    ) -> (String, Double)? {
+        shares.max { $0.value < $1.value }
+    }
+
+    private func formattedMultiplier(_ value: Double) -> String {
+        value.formatted(
+            .number.precision(.fractionLength(1 ... 2))
+        ) + "×"
+    }
+
+    private func baselineLabel(
+        _ evidence: WeeklyUsageEvidence
+    ) -> String {
+        let start = evidence.interval.start.formatted(
+            date: .abbreviated,
+            time: .omitted
+        )
+        let end = evidence.interval.end.formatted(
+            date: .abbreviated,
+            time: .omitted
+        )
+        return "\(start)–\(end)"
+    }
+
+    private func baselineLabel(
+        _ baseline: ReferenceBaseline
+    ) -> String {
+        let start = baseline.interval.start.formatted(
+            date: .abbreviated,
+            time: .omitted
+        )
+        let end = baseline.interval.end.formatted(
+            date: .abbreviated,
+            time: .omitted
+        )
+        return "\(start)–\(end)"
+    }
+
+    private func selectNearest(
+        at location: CGPoint,
+        proxy: ChartProxy,
+        geometry: GeometryProxy
+    ) {
+        guard let plotFrame = proxy.plotFrame else { return }
+        let frame = geometry[plotFrame]
+        let x = location.x - frame.origin.x
+        guard x >= 0,
+              x <= frame.width,
+              let date: Date = proxy.value(atX: x),
+              let nearest = visiblePoints.min(by: {
+                  abs($0.date.timeIntervalSince(date))
+                      < abs($1.date.timeIntervalSince(date))
+              }) else {
+            return
+        }
+        selectedPointID = nearest.id
+    }
+
+    private func moveSelection(by offset: Int) {
+        guard !visiblePoints.isEmpty else { return }
+        let index = selectedPoint.flatMap { selected in
+            visiblePoints.firstIndex(where: { $0.id == selected.id })
+        } ?? (offset < 0 ? visiblePoints.count : -1)
+        let next = min(max(index + offset, 0), visiblePoints.count - 1)
+        selectedPointID = visiblePoints[next].id
     }
 }
 

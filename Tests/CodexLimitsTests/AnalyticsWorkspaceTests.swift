@@ -75,6 +75,46 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testPinnedUsageBaselinePersistsUntilCleared() {
+        let suiteName = "AnalyticsWorkspaceTests-pin-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let first = AnalyticsWorkspaceStore(defaults: defaults)
+        first.pinUsageBaseline(
+            "weekly|123",
+            accountPartitionID: "account-a"
+        )
+
+        XCTAssertEqual(
+            AnalyticsWorkspaceStore(defaults: defaults)
+                .state.pinnedUsageBaselineID,
+            "weekly|123"
+        )
+        XCTAssertEqual(
+            AnalyticsWorkspaceStore(defaults: defaults)
+                .state.pinnedUsageBaselineAccountPartitionID,
+            "account-a"
+        )
+
+        first.pinUsageBaseline(nil)
+
+        XCTAssertNil(
+            AnalyticsWorkspaceStore(defaults: defaults)
+                .state.pinnedUsageBaselineID
+        )
+        XCTAssertNil(
+            AnalyticsWorkspaceStore(defaults: defaults)
+                .state.pinnedUsageBaselineAccountPartitionID
+        )
+    }
+
+    func testUsagePerTokenKeepsAccountScope() {
+        XCTAssertTrue(AnalyticsGraph.usagePerToken.usesAccountScope)
+        XCTAssertFalse(AnalyticsGraph.tokenActivity.usesAccountScope)
+        XCTAssertFalse(AnalyticsGraph.concurrency.usesAccountScope)
+    }
+
     func testChangingGraphKeepsRangeAndFilters() {
         let store = AnalyticsWorkspaceStore(
             defaults: UserDefaults(suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)")!
@@ -582,6 +622,60 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 "\(section.rawValue) did not render"
             )
         }
+
+        store.selectSection(.graphs)
+        for graph in AnalyticsGraph.allCases {
+            store.selectGraph(graph)
+            XCTAssertTrue(
+                renders(
+                    AnalyticsWorkspaceBody(reader: reader, store: store),
+                    size: CGSize(width: 640, height: 620)
+                ),
+                "\(graph.rawValue) did not render"
+            )
+        }
+    }
+
+    func testUsagePerTokenComparisonRendersAtSmallAndLargeSizes() {
+        let suiteName =
+            "AnalyticsWorkspaceTests-usage-per-token-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AnalyticsWorkspaceStore(defaults: defaults)
+        store.selectTimeRange(.fourWeeks)
+        let current = comparisonWeek(
+            index: 5,
+            movement: 40,
+            tokens: 10_000_000
+        )
+        let history = (0 ... 3).map {
+            comparisonWeek(
+                index: $0,
+                movement: Double(($0 + 1) * 10),
+                tokens: 10_000_000
+            )
+        }
+        let snapshot = UsagePerTokenEngine.evaluate(
+            current: current,
+            history: history,
+            pinnedBaselineID: nil
+        )
+
+        for size in [
+            CGSize(width: 390, height: 430),
+            CGSize(width: 640, height: 780)
+        ] {
+            XCTAssertTrue(
+                renders(
+                    UsagePerTokenWorkspace(
+                        sourceSnapshot: snapshot,
+                        store: store
+                    ),
+                    size: size
+                ),
+                "Usage per token comparison did not render at \(size)"
+            )
+        }
     }
 
     private func renders<Content: View>(
@@ -625,4 +719,43 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             fetchedAt: fetchedAt
         )
     }
+
+    private func comparisonWeek(
+        index: Int,
+        movement: Double,
+        tokens: Int64
+    ) -> WeeklyUsageEvidence {
+        let start = Date(timeIntervalSince1970: 10_000)
+            .addingTimeInterval(Double(index) * 7 * 86_400)
+        return WeeklyUsageEvidence(
+            id: "week-\(index)",
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            windowDurationMinutes: 10_080,
+            allowanceResetsAt: start.addingTimeInterval(7 * 86_400),
+            interval: DateInterval(start: start, duration: 7 * 86_400),
+            isComplete: index < 5,
+            accountMovementPoints: movement,
+            accountTokenActivity: tokens,
+            localTokenActivity: Int64(Double(tokens) * 0.9),
+            localCoveragePercent: 90,
+            boundaryQuality: .tight,
+            maximumAccountGap: 15 * 60,
+            modelShares: [
+                "gpt-5.6-sol": 0.8,
+                "gpt-5.6-luna": 0.2
+            ],
+            modelAttributionPercent: 100,
+            reasoningShares: ["high": 0.8, "medium": 0.2],
+            reasoningAttributionPercent: 100,
+            cachedInputShare: 0.4,
+            containsUnknownCorrection: false,
+            containsAccountChange: false,
+            containsCounterDecrease: false,
+            tokenDefinitionsAlign: true,
+            localSourceContinuous: true,
+            localSourceReason: nil
+        )
+    }
+
 }

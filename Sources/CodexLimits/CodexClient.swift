@@ -31,6 +31,17 @@ enum CodexAccountObservation: Equatable, Sendable {
 struct CodexFetchResult: Sendable {
     let snapshot: UsageSnapshot
     let account: CodexAccountObservation?
+    let planType: String?
+
+    init(
+        snapshot: UsageSnapshot,
+        account: CodexAccountObservation?,
+        planType: String? = nil
+    ) {
+        self.snapshot = snapshot
+        self.account = account
+        self.planType = planType
+    }
 }
 
 enum CodexClientError: LocalizedError {
@@ -727,6 +738,19 @@ actor CodexClient {
         return .unknown(state: state)
     }
 
+    static func decodePlanType(_ response: Data) -> String? {
+        guard let value = try? JSONDecoder().decode(
+            RPCResponse<AccountResult>.self,
+            from: response
+        ) else {
+            return nil
+        }
+        let plan = value.result?.account?.planType?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return plan?.isEmpty == false ? plan : nil
+    }
+
     static func decodeResult(
         rateLimitsResponse: Data,
         usageResponse: Data,
@@ -739,7 +763,8 @@ actor CodexClient {
                 usageResponse: usageResponse,
                 fetchedAt: fetchedAt
             ),
-            account: try? decodeAccount(accountResponse)
+            account: try? decodeAccount(accountResponse),
+            planType: decodePlanType(accountResponse)
         )
     }
 
@@ -764,7 +789,8 @@ actor CodexClient {
         )
         return CodexFetchResult(
             snapshot: snapshot,
-            account: current.account
+            account: current.account,
+            planType: current.planType ?? previous.planType
         )
     }
 
@@ -925,6 +951,7 @@ private struct AccountResult: Decodable {
 private struct AccountValue: Decodable {
     let type: String
     let email: String?
+    let planType: String?
 }
 
 private struct TokenBucket: Decodable {

@@ -795,6 +795,7 @@ final class CodexClientTests: XCTestCase {
         let account = try CodexClient.decodeAccount(response)
 
         XCTAssertEqual(account, .stable(identity: "User@example.com"))
+        XCTAssertEqual(CodexClient.decodePlanType(response), "pro")
     }
 
     func testAccountReadErrorKeepsValidUsageWithoutAnAccountObservation() throws {

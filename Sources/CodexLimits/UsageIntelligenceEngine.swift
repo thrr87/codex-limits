@@ -369,8 +369,10 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let sourceState: UsageSourceState
     let now: Date
     let previousStatus: PaceStatus?
+    let accountPartitionID: String?
     let accountEpochStartedAt: Date?
     let localActivityFacts: [LocalActivityFact]
+    let localActivityHistoryFacts: [LocalActivityFact]
     let localActivityObservation: LocalActivityObservation
     let localTaskProjections: [ThreadProjection]
 
@@ -381,8 +383,10 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         sourceState: UsageSourceState,
         now: Date,
         previousStatus: PaceStatus?,
+        accountPartitionID: String? = nil,
         accountEpochStartedAt: Date? = nil,
         localActivityFacts: [LocalActivityFact] = [],
+        localActivityHistoryFacts: [LocalActivityFact]? = nil,
         localActivityObservation: LocalActivityObservation = .unavailable(
             "Codex local records are unavailable"
         ),
@@ -394,8 +398,11 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         self.sourceState = sourceState
         self.now = now
         self.previousStatus = previousStatus
+        self.accountPartitionID = accountPartitionID
         self.accountEpochStartedAt = accountEpochStartedAt
         self.localActivityFacts = localActivityFacts
+        self.localActivityHistoryFacts =
+            localActivityHistoryFacts ?? localActivityFacts
         self.localActivityObservation = localActivityObservation
         self.localTaskProjections = localTaskProjections
     }
@@ -414,6 +421,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let bankedResets: BankedResetSummary?
     let accountTokenActivity: AccountTokenActivitySnapshot
     let localTokenActivity: LocalTokenActivitySnapshot
+    let usagePerToken: UsagePerTokenSnapshot
     let usageReceipts: UsageReceiptSnapshot
     let activityTimeline: ActivityTimelineSnapshot
     let localTaskProjections: [ThreadProjection]
@@ -606,6 +614,30 @@ enum UsageIntelligenceEngine {
             interval: localTokenActivity.interval,
             observation: input.localActivityObservation
         )
+        let usagePerToken: UsagePerTokenSnapshot
+        if let partitionID = input.accountPartitionID,
+           let weekly = input.account?.mainLimit {
+            let evidence = WeeklyUsageEvidenceBuilder.build(
+                samples: input.samples,
+                localFacts: input.localActivityHistoryFacts,
+                localObservation: input.localActivityObservation,
+                accountPartitionID: partitionID,
+                limitID: weekly.limitId,
+                currentReset: weekly.window.resetsAt,
+                compatibleTokenSources: []
+            )
+            usagePerToken = UsagePerTokenEngine.evaluate(
+                current: evidence.current,
+                history: evidence.history,
+                pinnedBaselineID: nil
+            )
+        } else {
+            usagePerToken = UsagePerTokenEngine.evaluate(
+                current: nil,
+                history: [],
+                pinnedBaselineID: nil
+            )
+        }
         return UsageReaderSnapshot(
             account: input.account,
             accountSource: .account,
@@ -634,6 +666,7 @@ enum UsageIntelligenceEngine {
             ),
             accountTokenActivity: accountTokenActivity,
             localTokenActivity: localTokenActivity,
+            usagePerToken: usagePerToken,
             usageReceipts: usageReceipts,
             activityTimeline: activityTimeline,
             localTaskProjections: input.localTaskProjections

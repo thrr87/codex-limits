@@ -83,6 +83,154 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertNil(reader.accountTokenActivity.reason)
     }
 
+    func testReaderPublishesBoundedCurrentUsagePerTokenFacts() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 1_600,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil
+            )
+        )
+        let reset = try XCTUnwrap(account.mainLimit?.window.resetsAt)
+        let boundary = UsageSample(
+            observedAt: try XCTUnwrap(account.mainLimit?.window.startsAt),
+            remainingPercent: 100,
+            resetsAt: reset,
+            lifetimeTokens: 1_000
+        )
+        let current = UsageSample(
+            observedAt: now,
+            remainingPercent: 80,
+            resetsAt: reset,
+            lifetimeTokens: 1_600
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary, current],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a"
+            )
+        )
+
+        XCTAssertEqual(
+            reader.usagePerToken.current?.accountMovementPoints,
+            20
+        )
+        XCTAssertEqual(
+            reader.usagePerToken.current?.accountTokenActivity,
+            600
+        )
+        XCTAssertNil(reader.usagePerToken.comparison)
+        XCTAssertEqual(
+            reader.usagePerToken.reason,
+            "Account samples are more than 6 hours apart"
+        )
+    }
+
+    func testReaderUsesHistoricalFactsOnlyForHistoricalWeeklyEvidence() throws {
+        let now = Date(timeIntervalSince1970: 8_000_000)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 16_000_000,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil,
+                lifetimeTokensObservedAt: now
+            )
+        )
+        let currentReset = try XCTUnwrap(account.mainLimit?.window.resetsAt)
+        let currentStart = try XCTUnwrap(account.mainLimit?.window.startsAt)
+        let previousReset = currentStart
+        let previousStart = previousReset.addingTimeInterval(-7 * 86_400)
+        let samples = [
+            UsageSample(
+                observedAt: previousStart,
+                remainingPercent: 100,
+                resetsAt: previousReset,
+                lifetimeTokens: 1_000_000
+            ),
+            UsageSample(
+                observedAt: previousReset,
+                remainingPercent: 60,
+                resetsAt: previousReset,
+                lifetimeTokens: 11_000_000
+            ),
+            UsageSample(
+                observedAt: currentStart,
+                remainingPercent: 100,
+                resetsAt: currentReset,
+                lifetimeTokens: 11_000_000
+            ),
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 80,
+                resetsAt: currentReset,
+                lifetimeTokens: 16_000_000
+            )
+        ]
+        let pastFact = tokenFact(
+            tokens: 9_000_000,
+            date: previousStart.addingTimeInterval(60),
+            eventID: "past"
+        )
+        let currentFact = tokenFact(
+            tokens: 4_000_000,
+            date: currentStart.addingTimeInterval(60),
+            eventID: "current"
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: [currentFact],
+                localActivityHistoryFacts: [pastFact, currentFact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                )
+            )
+        )
+
+        XCTAssertEqual(reader.localTokenActivity.tokens, 4_000_000)
+        XCTAssertEqual(
+            reader.usagePerToken.current?.localTokenActivity,
+            4_000_000
+        )
+        XCTAssertEqual(
+            reader.usagePerToken.history.first?.localTokenActivity,
+            9_000_000
+        )
+        XCTAssertNil(reader.usagePerToken.current?.localCoveragePercent)
+        XCTAssertFalse(
+            try XCTUnwrap(
+                reader.usagePerToken.current
+            ).tokenDefinitionsAlign
+        )
+    }
+
     func testPreservedLifetimeReadingDoesNotExtendTheExactInterval() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let observedAt = now.addingTimeInterval(-600)
@@ -1262,5 +1410,45 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 )
             )
         }
+    }
+
+    private func tokenFact(
+        tokens: Int64,
+        date: Date,
+        eventID: String
+    ) -> LocalActivityFact {
+        LocalActivityFact(
+            key: .token,
+            availability: .available,
+            value: nil,
+            numericDelta: tokens,
+            tokenSegment: 0,
+            reason: nil,
+            eventID: eventID,
+            eventTimestamp: ISO8601DateFormatter().string(from: date),
+            source: LocalActivitySourceMetadata(
+                source: .rolloutJSONL,
+                sourceVersion: "0.145.0",
+                schemaVersion: "rollout-jsonl-v1",
+                sourceGeneration: 0,
+                historyMode: nil,
+                observedAt: date
+            ),
+            context: LocalActivityContext(
+                taskID: eventID,
+                turnID: eventID,
+                agent: nil,
+                effectiveModel: "gpt-5.6-sol",
+                reasoning: "high"
+            ),
+            tokenDelta: LocalTokenUsage(
+                inputTokens: tokens,
+                cachedInputTokens: 0,
+                cacheWriteInputTokens: 0,
+                outputTokens: 0,
+                reasoningOutputTokens: 0,
+                totalTokens: tokens
+            )
+        )
     }
 }

@@ -30,6 +30,7 @@ final class UsageMonitor: ObservableObject {
     private static let historyPartitionKey = "historyAccountPartition"
     private static let historyFingerprintKey = "historyAccountFingerprintKey"
     private static let historyAuthStateKey = "historyAccountState"
+    private static let historyPlanTypeKey = "historyAccountPlanType"
     private static let historyAccountEpochStartedAtKey = "historyAccountEpochStartedAt"
     private static let historySyncSelectedKey = "historySyncSelected"
     private static let historySyncAccountBindingKey = "historySyncAccountBinding"
@@ -201,6 +202,7 @@ final class UsageMonitor: ObservableObject {
             historyMatchesCurrentSnapshot = true
             await selectHistoryAccount(
                 account,
+                planType: result.planType,
                 observedAt: result.snapshot.fetchedAt
             )
             await prepareHistory(legacySamples: legacySamples)
@@ -218,7 +220,9 @@ final class UsageMonitor: ObservableObject {
                     observedAt: newSnapshot.fetchedAt,
                     remainingPercent: window.remainingPercent,
                     resetsAt: window.resetsAt,
-                    lifetimeTokens: freshLifetimeTokens(in: newSnapshot)
+                    lifetimeTokens: freshLifetimeTokens(in: newSnapshot),
+                    comparisonBreak:
+                        accountEpochStartedAt == newSnapshot.fetchedAt
                 )
                 let recordedState = await history.record(sample)
                 apply(
@@ -345,11 +349,15 @@ final class UsageMonitor: ObservableObject {
 
     private func selectHistoryAccount(
         _ observation: CodexAccountObservation,
+        planType: String? = nil,
         observedAt: Date
     ) async {
         let partition: AccountHistoryPartition
         let authState: String
         let previousAuthState = defaults.string(forKey: Self.historyAuthStateKey)
+        let previousPlanType = defaults.string(
+            forKey: Self.historyPlanTypeKey
+        )
         switch observation {
         case let .stable(identity):
             historyAccountIdentity = identity
@@ -368,7 +376,12 @@ final class UsageMonitor: ObservableObject {
                 partition = .unknown(transitionID: UUID())
             }
         }
-        if previousAuthState != authState || accountEpochStartedAt == nil {
+        let planChanged = planType.map {
+            previousAuthState != nil && previousPlanType != $0
+        } ?? false
+        if previousAuthState != authState
+            || planChanged
+            || accountEpochStartedAt == nil {
             accountEpochStartedAt = observedAt
             defaults.set(
                 observedAt,
@@ -376,6 +389,9 @@ final class UsageMonitor: ObservableObject {
             )
         }
         defaults.set(authState, forKey: Self.historyAuthStateKey)
+        if let planType {
+            defaults.set(planType, forKey: Self.historyPlanTypeKey)
+        }
         await localActivityCollector?.selectPartition(partition.id)
         guard partition != historyPartition else { return }
         historyPartition = partition
@@ -533,6 +549,7 @@ final class UsageMonitor: ObservableObject {
             historyMatchesCurrentSnapshot = true
             await selectHistoryAccount(
                 account,
+                planType: result.planType,
                 observedAt: result.snapshot.fetchedAt
             )
             let snapshot = result.snapshot
@@ -541,7 +558,9 @@ final class UsageMonitor: ObservableObject {
                     observedAt: snapshot.fetchedAt,
                     remainingPercent: window.remainingPercent,
                     resetsAt: window.resetsAt,
-                    lifetimeTokens: freshLifetimeTokens(in: snapshot)
+                    lifetimeTokens: freshLifetimeTokens(in: snapshot),
+                    comparisonBreak:
+                        accountEpochStartedAt == snapshot.fetchedAt
                 )
                 apply(await history.rebuildAvailableHistory([sample]))
             }
@@ -580,8 +599,11 @@ final class UsageMonitor: ObservableObject {
                 sourceState: sourceState,
                 now: now,
                 previousStatus: previousStatus,
+                accountPartitionID: historyPartition.id,
                 accountEpochStartedAt: accountEpochStartedAt,
                 localActivityFacts: localActivityCollection.facts,
+                localActivityHistoryFacts:
+                    localActivityCollection.facts,
                 localActivityObservation: localActivityCollection.observation,
                 localTaskProjections: localActivityCollection.projections
             )
@@ -747,6 +769,7 @@ final class UsageMonitor: ObservableObject {
             historyMatchesCurrentSnapshot = true
             await selectHistoryAccount(
                 account,
+                planType: result.planType,
                 observedAt: result.snapshot.fetchedAt
             )
             guard historyAccountIdentity != nil else {

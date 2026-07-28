@@ -102,12 +102,14 @@ final class UsageHistoryTests: XCTestCase {
                 observedAt: observedAt,
                 remainingPercent: 80,
                 resetsAt: resetsAt,
-                lifetimeTokens: 1_500
+                lifetimeTokens: 1_500,
+                comparisonBreak: true
             )
         )
 
         XCTAssertEqual(state.samples.count, 1)
         XCTAssertEqual(state.samples.first?.lifetimeTokens, 1_500)
+        XCTAssertEqual(state.samples.first?.comparisonBreak, true)
     }
 
     func testNegativeLifetimeTokenReadingIsRejectedDuringNormalization() async throws {

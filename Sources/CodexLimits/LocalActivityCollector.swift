@@ -324,7 +324,6 @@ actor LocalActivityCollector {
         }) {
             gapReason = gapReason ?? "Local task record continuity changed"
         }
-        let facts = activeStates.flatMap(\.facts)
         let activeTaskIDs = taskIDs(in: activeStates)
         let projectionChainsBefore = projectionChainIdentities(
             for: activeTaskIDs,
@@ -408,7 +407,7 @@ actor LocalActivityCollector {
             gapReason = gapReason ?? "Local activity could not be saved"
         }
         return LocalActivityCollection(
-            facts: facts,
+            facts: activeStates.flatMap(\.facts),
             projections: activeProjections,
             observation: gapReason.map {
                 .gap(

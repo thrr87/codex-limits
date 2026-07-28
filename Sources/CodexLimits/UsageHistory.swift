@@ -964,10 +964,20 @@ actor UsageHistory {
                 byIdentity[sample] = sample
                 continue
             }
-            if let newTokens = sample.lifetimeTokens,
-               newTokens > (existing.lifetimeTokens ?? .min) {
-                byIdentity[sample] = sample
+            let lifetimeTokens = if let newTokens = sample.lifetimeTokens,
+                                    newTokens > (existing.lifetimeTokens ?? .min) {
+                newTokens
+            } else {
+                existing.lifetimeTokens
             }
+            byIdentity[sample] = UsageSample(
+                observedAt: existing.observedAt,
+                remainingPercent: existing.remainingPercent,
+                resetsAt: existing.resetsAt,
+                lifetimeTokens: lifetimeTokens,
+                comparisonBreak:
+                    existing.comparisonBreak || sample.comparisonBreak
+            )
         }
         return byIdentity.values.sorted {
             if $0.observedAt != $1.observedAt { return $0.observedAt < $1.observedAt }

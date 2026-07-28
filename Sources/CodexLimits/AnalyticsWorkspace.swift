@@ -19,7 +19,7 @@ enum AnalyticsGraph: String, CaseIterable, Codable, Identifiable, Sendable {
     var id: String { rawValue }
 
     var usesAccountScope: Bool {
-        self == .usageRemaining
+        self == .usageRemaining || self == .usagePerToken
     }
 }
 
@@ -27,6 +27,8 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
     case currentWindow = "Current window"
     case oneDay = "24 hours"
     case threeDays = "3 days"
+    case fourWeeks = "4 weeks"
+    case twelveWeeks = "12 weeks"
     case selected = "Selected range"
 
     var id: String { rawValue }
@@ -47,6 +49,10 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
             duration = 86_400
         case .threeDays:
             duration = 3 * 86_400
+        case .fourWeeks:
+            duration = 28 * 86_400
+        case .twelveWeeks:
+            duration = 84 * 86_400
         }
         let end = min(max(proposedEnd, bounds.start), bounds.end)
         return DateInterval(
@@ -83,13 +89,17 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
     var timeRange: AnalyticsTimeRange
     var filters: WorkspaceFilters
     var visibleRange: DateInterval?
+    var pinnedUsageBaselineID: String?
+    var pinnedUsageBaselineAccountPartitionID: String?
 
     static let initial = AnalyticsExplorationState(
         section: .graphs,
         graph: .usageRemaining,
         timeRange: .currentWindow,
         filters: .all,
-        visibleRange: nil
+        visibleRange: nil,
+        pinnedUsageBaselineID: nil,
+        pinnedUsageBaselineAccountPartitionID: nil
     )
 }
 
@@ -132,6 +142,17 @@ final class AnalyticsWorkspaceStore: ObservableObject {
 
     func updateFilters(_ filters: WorkspaceFilters) {
         update { $0.filters = filters }
+    }
+
+    func pinUsageBaseline(
+        _ intervalID: String?,
+        accountPartitionID: String? = nil
+    ) {
+        update {
+            $0.pinnedUsageBaselineID = intervalID
+            $0.pinnedUsageBaselineAccountPartitionID =
+                intervalID == nil ? nil : accountPartitionID
+        }
     }
 
     func selectVisibleRange(

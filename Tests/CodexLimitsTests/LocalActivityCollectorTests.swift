@@ -1227,6 +1227,45 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(after, before)
     }
 
+    func testRestartDoesNotLoadPersistedFactsOutsideTheCurrentInterval() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "past-task",
+            lines: [
+                fixture.session(threadID: "past-task", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let past = try fixture.interval()
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        _ = await first.refresh(interval: past)
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let current = try fixture.interval(
+            start: "2026-08-04T00:00:00Z",
+            end: "2026-08-05T00:00:00Z"
+        )
+        let collection = await restarted.refresh(interval: current)
+
+        XCTAssertEqual(collection.bytesRead, 0)
+        XCTAssertTrue(collection.facts.isEmpty)
+        XCTAssertEqual(collection.observation.coverage, .high)
+    }
+
     func testCorruptPersistedFactsRebuildFromTheRollout() async throws {
         let fixture = try CollectorFixture()
         _ = try fixture.rollout(

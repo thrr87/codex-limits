@@ -15,6 +15,7 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     let remainingPercent: Double
     let resetsAt: Date
     let lifetimeTokens: Int64?
+    let comparisonBreak: Bool
 
     private enum CodingKeys: String, CodingKey {
         case observedAt
@@ -22,18 +23,21 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
         case remainingPercent
         case resetsAt
         case lifetimeTokens
+        case comparisonBreak
     }
 
     init(
         observedAt: Date,
         remainingPercent: Double,
         resetsAt: Date,
-        lifetimeTokens: Int64? = nil
+        lifetimeTokens: Int64? = nil,
+        comparisonBreak: Bool = false
     ) {
         self.observedAt = observedAt
         self.remainingPercent = remainingPercent
         self.resetsAt = resetsAt
         self.lifetimeTokens = lifetimeTokens
+        self.comparisonBreak = comparisonBreak
     }
 
     init(from decoder: Decoder) throws {
@@ -43,6 +47,10 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
         remainingPercent = try container.decode(Double.self, forKey: .remainingPercent)
         resetsAt = try container.decode(Date.self, forKey: .resetsAt)
         lifetimeTokens = try container.decodeIfPresent(Int64.self, forKey: .lifetimeTokens)
+        comparisonBreak = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .comparisonBreak
+        ) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -51,6 +59,9 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
         try container.encode(remainingPercent, forKey: .remainingPercent)
         try container.encode(resetsAt, forKey: .resetsAt)
         try container.encodeIfPresent(lifetimeTokens, forKey: .lifetimeTokens)
+        if comparisonBreak {
+            try container.encode(true, forKey: .comparisonBreak)
+        }
     }
 
     static func == (lhs: UsageSample, rhs: UsageSample) -> Bool {

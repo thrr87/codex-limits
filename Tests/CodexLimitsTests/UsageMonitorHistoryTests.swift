@@ -264,6 +264,86 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
+    func testPlanChangeRecordsADurableComparisonBreak() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 90,
+                planType: "pro"
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_060),
+                remaining: 80,
+                planType: "pro"
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_120),
+                remaining: 70,
+                planType: "business"
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.refresh()
+        await monitor.refresh()
+        await monitor.refresh()
+
+        XCTAssertEqual(
+            monitor.samples.map(\.comparisonBreak),
+            [true, false, true]
+        )
+    }
+
+    func testFirstKnownPlanStartsNewComparisonCohort() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_060),
+                remaining: 80,
+                planType: "pro"
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.refresh()
+        await monitor.refresh()
+
+        XCTAssertEqual(
+            monitor.samples.map(\.comparisonBreak),
+            [true, true]
+        )
+    }
+
     func testRefreshDoesNotRecordAPreservedLifetimeFactAsANewReading() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -1210,14 +1290,16 @@ final class UsageMonitorHistoryTests: XCTestCase {
         fetchedAt: Date,
         remaining: Double,
         lifetimeTokens: Int64? = nil,
-        lifetimeTokensObservedAt: Date? = nil
+        lifetimeTokensObservedAt: Date? = nil,
+        planType: String? = nil
     ) -> CodexFetchResult {
         makeFetchResult(
             account: .stable(identity: identity),
             fetchedAt: fetchedAt,
             remaining: remaining,
             lifetimeTokens: lifetimeTokens,
-            lifetimeTokensObservedAt: lifetimeTokensObservedAt
+            lifetimeTokensObservedAt: lifetimeTokensObservedAt,
+            planType: planType
         )
     }
 
@@ -1226,7 +1308,8 @@ final class UsageMonitorHistoryTests: XCTestCase {
         fetchedAt: Date,
         remaining: Double,
         lifetimeTokens: Int64? = nil,
-        lifetimeTokensObservedAt: Date? = nil
+        lifetimeTokensObservedAt: Date? = nil,
+        planType: String? = nil
     ) -> CodexFetchResult {
         CodexFetchResult(
             snapshot: UsageSnapshot(
@@ -1257,7 +1340,8 @@ final class UsageMonitorHistoryTests: XCTestCase {
                     )
                 }
             ),
-            account: account
+            account: account,
+            planType: planType
         )
     }
 }
