@@ -70,9 +70,9 @@ enum CodexClientError: LocalizedError {
 
 final class CodexAppServerConnection: @unchecked Sendable {
     let input: FileHandle
-    let output: FileHandle
     let isRunning: () -> Bool
     let stop: () -> Void
+    private let outputDescriptor: Int32
     private var bufferedOutput = Data()
 
     init(
@@ -82,9 +82,15 @@ final class CodexAppServerConnection: @unchecked Sendable {
         stop: @escaping () -> Void
     ) {
         self.input = input
-        self.output = output
         self.isRunning = isRunning
         self.stop = stop
+        outputDescriptor = Darwin.dup(output.fileDescriptor)
+    }
+
+    deinit {
+        if outputDescriptor >= 0 {
+            Darwin.close(outputDescriptor)
+        }
     }
 
     func readLine() async -> Data? {
@@ -94,10 +100,21 @@ final class CodexAppServerConnection: @unchecked Sendable {
                 bufferedOutput.removeSubrange(...newline)
                 return Data(line)
             }
-            let chunk = await Task.detached { [output] in
-                output.availableData
+            let chunk = await Task.detached {
+                [outputDescriptor] () -> Data? in
+                var data = Data(count: 64 * 1_024)
+                let count = data.withUnsafeMutableBytes {
+                    Darwin.read(
+                        outputDescriptor,
+                        $0.baseAddress,
+                        $0.count
+                    )
+                }
+                guard count > 0 else { return nil }
+                data.count = count
+                return data
             }.value
-            guard !chunk.isEmpty else {
+            guard let chunk else {
                 guard !bufferedOutput.isEmpty else { return nil }
                 defer { bufferedOutput.removeAll() }
                 return bufferedOutput
