@@ -92,6 +92,7 @@ actor LocalActivityCollector {
     private let installedCLIVersion: (@Sendable () async -> String?)?
     private let tail = IncrementalRolloutTailSource()
     private let normalizer = LocalActivityNormalizer()
+    private let timestampParser = LocalEventTimestampParser()
     private var files: [String: FileState] = [:]
     private var restoredFilesByFingerprint: [String: FileState] = [:]
     private var restoredFingerprintByIdentity: [RolloutFileIdentity: String] = [:]
@@ -802,7 +803,7 @@ actor LocalActivityCollector {
     }
 
     private func parseTimestamp(_ value: String) -> Date? {
-        LocalEventTimestampParser().date(from: value)
+        timestampParser.date(from: value)
     }
 
     @discardableResult
