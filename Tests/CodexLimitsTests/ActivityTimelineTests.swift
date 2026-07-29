@@ -589,6 +589,50 @@ final class ActivityTimelineTests: XCTestCase {
             reader.activeTimeAvailability.activeTimeThisWeek,
             200
         )
+        XCTAssertEqual(
+            reader.activeTimeAvailability.maximumConcurrency,
+            1
+        )
+    }
+
+    func testAggregatorDoesNotRetainCompletedTurnsBeforeItsInterval() {
+        let interval = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        let snapshot = ActivityTimelineAggregator.evaluate(
+            facts: [
+                timingFact(
+                    eventID: "old",
+                    taskID: "root",
+                    turnID: "old",
+                    start: 100,
+                    end: 200
+                ),
+                timingFact(
+                    eventID: "current",
+                    taskID: "root",
+                    turnID: "current",
+                    start: 1_100,
+                    end: 1_200
+                )
+            ],
+            projections: [projection(taskID: "root", project: "atlas")],
+            interval: interval,
+            observation: .continuous(
+                sourceVersion: "0.145.0",
+                observedAt: interval.end
+            )
+        )
+        let wide = DateInterval(
+            start: Date(timeIntervalSince1970: 0),
+            end: interval.end
+        )
+
+        XCTAssertEqual(
+            snapshot.slice(in: wide, filters: .all).activeTime,
+            100
+        )
     }
 
     private func accountSnapshot(

@@ -126,9 +126,13 @@ final class LocalActivityCollectorTests: XCTestCase {
             interval: interval,
             observedAt: observedAt
         )
+        let failedProjectionSource = ReadOnlyThreadProjectionSource { _ in
+            throw CocoaError(.fileReadUnknown)
+        }
         let restarted = LocalActivityCollector(
             rootDirectory: fixture.root,
-            stateDirectory: stateDirectory
+            stateDirectory: stateDirectory,
+            projectionSource: failedProjectionSource
         )
         await restarted.selectPartition("stable-account")
         let afterRestart = await restarted.refresh(
@@ -150,6 +154,52 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(
             afterRestart.observation.reason,
             "Local task record continuity changed"
+        )
+    }
+
+    func testRewrittenRolloutKeepsFactsFromUnchangedActiveFiles() async throws {
+        let fixture = try CollectorFixture()
+        let rewritten = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-2",
+            lines: [
+                fixture.session(threadID: "task-2", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 3),
+                fixture.tokens(total: 1_000, ordinal: 2, minute: 4)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        _ = await collector.refresh(interval: interval)
+        try Data(
+            (
+                [
+                    fixture.session(threadID: "task-1", ordinal: 0),
+                    fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                    fixture.tokens(total: 800, ordinal: 2, minute: 2)
+                ].joined(separator: "\n") + "\n"
+            ).utf8
+        ).write(to: rewritten, options: .atomic)
+
+        let result = await collector.refresh(interval: interval)
+
+        XCTAssertEqual(
+            result.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta).sorted(),
+            [700, 900]
         )
     }
 
@@ -362,6 +412,121 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(
             restored.facts.compactMap(\.numericDelta),
             first.facts.compactMap(\.numericDelta)
+        )
+    }
+
+    func testRestoreCompactsLegacyContextFactsIntoTheirTokenFacts() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                #"{"timestamp":"2026-07-28T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","model_context_window":272000,"info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":80}}}}"#,
+                #"{"timestamp":"2026-07-28T10:02:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","model_context_window":272000,"info":{"total_token_usage":{"total_tokens":600},"last_token_usage":{"total_tokens":90}}}}"#
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        _ = await first.refresh(interval: try fixture.interval())
+        let partitionDirectory = stateDirectory.appendingPathComponent(
+            "stable-account",
+            isDirectory: true
+        )
+        let factsFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partitionDirectory,
+                includingPropertiesForKeys: nil
+            ).first { $0.lastPathComponent.hasSuffix(".facts.jsonl") }
+        )
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        let persisted = try String(contentsOf: factsFile, encoding: .utf8)
+            .split(separator: "\n")
+            .map { try decoder.decode(LocalActivityFact.self, from: Data($0.utf8)) }
+        var legacy: [LocalActivityFact] = []
+        for fact in persisted {
+            guard fact.key == .token,
+                  let contextUsage = fact.contextUsage else {
+                legacy.append(fact)
+                continue
+            }
+            legacy.append(
+                LocalActivityFact(
+                    key: fact.key,
+                    availability: fact.availability,
+                    value: fact.value,
+                    numericDelta: fact.numericDelta,
+                    tokenSegment: fact.tokenSegment,
+                    reason: fact.reason,
+                    eventID: fact.eventID,
+                    eventTimestamp: fact.eventTimestamp,
+                    source: fact.source,
+                    context: fact.context,
+                    tokenDelta: fact.tokenDelta
+                )
+            )
+            legacy.append(
+                LocalActivityFact(
+                    key: .context,
+                    availability: .available,
+                    value: .tokens(contextUsage),
+                    numericDelta: nil,
+                    tokenSegment: nil,
+                    reason: nil,
+                    eventID: fact.eventID,
+                    eventTimestamp: fact.eventTimestamp,
+                    source: contextUsage.totalTokens == 90
+                        ? LocalActivitySourceMetadata(
+                            source: fact.source.source,
+                            sourceVersion: fact.source.sourceVersion,
+                            schemaVersion: fact.source.schemaVersion,
+                            sourceGeneration:
+                                fact.source.sourceGeneration + 1,
+                            historyMode: fact.source.historyMode,
+                            observedAt: fact.source.observedAt
+                        )
+                        : fact.source,
+                    context: fact.context
+                )
+            )
+        }
+        var encoded = Data()
+        for fact in legacy {
+            encoded.append(try encoder.encode(fact))
+            encoded.append(0x0A)
+        }
+        try encoded.write(to: factsFile)
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(interval: try fixture.interval())
+
+        XCTAssertEqual(
+            restored.facts.filter { $0.key == .token }
+                .compactMap(\.contextUsage).map(\.totalTokens),
+            [80]
+        )
+        XCTAssertEqual(
+            restored.facts.filter {
+                $0.key == .context && $0.availability == .available
+            }.compactMap { fact -> Int64? in
+                guard case let .tokens(usage) = fact.value else {
+                    return nil
+                }
+                return usage.totalTokens
+            },
+            [90]
         )
     }
 
@@ -934,7 +1099,7 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
         XCTAssertEqual(receiptSlice.receipts.first?.rootTaskID, "task-1")
         XCTAssertEqual(receiptSlice.receipts.first?.tokens, 500)
-        XCTAssertEqual(migrated["version"] as? Int, 6)
+        XCTAssertEqual(migrated["version"] as? Int, 7)
         XCTAssertNil(migrated["path"])
         XCTAssertNotNil(migrated["pathFingerprint"])
     }
@@ -1167,7 +1332,7 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
         await collector.selectPartition("stable-account")
         let interval = try fixture.interval()
-        _ = await collector.refresh(interval: interval)
+        let first = await collector.refresh(interval: interval)
         let partitionDirectory = stateDirectory.appendingPathComponent(
             "stable-account",
             isDirectory: true
@@ -1184,12 +1349,18 @@ final class LocalActivityCollectorTests: XCTestCase {
             fixture.tokens(total: 800, ordinal: 3, minute: 3),
             to: rollout
         )
-        _ = await collector.refresh(interval: interval)
+        let appended = await collector.refresh(interval: interval)
         let after = try Data(contentsOf: factsFile)
 
         XCTAssertTrue(after.starts(with: before))
         XCTAssertGreaterThan(after.count, before.count)
         XCTAssertLessThan(after.count - before.count, before.count)
+        XCTAssertNotEqual(appended.contentRevision, first.contentRevision)
+        XCTAssertEqual(
+            appended.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta),
+            [500, 200]
+        )
     }
 
     func testIdleRefreshDoesNotRewriteDurableState() async throws {
@@ -1242,6 +1413,173 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(after, before)
     }
 
+    func testIdleRefreshKeepsContentRevision() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+
+        let first = await collector.refresh(
+            interval: interval,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let idle = await collector.refresh(
+            interval: interval,
+            observedAt: Date(timeIntervalSince1970: 200)
+        )
+
+        XCTAssertEqual(idle.contentRevision, first.contentRevision)
+        XCTAssertEqual(idle.facts, first.facts)
+    }
+
+    func testProjectionObservationTimeDoesNotChangeContentRevision() async throws {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let source = ReadOnlyThreadProjectionSource { request in
+            guard case .list(cursor: nil, _, _, _) = request else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            return Data(#"""
+            {"result":{"data":[{
+              "id":"task-1",
+              "parentThreadId":null,
+              "cliVersion":"0.145.0",
+              "cwd":"/synthetic/projects/atlas",
+              "path":"\#(file.path)",
+              "createdAt":1785232800,
+              "updatedAt":1785232920
+            }],"nextCursor":null}}
+            """#.utf8)
+        }
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state"),
+            projectionSource: source
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let first = await collector.refresh(interval: interval)
+        try await Task.sleep(nanoseconds: 1_000_000)
+
+        let idle = await collector.refresh(interval: interval)
+
+        XCTAssertNotEqual(
+            first.projections.first?.source.observedAt,
+            idle.projections.first?.source.observedAt
+        )
+        XCTAssertEqual(idle.contentRevision, first.contentRevision)
+    }
+
+    func testMissingRootKeepsLastPublishedFacts() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let first = await collector.refresh(interval: interval)
+
+        try FileManager.default.removeItem(at: fixture.root)
+        let unavailable = await collector.refresh(interval: interval)
+
+        XCTAssertEqual(unavailable.facts, first.facts)
+        XCTAssertEqual(unavailable.contentRevision, 0)
+        XCTAssertEqual(unavailable.observation.coverage, .unavailable)
+    }
+
+    func testIdleRefreshWithLaterIntervalEndReusesPublishedFacts() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let firstInterval = try fixture.interval(
+            end: "2026-07-28T12:00:00Z"
+        )
+        let laterInterval = try fixture.interval(
+            end: "2026-07-28T13:00:00Z"
+        )
+
+        let first = await collector.refresh(interval: firstInterval)
+        let idle = await collector.refresh(interval: laterInterval)
+
+        XCTAssertEqual(idle.bytesRead, 0)
+        XCTAssertEqual(idle.contentRevision, first.contentRevision)
+        XCTAssertEqual(idle.facts, first.facts)
+    }
+
+    func testChangingIntervalStartDoesNotReusePriorIntervalFacts() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        _ = await collector.refresh(interval: try fixture.interval())
+        let later = await collector.refresh(
+            interval: try fixture.interval(
+                start: "2026-07-28T11:00:00Z"
+            )
+        )
+
+        XCTAssertTrue(
+            later.facts.filter {
+                $0.key == .token && $0.availability == .available
+            }.isEmpty
+        )
+        XCTAssertEqual(later.bytesRead, 0)
+    }
+
     func testRestartDoesNotLoadPersistedFactsOutsideTheCurrentInterval() async throws {
         let fixture = try CollectorFixture()
         _ = try fixture.rollout(
@@ -1279,6 +1617,95 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(collection.bytesRead, 0)
         XCTAssertTrue(collection.facts.isEmpty)
         XCTAssertEqual(collection.observation.coverage, .high)
+    }
+
+    func testOversizedMetadataIsIgnoredAndRolloutIsRebuilt() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent(
+            "collector-state",
+            isDirectory: true
+        )
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        _ = await first.refresh(interval: interval)
+        let partitionDirectory = stateDirectory.appendingPathComponent(
+            "stable-account",
+            isDirectory: true
+        )
+        let metadata = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partitionDirectory,
+                includingPropertiesForKeys: nil
+            ).first { $0.pathExtension == "json" }
+        )
+        try Data(repeating: 0, count: 1_048_577).write(
+            to: metadata,
+            options: .atomic
+        )
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let rebuilt = await restarted.refresh(interval: interval)
+
+        XCTAssertGreaterThan(rebuilt.bytesRead, 0)
+        XCTAssertEqual(
+            rebuilt.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta),
+            [500]
+        )
+        XCTAssertEqual(
+            rebuilt.observation.reason,
+            "Saved local activity could not be read"
+        )
+    }
+
+    func testChangingIntervalsReloadsPersistedFactsWithoutRescanningRollout() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "past-task",
+            lines: [
+                fixture.session(threadID: "past-task", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let past = try fixture.interval()
+        let first = await collector.refresh(interval: past)
+        let current = try fixture.interval(
+            start: "2026-08-04T00:00:00Z",
+            end: "2026-08-05T00:00:00Z"
+        )
+
+        let empty = await collector.refresh(interval: current)
+        let restored = await collector.refresh(interval: past)
+
+        XCTAssertTrue(empty.facts.isEmpty)
+        XCTAssertEqual(restored.facts, first.facts)
+        XCTAssertEqual(restored.bytesRead, 0)
+        XCTAssertNotEqual(empty.contentRevision, first.contentRevision)
+        XCTAssertNotEqual(restored.contentRevision, empty.contentRevision)
     }
 
     func testCorruptPersistedFactsRebuildFromTheRollout() async throws {
@@ -1328,6 +1755,62 @@ final class LocalActivityCollectorTests: XCTestCase {
             [500]
         )
         XCTAssertEqual(rebuilt.observation.coverage, .high)
+    }
+
+    func testOversizedPersistedFactRebuildsFromTheRollout() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        _ = await first.refresh(interval: interval)
+        let partition = stateDirectory.appendingPathComponent("stable-account")
+        let factsFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partition,
+                includingPropertiesForKeys: nil
+            ).first { $0.lastPathComponent.hasSuffix(".facts.jsonl") }
+        )
+        let firstLine = try XCTUnwrap(
+            String(contentsOf: factsFile, encoding: .utf8)
+                .split(separator: "\n").first
+        )
+        let padding = String(
+            repeating: "x",
+            count: BoundedJSONLReader.maximumRecordBytes
+        )
+        let oversized = firstLine.replacingOccurrences(
+            of: "{",
+            with: #"{"padding":"\#(padding)","#,
+            options: [.anchored]
+        ) + "\n"
+        try Data(oversized.utf8).write(to: factsFile)
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let restored = await restarted.refresh(interval: interval)
+
+        XCTAssertEqual(
+            restored.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta),
+            [500]
+        )
+        XCTAssertGreaterThan(restored.bytesRead, 0)
     }
 
     func testDeletedHistoryDoesNotReturnOnTheNextRefreshOrRestart() async throws {
@@ -1603,6 +2086,43 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
     }
 
+    func testCancelledProjectionReadDoesNotScanOrSaveRollouts() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let delay = CancellableProjectionDelay()
+        let source = ReadOnlyThreadProjectionSource { _ in
+            try await delay.response()
+        }
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory,
+            projectionSource: source
+        )
+        await collector.selectPartition("stable-account")
+        let refresh = Task {
+            await collector.refresh(interval: try fixture.interval())
+        }
+        await delay.waitUntilStarted()
+
+        refresh.cancel()
+        let result = try await refresh.value
+
+        XCTAssertEqual(result.observation.coverage, .unavailable)
+        XCTAssertTrue(result.facts.isEmpty)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: stateDirectory.path)
+        )
+    }
+
     func testDurableWriteFailureLowersCoverage() async throws {
         let fixture = try CollectorFixture()
         _ = try fixture.rollout(
@@ -1634,6 +2154,153 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(
             result.facts.filter { $0.key == .token }.compactMap(\.numericDelta),
             [500]
+        )
+    }
+
+    func testResumableRestoreKeepsFactsFromEveryCandidateFile() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "older-task",
+            lines: [
+                fixture.session(threadID: "older-task", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        var newerLines = [
+            fixture.session(threadID: "newer-task", ordinal: 0)
+        ]
+        newerLines.reserveCapacity(10_101)
+        for ordinal in 1 ... 10_100 {
+            newerLines.append(
+                fixture.tokens(total: ordinal * 100, ordinal: ordinal, minute: 1)
+            )
+        }
+        _ = try fixture.rollout(
+            day: "2026/07/29",
+            threadID: "newer-task",
+            lines: newerLines
+        )
+        let interval = try fixture.interval(
+            end: "2026-07-30T00:00:00Z"
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        for _ in 0 ..< 10 {
+            _ = await first.refresh(interval: interval)
+            if await first.hasPendingImport() == false { break }
+        }
+        let firstPending = await first.hasPendingImport()
+        XCTAssertFalse(firstPending)
+
+        let failedProjectionSource = ReadOnlyThreadProjectionSource { _ in
+            throw CocoaError(.fileReadUnknown)
+        }
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory,
+            projectionSource: failedProjectionSource
+        )
+        await restarted.selectPartition("stable-account")
+        let narrowInterval = try fixture.interval(
+            start: "2026-07-28T11:00:00Z",
+            end: "2026-07-30T00:00:00Z"
+        )
+        var restored = await restarted.refresh(interval: narrowInterval)
+        let firstRestoreRevision = restored.contentRevision
+        let pendingAfterFirstRestore = await restarted.hasPendingImport()
+        XCTAssertTrue(pendingAfterFirstRestore)
+        for _ in 0 ..< 10 {
+            guard await restarted.hasPendingImport() else { break }
+            restored = await restarted.refresh(
+                interval: interval,
+                refreshMetadata: false
+            )
+        }
+
+        let pendingAfterRestore = await restarted.hasPendingImport()
+        XCTAssertFalse(pendingAfterRestore)
+        XCTAssertNotEqual(restored.contentRevision, firstRestoreRevision)
+        XCTAssertEqual(
+            restored.observation.reason,
+            "Local task discovery is incomplete"
+        )
+        XCTAssertEqual(
+            restored.facts
+                .filter { $0.key == .token }
+                .compactMap(\.numericDelta)
+                .reduce(0, +),
+            1_010_400
+        )
+    }
+
+    func testNewerRefreshSupersedesASuspendedRefresh() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let delay = SupersededProjectionDelay()
+        let source = ReadOnlyThreadProjectionSource { request in
+            await delay.response(to: request)
+        }
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state"),
+            projectionSource: source
+        )
+        let interval = try fixture.interval()
+        let stale = Task {
+            await collector.refresh(interval: interval)
+        }
+        await delay.waitUntilListStarted()
+
+        let latest = await collector.refresh(
+            interval: interval,
+            refreshMetadata: false
+        )
+        await delay.releaseList()
+        let superseded = await stale.value
+        let idle = await collector.refresh(
+            interval: interval,
+            refreshMetadata: false
+        )
+
+        XCTAssertEqual(latest.facts, idle.facts)
+        XCTAssertEqual(
+            latest.facts.filter { $0.key == .token }.compactMap(\.numericDelta),
+            [500]
+        )
+        XCTAssertEqual(superseded.observation.coverage, .unavailable)
+        let pending = await collector.hasPendingImport()
+        XCTAssertFalse(pending)
+    }
+
+    func testLowerCoverageDoesNotChangeTheFactCacheRevision() {
+        let collection = LocalActivityCollection(
+            facts: [],
+            projections: [],
+            observation: .continuous(
+                sourceVersion: "0.145.0",
+                observedAt: Date(timeIntervalSince1970: 100)
+            ),
+            bytesRead: 0,
+            contentRevision: 7
+        )
+
+        XCTAssertEqual(
+            collection.loweringCoverage("Identity unavailable").contentRevision,
+            7
         )
     }
 }
@@ -1716,6 +2383,61 @@ private actor ProjectionDelay {
     func release(_ data: Data) {
         continuation?.resume(returning: data)
         continuation = nil
+    }
+}
+
+private actor CancellableProjectionDelay {
+    private var started = false
+
+    func response() async throws -> Data {
+        started = true
+        try await Task.sleep(nanoseconds: 60_000_000_000)
+        return Data()
+    }
+
+    func waitUntilStarted() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+}
+
+private actor SupersededProjectionDelay {
+    private var listStarted = false
+    private var listContinuation: CheckedContinuation<Data, Never>?
+
+    func response(to request: ThreadProjectionReadRequest) async -> Data {
+        switch request {
+        case .list:
+            listStarted = true
+            return await withCheckedContinuation { continuation in
+                listContinuation = continuation
+            }
+        case let .read(threadID, _):
+            return Data(#"""
+            {"result":{"thread":{
+              "id":"\#(threadID)",
+              "parentThreadId":null,
+              "cliVersion":"0.145.0",
+              "cwd":"/synthetic/project",
+              "createdAt":1785232800,
+              "updatedAt":1785232920
+            }}}
+            """#.utf8)
+        }
+    }
+
+    func waitUntilListStarted() async {
+        while !listStarted {
+            await Task.yield()
+        }
+    }
+
+    func releaseList() {
+        listContinuation?.resume(
+            returning: Data(#"{"result":{"data":[],"nextCursor":null}}"#.utf8)
+        )
+        listContinuation = nil
     }
 }
 

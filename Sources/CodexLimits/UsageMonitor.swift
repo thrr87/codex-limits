@@ -2,6 +2,16 @@ import AppKit
 import Combine
 import Foundation
 
+enum SafetyBufferPolicy {
+    static let defaultValue = 3.0
+    static let range = 1.0 ... 10.0
+
+    static func normalized(_ value: Double?) -> Double {
+        guard let value, value.isFinite else { return defaultValue }
+        return min(max(value, range.lowerBound), range.upperBound)
+    }
+}
+
 @MainActor
 final class UsageMonitor: ObservableObject {
     static let safetyBufferKey = "safetyBuffer"
@@ -42,6 +52,8 @@ final class UsageMonitor: ObservableObject {
     private let history: UsageHistory
     private let codexAssistedHistory: CodexAssistedHistory?
     private let fetchUsage: () async throws -> CodexFetchResult
+    private let evaluateUsage:
+        @Sendable (UsageIntelligenceInput) -> UsageReaderSnapshot
     private let localActivityCollector: LocalActivityCollector?
     private let resetReminderCoordinator: ResetReminderCoordinator
     private var historyPartition: AccountHistoryPartition
@@ -64,6 +76,10 @@ final class UsageMonitor: ObservableObject {
     private var localActivityCollection = LocalActivityCollection.unavailable(
         "Codex local records are unavailable"
     )
+    private var evaluationGeneration: UInt64 = 0
+    private var evaluationTask: Task<UsageReaderSnapshot?, Never>?
+    private var localImportGeneration: UInt64 = 0
+    private var localImportTask: Task<Void, Never>?
 
     convenience init() {
         self.init(
@@ -90,12 +106,25 @@ final class UsageMonitor: ObservableObject {
         resetReminderScheduler: (any ResetReminderScheduling)? = nil,
         resetReminderNow: @escaping () -> Date = Date.init,
         codexAssistedHistory: CodexAssistedHistory? = nil,
-        fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch
+        fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch,
+        evaluateUsage: @escaping @Sendable (
+            UsageIntelligenceInput
+        ) -> UsageReaderSnapshot = {
+            UsageIntelligenceEngine.evaluate($0)
+        }
     ) {
         self.defaults = defaults
         self.fetchUsage = fetchUsage
+        self.evaluateUsage = evaluateUsage
         self.localActivityCollector = localActivityCollector
         self.codexAssistedHistory = codexAssistedHistory
+        let storedSafetyBuffer = defaults.object(
+            forKey: Self.safetyBufferKey
+        ) as? Double
+        let safetyBuffer = SafetyBufferPolicy.normalized(storedSafetyBuffer)
+        if storedSafetyBuffer != safetyBuffer {
+            defaults.set(safetyBuffer, forKey: Self.safetyBufferKey)
+        }
         let resetReminderCoordinator = ResetReminderCoordinator(
             defaults: defaults,
             scheduler: resetReminderScheduler
@@ -112,9 +141,12 @@ final class UsageMonitor: ObservableObject {
         }
         if let data = defaults.data(forKey: Self.stateKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
-            accountSnapshot = state.snapshot
-            samples = state.samples
-            legacySamplesAwaitingMigration = state.samples
+            let restoredSamples = state.samples.filter(\.isValid)
+            accountSnapshot = state.snapshot.flatMap {
+                $0.isValid ? $0 : nil
+            }
+            samples = restoredSamples
+            legacySamplesAwaitingMigration = restoredSamples
             previousStatus = state.previousStatus
         }
 
@@ -136,7 +168,13 @@ final class UsageMonitor: ObservableObject {
         if defaults.object(forKey: Self.localHistoryDeletionCutoffKey) != nil {
             historyDeletionStatus = .pendingLocal
         }
-        recalculate()
+        if accountSnapshot != nil || !samples.isEmpty {
+            let pending = beginRecalculation()
+            Task { [weak self] in
+                guard let self else { return }
+                _ = await finishRecalculation(pending)
+            }
+        }
 
         if startsAutomatically {
             Task { [weak self] in
@@ -161,24 +199,33 @@ final class UsageMonitor: ObservableObject {
         Timer.publish(every: 600, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                Task { @MainActor in await self?.refresh() }
+                Task {
+                    @MainActor in await self?.refresh(
+                        forceHistorySync: false
+                    )
+                }
             }
             .store(in: &cancellables)
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
-                Task { @MainActor in await self?.refresh() }
+                Task {
+                    @MainActor in await self?.refresh(
+                        forceHistorySync: false
+                    )
+                }
             }
             .store(in: &cancellables)
 
-        await refresh()
+        await refresh(forceHistorySync: false)
     }
 
-    func refresh() async {
+    func refresh(forceHistorySync: Bool = true) async {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+        cancelLocalImport()
 
         await restoreHistoryIfAvailable()
         let fetchTask = Task { try await fetchUsage() }
@@ -187,7 +234,9 @@ final class UsageMonitor: ObservableObject {
             let result = try await fetchTask.value
             guard let account = result.account else {
                 historyMatchesCurrentSnapshot = false
-                await exchangeRestoredHistoryIfAvailable()
+                await exchangeRestoredHistoryIfAvailable(
+                    force: forceHistorySync
+                )
                 accountSnapshot = result.snapshot
                 sourceState = .available
                 await localActivityCollector?.selectPartition(
@@ -198,9 +247,13 @@ final class UsageMonitor: ObservableObject {
                     observedAt: result.snapshot.fetchedAt,
                     identityVerified: false
                 )
-                recalculate(now: result.snapshot.fetchedAt)
+                let published = await recalculate(
+                    now: result.snapshot.fetchedAt
+                )
                 persist()
-                await reconcileResetReminder()
+                if published {
+                    await reconcileResetReminder()
+                }
                 return
             }
             let legacySamples = legacySamplesAwaitingMigration
@@ -217,7 +270,7 @@ final class UsageMonitor: ObservableObject {
                 apply(historyState)
                 historyUsesFiles = historyState.errorMessage == nil
             }
-            let historyState = await exchangeHistory()
+            let historyState = await exchangeHistory(force: forceHistorySync)
             apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
             repairInitialAccountEpochIfNeeded()
             let exchangeErrorMessage = historyState.errorMessage
@@ -248,11 +301,15 @@ final class UsageMonitor: ObservableObject {
                 for: newSnapshot,
                 observedAt: newSnapshot.fetchedAt
             )
-            recalculate(now: newSnapshot.fetchedAt)
+            let published = await recalculate(now: newSnapshot.fetchedAt)
             persist()
-            await reconcileResetReminder()
+            if published {
+                await reconcileResetReminder()
+            }
         } catch {
-            await exchangeRestoredHistoryIfAvailable()
+            await exchangeRestoredHistoryIfAvailable(
+                force: forceHistorySync
+            )
             sourceState = .failed(
                 (error as? CodexClientError)?.localizedDescription
                     ?? "Couldn’t read Codex usage. Try refreshing again."
@@ -267,14 +324,23 @@ final class UsageMonitor: ObservableObject {
                     identityVerified: false
                 )
             }
-            recalculate()
+            _ = await recalculate()
             persist()
         }
     }
 
     func updateSafetyBuffer(_ value: Double) {
-        recalculate(safetyBuffer: value)
-        persist()
+        let value = SafetyBufferPolicy.normalized(value)
+        defaults.set(value, forKey: Self.safetyBufferKey)
+        let pending = beginRecalculation(safetyBuffer: value)
+        Task { [weak self] in
+            guard let self else { return }
+            let published = await finishRecalculation(pending)
+            persist()
+            if published {
+                await reconcileResetReminder()
+            }
+        }
     }
 
     func setResetReminderEnabled(_ isEnabled: Bool) async {
@@ -359,6 +425,7 @@ final class UsageMonitor: ObservableObject {
         planType: String? = nil,
         observedAt: Date
     ) async {
+        cancelLocalImport()
         let partition: AccountHistoryPartition
         let authState: String
         let previousAuthState = defaults.string(forKey: Self.historyAuthStateKey)
@@ -425,7 +492,7 @@ final class UsageMonitor: ObservableObject {
         localActivityCollection = .unavailable(
             "Codex local records are unavailable"
         )
-        recalculate()
+        _ = await recalculate()
         if historyPrepared {
             persist()
         }
@@ -475,6 +542,7 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        cancelLocalImport()
         let localDeletedAt = Date()
         NotificationCenter.default.post(
             name: .codexAssistedHistoryDeleted,
@@ -528,7 +596,7 @@ final class UsageMonitor: ObservableObject {
                 accountFacts: snapshot.accountFacts
             )
         }
-        recalculate()
+        _ = await recalculate()
         persist()
     }
 
@@ -536,6 +604,7 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        cancelLocalImport()
         let assistedDeletionCutoff = defaults.object(
             forKey: Self.localHistoryDeletionCutoffKey
         ) as? Date
@@ -612,7 +681,7 @@ final class UsageMonitor: ObservableObject {
         } else {
             false
         }
-        recalculate()
+        _ = await recalculate()
         persist()
     }
 
@@ -625,6 +694,7 @@ final class UsageMonitor: ObservableObject {
         guard !isUpdatingHistory, canRebuildAvailableHistory else { return }
         isUpdatingHistory = true
         defer { isUpdatingHistory = false }
+        cancelLocalImport()
         do {
             let result = try await fetchUsage()
             guard let account = result.account else {
@@ -656,16 +726,18 @@ final class UsageMonitor: ObservableObject {
                 for: snapshot,
                 observedAt: snapshot.fetchedAt
             )
-            recalculate(now: snapshot.fetchedAt)
+            let published = await recalculate(now: snapshot.fetchedAt)
             persist()
-            await reconcileResetReminder()
+            if published {
+                await reconcileResetReminder()
+            }
         } catch let error as CodexClientError {
             sourceState = .failed(error.localizedDescription)
-            recalculate()
+            _ = await recalculate()
             persist()
         } catch {
             sourceState = .failed("Couldn’t read Codex usage. Try again.")
-            recalculate()
+            _ = await recalculate()
             persist()
         }
     }
@@ -673,36 +745,106 @@ final class UsageMonitor: ObservableObject {
     private func recalculate(
         safetyBuffer: Double? = nil,
         now: Date = Date()
-    ) {
-        let storedBuffer = defaults.object(forKey: Self.safetyBufferKey) as? Double
-        let buffer = safetyBuffer ?? storedBuffer ?? 3
-        readerSnapshot = UsageIntelligenceEngine.evaluate(
-            UsageIntelligenceInput(
-                account: accountSnapshot,
-                samples: historyMatchesCurrentSnapshot ? samples : [],
-                safetyBuffer: buffer,
-                sourceState: sourceState,
-                now: now,
-                previousStatus: previousStatus,
-                accountPartitionID: historyPartition.id,
-                accountEpochStartedAt: accountEpochStartedAt,
-                localActivityFacts: localActivityCollection.facts,
-                localActivityHistoryFacts:
-                    localActivityCollection.facts,
-                localActivityObservation: localActivityCollection.observation,
-                localTaskProjections: localActivityCollection.projections,
-                analyticsExploration:
-                    AnalyticsWorkspaceStore.restoredState(
-                        from: defaults
-                    ),
-                insightDispositions:
-                    AnalyticsWorkspaceStore
-                        .restoredInsightDispositions(from: defaults)
-            )
+    ) async -> Bool {
+        await finishRecalculation(
+            beginRecalculation(safetyBuffer: safetyBuffer, now: now)
         )
-        if let status = readerSnapshot.guidance?.status {
+    }
+
+    private func beginRecalculation(
+        safetyBuffer: Double? = nil,
+        now: Date = Date(),
+        analyticsExploration: AnalyticsExplorationState? = nil,
+        insightDispositions: [String: InsightDisposition]? = nil
+    ) -> (
+        generation: UInt64,
+        task: Task<UsageReaderSnapshot?, Never>
+    ) {
+        let input = evaluationInput(
+            safetyBuffer: safetyBuffer,
+            now: now,
+            analyticsExploration: analyticsExploration,
+            insightDispositions: insightDispositions
+        )
+        evaluationGeneration &+= 1
+        let generation = evaluationGeneration
+        let previousTask = evaluationTask
+        previousTask?.cancel()
+        let evaluateUsage = evaluateUsage
+        let task: Task<UsageReaderSnapshot?, Never> = Task.detached(
+            priority: .userInitiated
+        ) {
+            _ = await previousTask?.value
+            guard !Task.isCancelled else { return nil }
+            let snapshot = evaluateUsage(input)
+            return Task.isCancelled ? nil : snapshot
+        }
+        evaluationTask = task
+        return (generation, task)
+    }
+
+    private func evaluationInput(
+        safetyBuffer: Double? = nil,
+        now: Date = Date(),
+        analyticsExploration: AnalyticsExplorationState? = nil,
+        insightDispositions: [String: InsightDisposition]? = nil
+    ) -> UsageIntelligenceInput {
+        let storedBuffer = defaults.object(forKey: Self.safetyBufferKey) as? Double
+        let buffer = SafetyBufferPolicy.normalized(
+            safetyBuffer ?? storedBuffer
+        )
+        return UsageIntelligenceInput(
+            account: accountSnapshot,
+            samples: historyMatchesCurrentSnapshot ? samples : [],
+            safetyBuffer: buffer,
+            sourceState: sourceState,
+            now: now,
+            previousStatus: previousStatus,
+            accountPartitionID: historyPartition.id,
+            accountEpochStartedAt: accountEpochStartedAt,
+            localActivityFacts: localActivityCollection.facts,
+            localActivityHistoryFacts: localActivityCollection.facts,
+            localActivityObservation: localActivityCollection.observation,
+            localTaskProjections: localActivityCollection.projections,
+            localActivityContentRevision:
+                localActivityCollection.contentRevision,
+            reusableLocalAggregates:
+                readerSnapshot.reusableLocalAggregates,
+            analyticsExploration:
+                analyticsExploration
+                    ?? AnalyticsWorkspaceStore.restoredState(from: defaults),
+            insightDispositions:
+                insightDispositions
+                    ?? AnalyticsWorkspaceStore
+                        .restoredInsightDispositions(from: defaults)
+        )
+    }
+
+    private func finishRecalculation(
+        _ pending: (
+            generation: UInt64,
+            task: Task<UsageReaderSnapshot?, Never>
+        )
+    ) async -> Bool {
+        let snapshot = await withTaskCancellationHandler {
+            await pending.task.value
+        } onCancel: {
+            pending.task.cancel()
+        }
+        if pending.generation == evaluationGeneration {
+            evaluationTask = nil
+        }
+        guard let snapshot,
+              !Task.isCancelled,
+              pending.generation == evaluationGeneration,
+              !pending.task.isCancelled else {
+            return false
+        }
+        readerSnapshot = snapshot
+        if let status = snapshot.guidance?.status {
             previousStatus = status
         }
+        return true
     }
 
     func analyticsPreferencesDidChange(
@@ -717,6 +859,17 @@ final class UsageMonitor: ObservableObject {
             input,
             dispositions: dispositions
         )
+        guard evaluationTask != nil else { return }
+        let pending = beginRecalculation(
+            analyticsExploration: exploration,
+            insightDispositions: dispositions
+        )
+        Task { [weak self] in
+            guard let self else { return }
+            if await finishRecalculation(pending) {
+                await reconcileResetReminder()
+            }
+        }
     }
 
     private func reconcileResetReminder() async {
@@ -752,6 +905,7 @@ final class UsageMonitor: ObservableObject {
         observedAt: Date,
         identityVerified: Bool = true
     ) async {
+        cancelLocalImport()
         guard let interval = UsageIntelligenceEngine.tokenActivityInterval(
             account: snapshot,
             samples: historyMatchesCurrentSnapshot ? samples : [],
@@ -768,6 +922,9 @@ final class UsageMonitor: ObservableObject {
             )
             return
         }
+        localActivityCollection = .unavailable(
+            "Codex local records are unavailable"
+        )
         let collection = await localActivityCollector.refresh(
             interval: interval,
             observedAt: observedAt
@@ -780,6 +937,69 @@ final class UsageMonitor: ObservableObject {
             : collection.loweringCoverage(
                 "Codex account identity could not be checked"
             )
+        guard await localActivityCollector.hasPendingImport() else { return }
+        let generation = localImportGeneration
+        localImportTask = Task(priority: .background) { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            await self?.continueLocalActivityImport(
+                with: localActivityCollector,
+                interval: interval,
+                observedAt: observedAt,
+                identityVerified: identityVerified,
+                generation: generation
+            )
+        }
+    }
+
+    private func continueLocalActivityImport(
+        with collector: LocalActivityCollector,
+        interval: DateInterval,
+        observedAt: Date,
+        identityVerified: Bool,
+        generation: UInt64
+    ) async {
+        var latest: LocalActivityCollection?
+        while !Task.isCancelled, await collector.hasPendingImport() {
+            while isRefreshing, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard generation == localImportGeneration else { return }
+            latest = nil
+            let collection = await collector.refresh(
+                interval: interval,
+                observedAt: observedAt,
+                refreshMetadata: false
+            )
+            guard !Task.isCancelled,
+                  generation == localImportGeneration else {
+                return
+            }
+            latest = collection
+            if await collector.hasPendingImport() {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        guard let latest,
+              !Task.isCancelled,
+              generation == localImportGeneration else {
+            return
+        }
+        localActivityCollection = identityVerified
+            ? latest
+            : latest.loweringCoverage(
+                "Codex account identity could not be checked"
+            )
+        _ = await recalculate(now: observedAt)
+        persist()
+        if generation == localImportGeneration {
+            localImportTask = nil
+        }
+    }
+
+    private func cancelLocalImport() {
+        localImportGeneration &+= 1
+        localImportTask?.cancel()
+        localImportTask = nil
     }
 
     private func persist() {
@@ -889,8 +1109,13 @@ final class UsageMonitor: ObservableObject {
         }
     }
 
-    private func exchangeHistory() async -> UsageHistory.State {
+    private func exchangeHistory(force: Bool) async -> UsageHistory.State {
         if let configuredSyncDirectory {
+            if await history.isConnected(to: configuredSyncDirectory) {
+                return force
+                    ? await history.synchronize()
+                    : await history.synchronizeIfDue()
+            }
             let state = await history.connect(
                 to: configuredSyncDirectory,
                 accountIdentity: historyAccountIdentity,
@@ -901,13 +1126,15 @@ final class UsageMonitor: ObservableObject {
             historyConnectionActive = state.folderName != nil
             return state
         }
-        return await history.synchronize()
+        return force
+            ? await history.synchronize()
+            : await history.synchronizeIfDue()
     }
 
-    private func exchangeRestoredHistoryIfAvailable() async {
+    private func exchangeRestoredHistoryIfAvailable(force: Bool) async {
         guard restoredFileStoreAvailable else { return }
         await prepareHistory(legacySamples: [])
-        let state = await exchangeHistory()
+        let state = await exchangeHistory(force: force)
         apply(state, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
     }
 

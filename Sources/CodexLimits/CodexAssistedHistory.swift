@@ -44,10 +44,23 @@ actor CodexAssistedHistory {
         let cutoff: Date
     }
 
+    private enum DeletionMarkerRestore {
+        case missing
+        case valid(Date)
+        case invalid
+    }
+
     private static let version = 1
+    private static let maximumMarkerBytes = 1_048_576
+
+    private enum HistoryError: Error {
+        case unreadableHistory
+    }
     private let fileURL: URL
     private let deletionMarkerURL: URL
     private var file: File?
+    private var didLoad = false
+    private var loadFailed = false
 
     init(
         fileURL: URL,
@@ -61,7 +74,7 @@ actor CodexAssistedHistory {
     func results(
         accountPartitionID: String
     ) -> [CodexAssistedHistoryResult] {
-        loadIfNeeded()
+        guard loadIfNeeded() else { return [] }
         return file?.results.filter {
             $0.accountPartitionID == accountPartitionID
         } ?? []
@@ -70,7 +83,7 @@ actor CodexAssistedHistory {
     func overhead(
         accountPartitionID: String
     ) -> [CodexAssistedHistoryOverhead] {
-        loadIfNeeded()
+        guard loadIfNeeded() else { return [] }
         return file?.overhead.filter {
             $0.accountPartitionID == accountPartitionID
         } ?? []
@@ -86,7 +99,9 @@ actor CodexAssistedHistory {
         guard let accountPartitionID = scope.accountPartitionID else {
             return
         }
-        loadIfNeeded()
+        guard loadIfNeeded() else {
+            throw HistoryError.unreadableHistory
+        }
         let previous = file
         file?.overhead.append(
             CodexAssistedHistoryOverhead(
@@ -119,7 +134,20 @@ actor CodexAssistedHistory {
     }
 
     func deleteAll(upTo cutoff: Date = Date()) throws {
-        loadIfNeeded()
+        guard loadIfNeeded() else {
+            try writeDeletionMarker(cutoff)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try FileManager.default.removeItem(at: fileURL)
+            }
+            if FileManager.default.fileExists(
+                atPath: deletionMarkerURL.path
+            ) {
+                try FileManager.default.removeItem(at: deletionMarkerURL)
+            }
+            file = File(version: Self.version, results: [], overhead: [])
+            loadFailed = false
+            return
+        }
         try writeDeletionMarker(cutoff)
         file?.results.removeAll {
             $0.result.observedAt <= cutoff
@@ -146,14 +174,34 @@ actor CodexAssistedHistory {
         }
     }
 
-    private func loadIfNeeded() {
-        guard file == nil else { return }
-        let deletionCutoff = deletionMarker()
-        guard let data = try? Data(contentsOf: fileURL),
+    @discardableResult
+    private func loadIfNeeded() -> Bool {
+        if didLoad { return !loadFailed }
+        didLoad = true
+        let deletionCutoff: Date?
+        switch deletionMarker() {
+        case .missing:
+            deletionCutoff = nil
+        case let .valid(cutoff):
+            deletionCutoff = cutoff
+        case .invalid:
+            loadFailed = true
+            return false
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            file = File(version: Self.version, results: [], overhead: [])
+            return true
+        }
+        // ponytail: v1 is one JSON document; map its bytes until a
+        // future file version can decode records one at a time.
+        guard let data = try? Data(
+            contentsOf: fileURL,
+            options: .mappedIfSafe
+        ),
               let decoded = try? JSONDecoder().decode(File.self, from: data),
               decoded.version == Self.version else {
-            file = File(version: Self.version, results: [], overhead: [])
-            return
+            loadFailed = true
+            return false
         }
         var filtered = decoded
         if let deletionCutoff {
@@ -165,6 +213,7 @@ actor CodexAssistedHistory {
             }
         }
         file = filtered
+        return true
     }
 
     private func persist() throws {
@@ -189,15 +238,40 @@ actor CodexAssistedHistory {
         try data.write(to: deletionMarkerURL, options: .atomic)
     }
 
-    private func deletionMarker() -> Date? {
-        guard let data = try? Data(contentsOf: deletionMarkerURL),
+    private func deletionMarker() -> DeletionMarkerRestore {
+        guard FileManager.default.fileExists(
+            atPath: deletionMarkerURL.path
+        ) else {
+            return .missing
+        }
+        guard let data = Self.readData(
+            at: deletionMarkerURL,
+            maximumBytes: Self.maximumMarkerBytes
+        ),
               let marker = try? JSONDecoder().decode(
                   DeletionMarker.self,
                   from: data
               ) else {
+            return .invalid
+        }
+        return .valid(marker.cutoff)
+    }
+
+    private static func readData(
+        at url: URL,
+        maximumBytes: Int
+    ) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
             return nil
         }
-        return marker.cutoff
+        defer { try? handle.close() }
+        guard let data = try? handle.read(
+            upToCount: maximumBytes + 1
+        ),
+        data.count <= maximumBytes else {
+            return nil
+        }
+        return data
     }
 
     private static func defaultFileURL() -> URL {

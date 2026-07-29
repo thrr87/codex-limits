@@ -51,7 +51,7 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
         _ reason: String,
         interval: DateInterval
     ) -> LocalTokenActivitySnapshot {
-        LocalTokenActivitySnapshot(
+        return LocalTokenActivitySnapshot(
             tokens: nil,
             interval: interval,
             coverage: .unavailable,
@@ -60,6 +60,42 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
             observedAt: nil,
             points: [],
             accountComparison: .unavailable
+        )
+    }
+
+    func updating(
+        interval: DateInterval,
+        observation: LocalActivityObservation
+    ) -> LocalTokenActivitySnapshot {
+        let source: (version: String?, observedAt: Date?) = switch observation {
+        case let .continuous(version, observedAt),
+             let .gap(version, observedAt, _):
+            (version, observedAt)
+        case .unavailable:
+            (nil, nil)
+        }
+        let updatedCoverage: CoverageLevel
+        let updatedReason: String?
+        switch observation {
+        case .continuous:
+            updatedCoverage = coverage
+            updatedReason = reason
+        case let .gap(_, _, reason):
+            updatedCoverage = .low
+            updatedReason = reason
+        case let .unavailable(reason):
+            updatedCoverage = .unavailable
+            updatedReason = reason
+        }
+        return LocalTokenActivitySnapshot(
+            tokens: tokens,
+            interval: interval,
+            coverage: updatedCoverage,
+            reason: updatedReason,
+            sourceVersion: source.version,
+            observedAt: source.observedAt,
+            points: points,
+            accountComparison: accountComparison
         )
     }
 

@@ -91,6 +91,69 @@ final class ForecastEngineTests: XCTestCase {
         XCTAssertEqual(result.historicalReferenceSource, .tokenEstimate)
     }
 
+    func testLargeTokenBucketsDoNotOverflowTheForecast() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 100 * day)
+        let reset = now.addingTimeInterval(2 * day)
+        let currentDate = now.addingTimeInterval(-5 * day)
+        let window = UsageWindow(
+            remainingPercent: 90,
+            resetsAt: reset,
+            durationMinutes: 7 * 24 * 60
+        )
+        let tokenHistory = [
+            TokenDay(date: currentDate, tokens: Int64.max),
+            TokenDay(date: currentDate, tokens: Int64.max),
+            TokenDay(
+                date: now.addingTimeInterval(-10 * day),
+                tokens: 1
+            )
+        ]
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: [],
+            tokenHistory: tokenHistory,
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: nil
+        )
+
+        XCTAssertTrue(result.currentPercentPerDay.isFinite)
+        XCTAssertTrue(result.expectedRemainingAtReset.isFinite)
+        XCTAssertEqual(result.historicalReferenceSource, .tokenEstimate)
+    }
+
+    func testOutOfRangeTokenDateDoesNotTrapTheForecast() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 100 * day)
+        let window = UsageWindow(
+            remainingPercent: 90,
+            resetsAt: now.addingTimeInterval(2 * day),
+            durationMinutes: 7 * 24 * 60
+        )
+
+        let result = ForecastEngine.evaluate(
+            window: window,
+            samples: [],
+            tokenHistory: [
+                TokenDay(
+                    date: Date(
+                        timeIntervalSince1970: Double.greatestFiniteMagnitude
+                    ),
+                    tokens: 1
+                )
+            ],
+            safetyBuffer: 3,
+            now: now,
+            previousStatus: nil
+        )
+
+        XCTAssertTrue(result.currentPercentPerDay.isFinite)
+        XCTAssertTrue(result.expectedRemainingAtReset.isFinite)
+        XCTAssertNil(result.historicalReferenceSource)
+    }
+
     func testOnlyCompleteHighCoverageWeeklyWindowsBecomeAccountHistory() {
         let day: TimeInterval = 86_400
         let halfHour: TimeInterval = 30 * 60

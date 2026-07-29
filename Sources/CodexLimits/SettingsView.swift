@@ -11,8 +11,17 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Stepper(value: $safetyBuffer, in: 1 ... 10, step: 1) {
-                Text("Safety buffer: \(Int(safetyBuffer))%")
+            Stepper(
+                value: Binding(
+                    get: { SafetyBufferPolicy.normalized(safetyBuffer) },
+                    set: { safetyBuffer = SafetyBufferPolicy.normalized($0) }
+                ),
+                in: SafetyBufferPolicy.range,
+                step: 1
+            ) {
+                Text(
+                    "Safety buffer: \(Int(SafetyBufferPolicy.normalized(safetyBuffer)))%"
+                )
             }
             .onChange(of: safetyBuffer) { _, value in
                 monitor.updateSafetyBuffer(value)

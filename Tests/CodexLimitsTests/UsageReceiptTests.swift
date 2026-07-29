@@ -3,6 +3,57 @@ import XCTest
 @testable import CodexLimits
 
 final class UsageReceiptTests: XCTestCase {
+    func testDecodedTokenTotalOverflowIsUnavailable() throws {
+        let interval = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        let facts = [
+            tokenFact(
+                eventID: "max",
+                date: Date(timeIntervalSince1970: 1_100),
+                tokens: .max,
+                taskID: "root"
+            ),
+            tokenFact(
+                eventID: "one-more",
+                date: Date(timeIntervalSince1970: 1_200),
+                tokens: 1,
+                taskID: "root"
+            )
+        ]
+        let decodedFacts = try JSONDecoder().decode(
+            [LocalActivityFact].self,
+            from: JSONEncoder().encode(facts)
+        )
+
+        let snapshot = UsageReceiptAggregator.evaluate(
+            facts: decodedFacts,
+            projections: [
+                projection(taskID: "root", project: "atlas")
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        )
+        let slice = snapshot.slice(in: interval, filters: .all)
+        let localTokens = snapshot.localTokenSlice(
+            in: interval,
+            filters: .all
+        )
+
+        XCTAssertEqual(slice.coverage, .unavailable)
+        XCTAssertEqual(slice.receiptCoverage, .unavailable)
+        XCTAssertEqual(slice.reason, "Local token total is invalid")
+        XCTAssertEqual(slice.receiptReason, "Local token total is invalid")
+        XCTAssertEqual(slice.totalTokens, 0)
+        XCTAssertTrue(slice.receipts.isEmpty)
+        XCTAssertTrue(slice.points.isEmpty)
+        XCTAssertEqual(localTokens.coverage, .unavailable)
+        XCTAssertEqual(localTokens.reason, "Local token total is invalid")
+        XCTAssertEqual(localTokens.tokens, 0)
+        XCTAssertTrue(localTokens.points.isEmpty)
+    }
+
     func testEnginePublishesReceiptsInTheReaderSnapshot() {
         let start = Date(timeIntervalSince1970: 1_000)
         let fetchedAt = Date(timeIntervalSince1970: 2_000)
@@ -112,6 +163,122 @@ final class UsageReceiptTests: XCTestCase {
         XCTAssertEqual(slice.receipts.map(\.projectLabel), ["atlas", "atlas"])
         XCTAssertEqual(slice.receipts.map(\.rootTaskID), ["root-1", "root-2"])
         XCTAssertEqual(slice.receipts.map(\.tokens), [140, 60])
+    }
+
+    func testOverviewMatchesReceiptTotalsWithoutBuildingTaskTrees() {
+        let interval = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        let snapshot = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "root-1-a",
+                    date: Date(timeIntervalSince1970: 1_100),
+                    tokens: 100,
+                    taskID: "root-1"
+                ),
+                tokenFact(
+                    eventID: "child-1-a",
+                    date: Date(timeIntervalSince1970: 1_200),
+                    tokens: 40,
+                    taskID: "child-1"
+                ),
+                tokenFact(
+                    eventID: "root-2-a",
+                    date: Date(timeIntervalSince1970: 1_300),
+                    tokens: 60,
+                    taskID: "root-2"
+                ),
+                tokenFact(
+                    eventID: "unattributed",
+                    date: Date(timeIntervalSince1970: 1_400),
+                    tokens: 25,
+                    taskID: nil
+                )
+            ],
+            projections: [
+                projection(taskID: "root-1", project: "atlas"),
+                projection(
+                    taskID: "child-1",
+                    parentTaskID: "root-1",
+                    project: "atlas"
+                ),
+                projection(taskID: "root-2", project: "atlas")
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        )
+
+        let overview = snapshot.overview(in: interval, filters: .all)
+        let detailed = snapshot.slice(in: interval, filters: .all)
+
+        XCTAssertEqual(overview.totalTokens, detailed.totalTokens)
+        XCTAssertEqual(overview.unattributedTokens, detailed.unattributedTokens)
+        XCTAssertEqual(overview.coverage, detailed.coverage)
+        XCTAssertEqual(overview.receiptCoverage, detailed.receiptCoverage)
+        XCTAssertEqual(
+            overview.receipts.map(\.rootTaskID),
+            detailed.receipts.map(\.rootTaskID)
+        )
+        XCTAssertEqual(
+            overview.receipts.map(\.projectLabel),
+            detailed.receipts.map(\.projectLabel)
+        )
+        XCTAssertEqual(
+            overview.receipts.map(\.tokens),
+            detailed.receipts.map(\.tokens)
+        )
+        XCTAssertEqual(overview.receipts.map(\.taskCount), [2, 1])
+    }
+
+    func testReceiptLoadsOnlyTheRequestedRootTask() {
+        let interval = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        let snapshot = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "root-1-a",
+                    date: Date(timeIntervalSince1970: 1_100),
+                    tokens: 100,
+                    taskID: "root-1"
+                ),
+                tokenFact(
+                    eventID: "root-2-a",
+                    date: Date(timeIntervalSince1970: 1_300),
+                    tokens: 60,
+                    taskID: "root-2"
+                ),
+                tokenFact(
+                    eventID: "unattributed",
+                    date: Date(timeIntervalSince1970: 1_400),
+                    tokens: 25,
+                    taskID: nil
+                )
+            ],
+            projections: [
+                projection(taskID: "root-1", project: "atlas"),
+                projection(taskID: "root-2", project: "atlas")
+            ],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        )
+
+        let receipt = snapshot.receipt(
+            rootTaskID: "root-2",
+            in: interval,
+            filters: .all
+        )
+
+        XCTAssertEqual(receipt?.rootTaskID, "root-2")
+        XCTAssertEqual(receipt?.tokens, 60)
+        XCTAssertEqual(
+            receipt?.reason,
+            snapshot.overview(in: interval, filters: .all)
+                .receipts.first { $0.rootTaskID == "root-2" }?.reason
+        )
     }
 
     func testSelectedRangeKeepsOneTaskAcrossDaysAndDeduplicatesReplay() {
@@ -257,10 +424,23 @@ final class UsageReceiptTests: XCTestCase {
                 reasoning: "high"
             )
         )
+        let localTokens = snapshot.localTokenSlice(
+            in: interval,
+            filters: WorkspaceFilters(
+                projectID: "atlas",
+                taskTreeID: "atlas-task",
+                model: "gpt-5.6-sol",
+                reasoning: "high"
+            )
+        )
 
         XCTAssertEqual(slice.receipts.map(\.rootTaskID), ["atlas-task"])
         XCTAssertEqual(slice.totalTokens, 90)
         XCTAssertEqual(slice.points.last?.tokens, 90)
+        XCTAssertEqual(localTokens.tokens, slice.totalTokens)
+        XCTAssertEqual(localTokens.points, slice.points)
+        XCTAssertEqual(localTokens.coverage, slice.coverage)
+        XCTAssertEqual(localTokens.reason, slice.reason)
         XCTAssertEqual(
             snapshot.filterOptions(in: interval),
             UsageReceiptFilterOptions(
@@ -1070,6 +1250,7 @@ final class UsageReceiptTests: XCTestCase {
                 model: "gpt-5.6-sol",
                 reasoning: "high",
                 turnID: "turn-1",
+                modelContextWindow: 272_000,
                 tokenDelta: LocalTokenUsage(
                     inputTokens: 300,
                     cachedInputTokens: 100,
@@ -1077,23 +1258,15 @@ final class UsageReceiptTests: XCTestCase {
                     outputTokens: 60,
                     reasoningOutputTokens: 20,
                     totalTokens: 360
-                )
-            ),
-            diagnosticFact(
-                key: .context,
-                value: .tokens(
-                    LocalTokenUsage(
-                        inputTokens: 800,
-                        cachedInputTokens: 300,
-                        cacheWriteInputTokens: 15,
-                        outputTokens: 140,
-                        reasoningOutputTokens: 60,
-                        totalTokens: 940
-                    )
                 ),
-                eventID: "context",
-                date: interval.start.addingTimeInterval(21),
-                context: turnContext
+                contextUsage: LocalTokenUsage(
+                    inputTokens: 800,
+                    cachedInputTokens: 300,
+                    cacheWriteInputTokens: 15,
+                    outputTokens: 140,
+                    reasoningOutputTokens: 60,
+                    totalTokens: 940
+                )
             ),
             diagnosticFact(
                 key: .compaction,
@@ -1532,6 +1705,40 @@ final class UsageReceiptTests: XCTestCase {
         )
     }
 
+    func testAggregatorDoesNotRetainTokenFactsBeforeItsInterval() {
+        let interval = testInterval()
+        let oldDate = interval.start.addingTimeInterval(-60)
+        let currentDate = interval.start.addingTimeInterval(60)
+        let snapshot = UsageReceiptAggregator.evaluate(
+            facts: [
+                tokenFact(
+                    eventID: "old",
+                    date: oldDate,
+                    tokens: 40,
+                    taskID: "root"
+                ),
+                tokenFact(
+                    eventID: "current",
+                    date: currentDate,
+                    tokens: 60,
+                    taskID: "root"
+                )
+            ],
+            projections: [projection(taskID: "root", project: "atlas")],
+            interval: interval,
+            observation: continuousObservation(for: interval)
+        )
+        let wide = DateInterval(
+            start: oldDate.addingTimeInterval(-1),
+            end: interval.end
+        )
+
+        XCTAssertEqual(
+            snapshot.slice(in: wide, filters: .all).totalTokens,
+            60
+        )
+    }
+
     private func tokenFact(
         eventID: String,
         date: Date,
@@ -1540,9 +1747,11 @@ final class UsageReceiptTests: XCTestCase {
         model: String? = nil,
         reasoning: String? = nil,
         turnID: String? = nil,
+        modelContextWindow: Int64? = nil,
         agent: LocalAgentIdentity? = nil,
         reason: String? = nil,
-        tokenDelta: LocalTokenUsage? = nil
+        tokenDelta: LocalTokenUsage? = nil,
+        contextUsage: LocalTokenUsage? = nil
     ) -> LocalActivityFact {
         LocalActivityFact(
             key: .token,
@@ -1559,9 +1768,11 @@ final class UsageReceiptTests: XCTestCase {
                 turnID: turnID,
                 agent: agent,
                 effectiveModel: model,
-                reasoning: reasoning
+                reasoning: reasoning,
+                modelContextWindow: modelContextWindow
             ),
-            tokenDelta: tokenDelta
+            tokenDelta: tokenDelta,
+            contextUsage: contextUsage
         )
     }
 

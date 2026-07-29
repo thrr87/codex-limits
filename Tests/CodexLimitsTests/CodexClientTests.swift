@@ -288,8 +288,68 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.threadListReadCount, 1)
     }
 
+    func testCancelledQueuedRequestDoesNotReachTheServer() async throws {
+        let server = PersistentAppServerFixture(
+            delaysFirstRateLimitResponse: true
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+        let fetch = Task {
+            try await client.fetch(
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+            )
+        }
+        while server.rateLimitReadCount == 0 {
+            await Task.yield()
+        }
+        let queued = Task {
+            try await client.threadProjectionResponse(
+                for: .list(
+                    cursor: nil,
+                    limit: 100,
+                    useStateDBOnly: true,
+                    sortKey: "updated_at"
+                )
+            )
+        }
+        await Task.yield()
+        queued.cancel()
+
+        _ = try await fetch.value
+        do {
+            _ = try await queued.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(server.threadListReadCount, 0)
+    }
+
     func testBrokenConnectionReconnectsWithoutLosingTheRefresh() async throws {
         let server = PersistentAppServerFixture(dropsFirstConnection: true)
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+
+        let result = try await client.fetch(
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.snapshot.mainLimit?.window.remainingPercent, 80)
+        XCTAssertEqual(server.connectionCount, 2)
+        XCTAssertEqual(server.initializationCount, 2)
+    }
+
+    func testOversizedProtocolLineReconnectsWithoutLosingTheRefresh() async throws {
+        let server = PersistentAppServerFixture(
+            oversizedInitializationOnFirstConnection: true,
+            maximumLineBytes: 1_024
+        )
         let client = CodexClient(
             makeConnection: server.makeConnection,
             timeout: 1
@@ -813,6 +873,35 @@ final class CodexClientTests: XCTestCase {
         )
     }
 
+    func testInvalidSpendControlPercentFailsTheAccountRead() {
+        let usage = Data(
+            #"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8
+        )
+        for remaining in ["-1", "101", "1e308"] {
+            let rateLimits = Data(
+                #"""
+                {"id":2,"result":{"rateLimits":{
+                  "limitId":"codex",
+                  "secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":2000000},
+                  "individualLimit":{"limit":"50","used":"10","remainingPercent":\#(remaining),"resetsAt":2100000}
+                }}}
+                """#.utf8
+            )
+
+            XCTAssertThrowsError(
+                try CodexClient.decode(
+                    rateLimitsResponse: rateLimits,
+                    usageResponse: usage,
+                    fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+                )
+            ) { error in
+                guard case CodexClientError.invalidResponse = error else {
+                    return XCTFail("Expected invalidResponse, got \(error)")
+                }
+            }
+        }
+    }
+
     func testNestedMissingFactsKeepTheirOwnObservationTimes() {
         let previousReadAt = Date(timeIntervalSince1970: 1_900_000)
         let currentReadAt = Date(timeIntervalSince1970: 1_900_060)
@@ -946,6 +1035,45 @@ final class CodexClientTests: XCTestCase {
                 return XCTFail("Expected invalidResponse, got \(error)")
             }
         }
+    }
+
+    func testInvalidAllowanceWindowUsesTheIncompatibleResponseError() {
+        let usage = Data(
+            #"{"id":3,"result":{"dailyUsageBuckets":[]}}"#.utf8
+        )
+        for duration in [0, -10_080] {
+            let rateLimits = Data(
+                #"{"id":2,"result":{"rateLimits":{"limitId":"codex","secondary":{"usedPercent":20,"windowDurationMins":\#(duration),"resetsAt":2000000}}}}"#
+                    .utf8
+            )
+
+            XCTAssertThrowsError(
+                try CodexClient.decode(
+                    rateLimitsResponse: rateLimits,
+                    usageResponse: usage,
+                    fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+                )
+            ) { error in
+                guard case CodexClientError.invalidResponse = error else {
+                    return XCTFail("Expected invalidResponse, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testUsageWindowDecodingRejectsNonFiniteRemainingPercent() throws {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        let data = Data(
+            #"{"remainingPercent":"NaN","resetsAt":2000000,"durationMinutes":10080}"#
+                .utf8
+        )
+
+        XCTAssertThrowsError(try decoder.decode(UsageWindow.self, from: data))
     }
 
     func testMalformedDailyTokenBucketsFailTheWholeAccountRead() {
@@ -1096,6 +1224,8 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
     private let includesChangingResetDetails: Bool
     private let errorBodiesByMethod: [String: String]
     private let initializationResultBody: String?
+    private let oversizedInitializationOnFirstConnection: Bool
+    private let maximumLineBytes: Int
     private var connections = 0
     private var initializations = 0
     private var rateLimitReads = 0
@@ -1146,7 +1276,9 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         initializeUserAgent: String? = nil,
         includesChangingResetDetails: Bool = false,
         errorBodiesByMethod: [String: String] = [:],
-        initializationResultBody: String? = nil
+        initializationResultBody: String? = nil,
+        oversizedInitializationOnFirstConnection: Bool = false,
+        maximumLineBytes: Int = 16 * 1_024 * 1_024
     ) {
         self.dropsFirstConnection = dropsFirstConnection
         self.stallsFirstConnection = stallsFirstConnection
@@ -1162,6 +1294,9 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         self.includesChangingResetDetails = includesChangingResetDetails
         self.errorBodiesByMethod = errorBodiesByMethod
         self.initializationResultBody = initializationResultBody
+        self.oversizedInitializationOnFirstConnection =
+            oversizedInitializationOnFirstConnection
+        self.maximumLineBytes = maximumLineBytes
     }
 
     func makeConnection() throws -> CodexAppServerConnection {
@@ -1191,7 +1326,10 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                 switch method {
                 case "initialize":
                     lock.withLock { initializations += 1 }
-                    if let initializationResultBody {
+                    if oversizedInitializationOnFirstConnection,
+                       connectionNumber == 1 {
+                        response = #"{"id":\#(id),"result":{"padding":"\#(String(repeating: "x", count: maximumLineBytes))"}}"#
+                    } else if let initializationResultBody {
                         response =
                             #"{"id":\#(id),"result":\#(initializationResultBody)}"#
                     } else if let initializeUserAgent {
@@ -1318,6 +1456,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         return CodexAppServerConnection(
             input: requests.fileHandleForWriting,
             output: responses.fileHandleForReading,
+            maximumLineBytes: maximumLineBytes,
             isRunning: { true },
             stop: {
                 try? requests.fileHandleForWriting.close()

@@ -76,6 +76,37 @@ final class LocalTokenActivityTests: XCTestCase {
         XCTAssertEqual(activity.reason, "Local task records are missing")
     }
 
+    func testCachedActivityUsesTheLatestCoverageObservation() {
+        let interval = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        let cached = LocalTokenActivityAggregator.evaluate(
+            facts: [tokenFact(id: "first", timestamp: 1_100, delta: 100)],
+            interval: interval,
+            observation: .continuous(
+                sourceVersion: "0.145.0",
+                observedAt: interval.end
+            )
+        )
+
+        let updated = cached.updating(
+            interval: interval,
+            observation: .gap(
+                sourceVersion: "0.145.0",
+                observedAt: interval.end,
+                reason: "Codex account identity could not be checked"
+            )
+        )
+
+        XCTAssertEqual(updated.tokens, 100)
+        XCTAssertEqual(updated.coverage, .low)
+        XCTAssertEqual(
+            updated.reason,
+            "Codex account identity could not be checked"
+        )
+    }
+
     func testNoLocalActivityInAContinuouslyObservedIntervalIsNotApplicable() {
         let interval = DateInterval(
             start: Date(timeIntervalSince1970: 1_000),

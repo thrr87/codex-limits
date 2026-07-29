@@ -413,16 +413,58 @@ final class ActiveTimeAvailabilityTests: XCTestCase {
             end: boundary.addingTimeInterval(1_800),
             eventDate: boundary.addingTimeInterval(1_800)
         )
-        let index = LocalActivityFactIndex([missingEnd, missingStart])
+        let facts = [missingEnd, missingStart]
+        let index = LocalActivityFactIndex(facts)
 
         XCTAssertEqual(
-            Set(index.activityFacts(in: first.interval).compactMap(\.eventID)),
+            Set(
+                index.activityFacts(
+                    in: first.interval,
+                    from: facts
+                ).compactMap(\.eventID)
+            ),
             ["missing-end", "missing-start"]
         )
         XCTAssertEqual(
-            Set(index.activityFacts(in: second.interval).compactMap(\.eventID)),
+            Set(
+                index.activityFacts(
+                    in: second.interval,
+                    from: facts
+                ).compactMap(\.eventID)
+            ),
             ["missing-end", "missing-start"]
         )
+    }
+
+    func testActivityIndexDoesNotKeepTheFactBufferShared() {
+        let first = week(index: 0, movement: 80)
+        var facts = [
+            timingFact(
+                id: "turn-1",
+                taskID: "task-1",
+                start: first.interval.start,
+                end: first.interval.start.addingTimeInterval(60)
+            )
+        ]
+        facts.reserveCapacity(2)
+        let originalAddress = facts.withUnsafeBufferPointer(\.baseAddress)
+        let index = LocalActivityFactIndex(facts)
+
+        facts.append(
+            timingFact(
+                id: "turn-2",
+                taskID: "task-2",
+                start: first.interval.start.addingTimeInterval(120),
+                end: first.interval.start.addingTimeInterval(180)
+            )
+        )
+
+        withExtendedLifetime(index) {
+            XCTAssertEqual(
+                facts.withUnsafeBufferPointer(\.baseAddress),
+                originalAddress
+            )
+        }
     }
 
     func testHistoricalSourceGapStaysLowOutsideItsObservationTime() {

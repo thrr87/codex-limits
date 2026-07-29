@@ -36,6 +36,10 @@ struct ActiveTimeAvailableEstimate: Equatable, Sendable {
 
 struct ActiveTimeAvailabilitySnapshot: Equatable, Sendable {
     let activeTimeThisWeek: TimeInterval
+    let maximumConcurrency: Int
+    let waitingTime: TimeInterval?
+    let pollingTime: TimeInterval?
+    let activityBreakdownReason: String?
     let activeTimeCoverage: CoverageLevel
     let activeTimeReason: String?
     let observedInterval: DateInterval?
@@ -54,7 +58,8 @@ enum ActiveTimeWeekEvidenceBuilder {
         usage: [WeeklyUsageEvidence],
         facts: [LocalActivityFact],
         projections: [ThreadProjection],
-        observation: LocalActivityObservation
+        observation: LocalActivityObservation,
+        factIndex: LocalActivityFactIndex? = nil
     ) -> ActiveTimeHistorySelection {
         guard let currentUsage else {
             return ActiveTimeHistorySelection(
@@ -62,7 +67,7 @@ enum ActiveTimeWeekEvidenceBuilder {
                 unavailableReason: nil
             )
         }
-        let factIndex = LocalActivityFactIndex(facts)
+        let factIndex = factIndex ?? LocalActivityFactIndex(facts)
         var result: [ActiveTimeWeekEvidence] = []
         var workloadMismatchCount = 0
         for candidate in usage.sorted(
@@ -80,7 +85,10 @@ enum ActiveTimeWeekEvidenceBuilder {
                 continue
             }
             let timeline = ActivityTimelineAggregator.evaluate(
-                facts: factIndex.activityFacts(in: candidate.interval),
+                facts: factIndex.activityFacts(
+                    in: candidate.interval,
+                    from: facts
+                ),
                 projections: projections,
                 interval: candidate.interval,
                 observation: scopedObservation(
@@ -168,6 +176,10 @@ enum ActiveTimeAvailabilityEngine {
     static func evaluate(
         currentUsage: WeeklyUsageEvidence?,
         activeTimeThisWeek: TimeInterval,
+        maximumConcurrency: Int = 0,
+        waitingTime: TimeInterval? = nil,
+        pollingTime: TimeInterval? = nil,
+        activityBreakdownReason: String? = nil,
         activeTimeCoverage: CoverageLevel,
         activeTimeReason: String?,
         history: [ActiveTimeWeekEvidence],
@@ -177,6 +189,10 @@ enum ActiveTimeAvailabilityEngine {
         let unavailable: (String) -> ActiveTimeAvailabilitySnapshot = {
             ActiveTimeAvailabilitySnapshot(
                 activeTimeThisWeek: activeTimeThisWeek,
+                maximumConcurrency: maximumConcurrency,
+                waitingTime: waitingTime,
+                pollingTime: pollingTime,
+                activityBreakdownReason: activityBreakdownReason,
                 activeTimeCoverage: activeTimeCoverage,
                 activeTimeReason: activeTimeReason,
                 observedInterval: currentUsage?.interval,
@@ -272,6 +288,10 @@ enum ActiveTimeAvailabilityEngine {
         let confidence: ConfidenceLevel = caveats.isEmpty ? .high : .medium
         return ActiveTimeAvailabilitySnapshot(
             activeTimeThisWeek: activeTimeThisWeek,
+            maximumConcurrency: maximumConcurrency,
+            waitingTime: waitingTime,
+            pollingTime: pollingTime,
+            activityBreakdownReason: activityBreakdownReason,
             activeTimeCoverage: activeTimeCoverage,
             activeTimeReason: activeTimeReason,
             observedInterval: currentUsage.interval,

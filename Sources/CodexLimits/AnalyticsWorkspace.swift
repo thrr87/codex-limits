@@ -353,10 +353,48 @@ struct UsageChartSelection: Equatable, Sendable {
         in chart: UsageChartSnapshot,
         within visibleRange: DateInterval? = nil
     ) -> UsageChartSelection? {
-        candidates(in: chart)
-            .filter {
-                visibleRange?.contains($0.point.date) ?? true
-            }.min {
+        [
+            nearestCandidate(
+                in: chart.allObserved,
+                series: .observed,
+                priority: 0,
+                source: .account,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.currentProjection,
+                series: .currentEstimate,
+                priority: 1,
+                source: .derivedEstimate,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.historicalProjection,
+                series: .pastEstimate,
+                priority: 2,
+                source: .accountHistory,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.estimatedBackfill,
+                series: .estimatedBackfill,
+                priority: 3,
+                source: .tokenEstimate,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.target,
+                series: .target,
+                priority: 4,
+                source: .weeklyTarget,
+                to: date,
+                within: visibleRange
+            )
+        ].compactMap { $0 }.min {
                 let leftDistance = abs($0.point.date.timeIntervalSince(date))
                 let rightDistance = abs($1.point.date.timeIntervalSince(date))
                 if leftDistance == rightDistance {
@@ -371,6 +409,30 @@ struct UsageChartSelection: Equatable, Sendable {
                     source: $0.source
                 )
             }
+    }
+
+    private static func nearestCandidate(
+        in points: [UsageChartPoint],
+        series: UsageChartSeries,
+        priority: Int,
+        source: UsageChartPointSource,
+        to date: Date,
+        within visibleRange: DateInterval?
+    ) -> Candidate? {
+        guard let point = nearestPoint(
+            in: points,
+            to: date,
+            date: \.date,
+            within: visibleRange
+        ) else {
+            return nil
+        }
+        return Candidate(
+            series: series,
+            point: point,
+            priority: priority,
+            source: source
+        )
     }
 
     private static func candidates(

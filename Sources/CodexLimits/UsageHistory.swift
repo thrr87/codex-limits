@@ -142,6 +142,7 @@ actor UsageHistory {
     private static let accountBindingName = ".codex-limits-account.json"
     private static let maximumFileSize = 1_000_000
     private static let maximumGeneration = 1_000_000_000
+    private static let automaticSyncInterval: TimeInterval = 30 * 60
 
     private let localDirectory: URL
     private let installationID: String
@@ -152,6 +153,7 @@ actor UsageHistory {
     private var deletionStatus: DeletionStatus = .none
     private var migrationWarning = false
     private var syncAccountBindingToken: String?
+    private var lastSynchronizationAttemptAt: Date?
     private let beforeCoordinatedMarkerRead: ((URL) throws -> Void)?
 
     init(
@@ -182,7 +184,10 @@ actor UsageHistory {
         } catch {
             errorMessage = "Usage history couldn’t be saved."
         }
-        return state(fallback: legacySamples)
+        return state(
+            fallback: legacySamples,
+            refreshSamples: true
+        )
     }
 
     func restoreExistingState() -> State? {
@@ -236,6 +241,7 @@ actor UsageHistory {
                 installationID: installationID,
                 coordinated: false
             )
+            knownSamples = normalized(knownSamples + [sample])
             if let syncDirectory {
                 try prepareRoot(
                     syncDirectory,
@@ -304,7 +310,7 @@ actor UsageHistory {
                 }
                 syncDirectory = directory
                 errorMessage = nil
-                return state()
+                return state(refreshSamples: true)
             }
             if let accountIdentity {
                 syncAccountBindingToken = try ensureAccountBinding(
@@ -348,6 +354,7 @@ actor UsageHistory {
         syncDirectory = nil
         syncAccountBindingToken = nil
         errorMessage = nil
+        lastSynchronizationAttemptAt = nil
         return state()
     }
 
@@ -364,13 +371,29 @@ actor UsageHistory {
         self.partition = partition
         syncDirectory = nil
         syncAccountBindingToken = nil
+        lastSynchronizationAttemptAt = nil
         errorMessage = nil
         knownSamples = []
         return load()
     }
 
     func synchronize() -> State {
-        guard let syncDirectory else { return state() }
+        synchronize(at: Date())
+    }
+
+    func synchronizeIfDue(at now: Date = Date()) -> State {
+        if let lastSynchronizationAttemptAt {
+            let elapsed = now.timeIntervalSince(lastSynchronizationAttemptAt)
+            if elapsed >= 0, elapsed < Self.automaticSyncInterval {
+                return state()
+            }
+        }
+        return synchronize(at: now)
+    }
+
+    private func synchronize(at now: Date) -> State {
+        lastSynchronizationAttemptAt = now
+        guard let syncDirectory else { return state(refreshSamples: true) }
         do {
             try prepareLocalStore()
             try prepareRoot(
@@ -389,7 +412,7 @@ actor UsageHistory {
                     generation: localMarker.generation ?? 1
                 )
                 errorMessage = nil
-                return state()
+                return state(refreshSamples: true)
             }
             try reconcileGeneration(with: syncDirectory)
             let generation = try effectiveGeneration(in: syncDirectory)
@@ -404,7 +427,7 @@ actor UsageHistory {
         } catch {
             errorMessage = message(for: error)
         }
-        return state()
+        return state(refreshSamples: true)
     }
 
     func deleteAnalyticsHistory(
@@ -496,7 +519,7 @@ actor UsageHistory {
                 : "Deletion pending — sync folder unavailable."
             deletionStatus = deletionTarget == nil ? .none : .pendingSync
         }
-        return state()
+        return state(refreshSamples: true)
     }
 
     func retryPendingDeletion(
@@ -546,7 +569,7 @@ actor UsageHistory {
             }
             deletionStatus = .pendingSync
         }
-        return state()
+        return state(refreshSamples: true)
     }
 
     func rebuildAvailableHistory(_ samples: [UsageSample]) -> State {
@@ -589,23 +612,27 @@ actor UsageHistory {
         } catch {
             errorMessage = "Available history couldn’t be rebuilt."
         }
-        return state()
+        return state(refreshSamples: true)
     }
 
     private func state(
         fallback: [UsageSample] = [],
-        issue: Issue? = nil
+        issue: Issue? = nil,
+        refreshSamples: Bool = false
     ) -> State {
-        let local = readAll(from: activeLocalDirectory)
-        if local.hadError && errorMessage == nil {
-            errorMessage = "Some usage history couldn’t be read."
+        if refreshSamples {
+            let local = readAll(from: activeLocalDirectory)
+            if local.hadError && errorMessage == nil {
+                errorMessage = "Some usage history couldn’t be read."
+            }
+            knownSamples = local.hadError || errorMessage != nil
+                ? normalized(local.samples + knownSamples + fallback)
+                : local.samples
+        } else if !fallback.isEmpty {
+            knownSamples = normalized(knownSamples + fallback)
         }
-        let samples = local.hadError || errorMessage != nil
-            ? normalized(local.samples + knownSamples + fallback)
-            : local.samples
-        knownSamples = samples
         return State(
-            samples: samples,
+            samples: knownSamples,
             folderName: syncDirectory?.lastPathComponent,
             errorMessage: errorMessage,
             deletionStatus: deletionStatus,
@@ -937,7 +964,11 @@ actor UsageHistory {
         guard (size ?? 0) <= Self.maximumFileSize else {
             throw HistoryError.invalidFile
         }
-        return try Data(contentsOf: url)
+        let data = try Data(contentsOf: url)
+        guard data.count <= Self.maximumFileSize else {
+            throw HistoryError.invalidFile
+        }
+        return data
     }
 
     private func isUbiquitousItem(_ url: URL) -> Bool {
@@ -952,12 +983,7 @@ actor UsageHistory {
     }
 
     private func normalized(_ samples: [UsageSample]) -> [UsageSample] {
-        let valid = samples.filter {
-            $0.observedAt <= $0.resetsAt
-                && $0.remainingPercent.isFinite
-                && (0 ... 100).contains($0.remainingPercent)
-                && ($0.lifetimeTokens.map { $0 >= 0 } ?? true)
-        }
+        let valid = samples.filter(\.isValid)
         var byIdentity: [UsageSample: UsageSample] = [:]
         for sample in valid {
             guard let existing = byIdentity[sample] else {

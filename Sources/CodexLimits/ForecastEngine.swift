@@ -152,26 +152,49 @@ enum ForecastEngine {
         now: Date
     ) -> Double? {
         let day: TimeInterval = 86_400
-        let dayNumber: (Date) -> Int = { Int(floor($0.timeIntervalSince1970 / day)) }
-        let start = dayNumber(window.startsAt)
-        let today = dayNumber(now)
-        let buckets = Dictionary(grouping: tokenHistory, by: { dayNumber($0.date) })
-            .mapValues { $0.reduce(Int64(0)) { $0 + $1.tokens } }
+        let dayNumber: (Date) -> Int? = {
+            let value = floor($0.timeIntervalSince1970 / day)
+            guard value.isFinite else { return nil }
+            return Int(exactly: value)
+        }
+        guard let start = dayNumber(window.startsAt),
+              let today = dayNumber(now) else { return nil }
+        var buckets: [Int: Double] = [:]
+        for tokenDay in tokenHistory {
+            guard tokenDay.tokens >= 0,
+                  let bucket = dayNumber(tokenDay.date) else { return nil }
+            let total = (buckets[bucket] ?? 0) + Double(tokenDay.tokens)
+            guard total.isFinite else { return nil }
+            buckets[bucket] = total
+        }
         guard let first = buckets.keys.min(),
               let latest = buckets.keys.filter({ $0 < today }).max(),
               latest >= start else { return nil }
 
-        let currentCount = latest - start + 1
-        let currentTokens = (start ... latest).reduce(Int64(0)) { $0 + (buckets[$1] ?? 0) }
-        let historyEnd = start - 1
-        let historyStart = max(first, historyEnd - 27)
+        let currentCount = Double(latest) - Double(start) + 1
+        let currentTokens = buckets.reduce(0.0) {
+            $1.key >= start && $1.key <= latest ? $0 + $1.value : $0
+        }
+        let (historyEnd, endOverflow) = start.subtractingReportingOverflow(1)
+        guard !endOverflow else { return nil }
+        let (candidateStart, startOverflow) =
+            historyEnd.subtractingReportingOverflow(27)
+        guard !startOverflow else { return nil }
+        let historyStart = max(first, candidateStart)
         guard historyStart <= historyEnd, currentTokens > 0 else { return nil }
 
-        let historyCount = historyEnd - historyStart + 1
-        let historyTokens = (historyStart ... historyEnd).reduce(Int64(0)) { $0 + (buckets[$1] ?? 0) }
-        let currentAverage = Double(currentTokens) / Double(currentCount)
-        let historicalAverage = Double(historyTokens) / Double(historyCount)
-        guard currentAverage > 0, historicalAverage > 0 else { return nil }
+        let historyCount = Double(historyEnd) - Double(historyStart) + 1
+        let historyTokens = buckets.reduce(0.0) {
+            $1.key >= historyStart && $1.key <= historyEnd
+                ? $0 + $1.value
+                : $0
+        }
+        let currentAverage = currentTokens / currentCount
+        let historicalAverage = historyTokens / historyCount
+        guard currentAverage.isFinite,
+              historicalAverage.isFinite,
+              currentAverage > 0,
+              historicalAverage > 0 else { return nil }
 
         // Daily token buckets are a coarse bootstrap; percentage-based windows replace them.
         let relativePace = min(max(historicalAverage / currentAverage, 0.25), 4)

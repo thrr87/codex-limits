@@ -1,40 +1,40 @@
 import Foundation
 
 struct LocalActivityFactIndex {
-    private let entries: [(date: Date, fact: LocalActivityFact)]
+    private let entries: [(date: Date, index: Int)]
     private let turnEntries: [
-        (start: Date, end: Date, fact: LocalActivityFact)
+        (start: Date, end: Date, index: Int)
     ]
     private let boundaryEntries: [
         (
             date: Date,
             affectedStart: Date?,
             affectedEnd: Date?,
-            fact: LocalActivityFact
+            index: Int
         )
     ]
 
     init(_ facts: [LocalActivityFact]) {
         let parser = LocalEventTimestampParser()
-        entries = facts.compactMap { fact in
+        entries = facts.enumerated().compactMap { index, fact in
             guard let timestamp = fact.eventTimestamp,
                   let date = parser.date(from: timestamp) else {
                 return nil
             }
-            return (date, fact)
+            return (date, index)
         }
         .sorted { $0.date < $1.date }
-        turnEntries = facts.compactMap { fact in
+        turnEntries = facts.enumerated().compactMap { index, fact in
             guard case let .turnTiming(timing) = fact.value,
                   let start = timing.startedAt,
                   let end = timing.completedAt,
                   start < end else {
                 return nil
             }
-            return (start, end, fact)
+            return (start, end, index)
         }
         .sorted { $0.start < $1.start }
-        boundaryEntries = facts.compactMap { fact in
+        boundaryEntries = facts.enumerated().compactMap { index, fact in
             guard case let .turnTiming(timing) = fact.value else {
                 return nil
             }
@@ -52,21 +52,29 @@ struct LocalActivityFactIndex {
                     date,
                     min(start, end),
                     max(start, end),
-                    fact
+                    index
                 )
             }
-            return (date, start, end, fact)
+            return (date, start, end, index)
         }
     }
 
-    func facts(in interval: DateInterval) -> [LocalActivityFact] {
+    func facts(
+        in interval: DateInterval,
+        from facts: [LocalActivityFact]
+    ) -> [LocalActivityFact] {
         let start = lowerBound(for: interval.start)
         let end = lowerBound(for: interval.end)
-        return entries[start ..< end].map(\.fact)
+        return entries[start ..< end].compactMap {
+            facts.indices.contains($0.index) ? facts[$0.index] : nil
+        }
     }
 
-    func activityFacts(in interval: DateInterval) -> [LocalActivityFact] {
-        var result = facts(in: interval).filter { fact in
+    func activityFacts(
+        in interval: DateInterval,
+        from facts: [LocalActivityFact]
+    ) -> [LocalActivityFact] {
+        var result = self.facts(in: interval, from: facts).filter { fact in
             if case .turnTiming = fact.value { return false }
             return true
         }
@@ -74,7 +82,9 @@ struct LocalActivityFactIndex {
         result += turnEntries[..<candidateEnd]
             .lazy
             .filter { $0.end > interval.start }
-            .map(\.fact)
+            .compactMap {
+                facts.indices.contains($0.index) ? facts[$0.index] : nil
+            }
         result += boundaryEntries
             .lazy
             .filter { entry in
@@ -89,7 +99,9 @@ struct LocalActivityFactIndex {
                     return interval.contains(entry.date)
                 }
             }
-            .map(\.fact)
+            .compactMap {
+                facts.indices.contains($0.index) ? facts[$0.index] : nil
+            }
         return result
     }
 
