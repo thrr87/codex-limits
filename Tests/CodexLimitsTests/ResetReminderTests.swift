@@ -314,9 +314,7 @@ final class ResetReminderTests: XCTestCase {
         let restartedScheduler = RecordingResetReminderScheduler(
             authorization: .authorized
         )
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let monitor = UsageMonitor(
             defaults: fixture.defaults,
             historyDirectory: root,
@@ -423,9 +421,7 @@ final class ResetReminderTests: XCTestCase {
 
     func testFailedAccountRefreshKeepsTheLastFreshReminder() async throws {
         let fixture = makeFixture(authorization: .authorized)
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let fetch = ResetReminderFetchFixture(
             result: CodexFetchResult(
                 snapshot: UsageSnapshot(

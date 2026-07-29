@@ -40,9 +40,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testChangingAccountPartitionKeepsHistoriesSeparate() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let key = Data(repeating: 3, count: 32)
         let firstPartition = AccountHistoryPartition.stable(
             identity: "first@example.com",
@@ -79,9 +77,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testLifetimeTokenEnrichmentKeepsTheExistingSampleIdentity() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let observedAt = Date(timeIntervalSince1970: 1_900_000)
         let resetsAt = Date(timeIntervalSince1970: 2_000_000)
         let history = UsageHistory(
@@ -113,9 +109,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testNegativeLifetimeTokenReadingIsRejectedDuringNormalization() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let history = UsageHistory(
             localDirectory: root,
             installationID: "writer-a"
@@ -135,9 +129,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testSharedFolderAcceptsTheSameAccountAndRejectsAnotherAccount() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let sample = UsageSample(
@@ -188,9 +180,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testChangedBindingDisconnectsTheActiveFolderBeforeRecording() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let other = root.appendingPathComponent("other-shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -253,9 +243,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testUnavailableFolderKeepsLocalHistoryAndRemainsSelected() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let now = Date(timeIntervalSince1970: 1_900_000)
@@ -295,9 +283,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testVersionOneHistoryMigratesIntoTheActiveAccountPartition() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let writer = root
             .appendingPathComponent("installations", isDirectory: true)
             .appendingPathComponent("old-writer", isDirectory: true)
@@ -340,9 +326,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testDeleteAnalyticsHistoryRemovesAllLocalPartitionsAndSyncedInstallations() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let local = root.appendingPathComponent("local", isDirectory: true)
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -404,9 +388,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testNewSyncGenerationPreventsAnOfflineMacFromRepublishingOldHistory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let partition = AccountHistoryPartition.stable(
@@ -448,9 +430,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testNewSamplesUseASeparateDirectoryAfterSharedHistoryIsDeleted() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let writer = UsageHistory(
@@ -478,9 +458,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testLateWriteFromAnOldGenerationCannotRestoreDeletedHistory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let sample = UsageSample(
@@ -535,9 +513,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testConcurrentDeletionsNeverMoveTheSyncGenerationBackward() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let highLocal = root.appendingPathComponent("high", isDirectory: true)
         let lowLocal = root.appendingPathComponent("low", isDirectory: true)
@@ -572,9 +548,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testUnavailableSyncKeepsDeletionPendingUntilExplicitRetry() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -612,9 +586,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testPendingSyncDeletionBlocksNewHistoryUntilRetry() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -643,9 +615,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testConfiguredButUnavailableSyncTargetKeepsDeletionPending() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let missing = root.appendingPathComponent("missing-sync", isDirectory: true)
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
@@ -674,9 +644,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testPendingDeletionCannotDeleteADifferentSyncFolder() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let selected = root.appendingPathComponent("selected", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         let different = root.appendingPathComponent("different", isDirectory: true)
@@ -718,9 +686,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testPendingDeletionCannotDeleteAReplacementAtTheSamePath() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let selected = root.appendingPathComponent("selected", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
@@ -755,9 +721,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testDeleteChecksFolderIdentityBeforeRemovingReachableSharedHistory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let selected = root.appendingPathComponent("selected", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
@@ -792,9 +756,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testPendingDeletionFollowsTheSelectedFolderAfterRename() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let selected = root.appendingPathComponent("selected", isDirectory: true)
         let renamed = root.appendingPathComponent("renamed", isDirectory: true)
         try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
@@ -814,9 +776,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testSwitchingSyncFoldersDoesNotApplyTheOldFolderGeneration() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let firstFolder = root.appendingPathComponent("first", isDirectory: true)
         let secondFolder = root.appendingPathComponent("second", isDirectory: true)
         try FileManager.default.createDirectory(at: firstFolder, withIntermediateDirectories: true)
@@ -850,9 +810,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testPendingDeletionSurvivesRestartAndBlocksOldImports() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let local = root.appendingPathComponent("local", isDirectory: true)
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
@@ -890,9 +848,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testCompletingPendingDeletionDoesNotConnectAnotherAccount() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let local = root.appendingPathComponent("local", isDirectory: true)
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
@@ -942,9 +898,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testRetryFinishesInterruptedLocalDeletionBeforePublishing() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let local = root.appendingPathComponent("local", isDirectory: true)
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -984,9 +938,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testDeletedHistoryStaysEmptyUntilExplicitPartialRebuild() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let sample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
             remainingPercent: 80,
@@ -1012,9 +964,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testInterruptedLocalOnlyDeletionFinishesWithoutAskingForASyncFolder() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: [
             "version": 2,
@@ -1039,9 +989,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testCorruptionDoesNotReplaceHistoryAlreadyLoadedInMemory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let now = Date(timeIntervalSince1970: 1_900_000)
         let sample = UsageSample(
             observedAt: now,
@@ -1064,9 +1012,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testFailedAtomicWriteKeepsTheLastValidHistory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let reset = Date(timeIntervalSince1970: 2_000_000)
         let first = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
@@ -1103,9 +1049,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testOversizedDailyFileIsSkipped() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let now = Date(timeIntervalSince1970: 1_900_000)
         let sample = UsageSample(
             observedAt: now,
@@ -1138,9 +1082,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testRepeatedLegacyMigrationAndSyncAreIdempotent() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let now = Date(timeIntervalSince1970: 1_900_000)
@@ -1165,9 +1107,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testUnsupportedFolderVersionIsNotModified() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let marker = shared.appendingPathComponent(".codex-limits-history.json")
@@ -1192,9 +1132,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testAtomicMarkerUpdateDoesNotOverwriteANewerConcurrentVersion() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let upgraded = try JSONSerialization.data(withJSONObject: [
@@ -1222,9 +1160,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testOutOfRangeGenerationIsRejectedWithoutOverflowing() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let owner = UsageHistory(
@@ -1251,9 +1187,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testDisconnectKeepsLocalHistoryAndStopsPublishing() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let now = Date(timeIntervalSince1970: 1_900_060)
@@ -1292,9 +1226,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testMissingSyncFolderIsNotRecreated() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let missing = root.appendingPathComponent("missing", isDirectory: true)
         let history = UsageHistory(
             localDirectory: root.appendingPathComponent("local", isDirectory: true),
@@ -1310,9 +1242,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testMalformedSyncedFileDoesNotBlockValidRemoteHistory() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let now = Date(timeIntervalSince1970: 1_900_000)
@@ -1352,9 +1282,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testHistoryKeepsSamplesWithoutAgeLimit() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let currentDate = Date(timeIntervalSince1970: 1_700_000_000)
         let oldDate = currentDate.addingTimeInterval(-3 * 365 * 86_400)
         let oldReset = oldDate.addingTimeInterval(7 * 86_400)
@@ -1382,9 +1310,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testMalformedFileKeepsValidHistoryAndReportsWarning() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let now = Date(timeIntervalSince1970: 1_900_000)
         let sample = UsageSample(
             observedAt: now,
@@ -1415,9 +1341,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testVersionOneMigrationKeepsValidSamplesWhenAnotherFileIsMalformed() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let writer = root
             .appendingPathComponent("installations", isDirectory: true)
             .appendingPathComponent("old-writer", isDirectory: true)
@@ -1466,9 +1390,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testFailedMigrationKeepsLegacyHistoryAvailable() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let unusableDirectory = root.appendingPathComponent("history")
         try Data("not a directory".utf8).write(to: unusableDirectory)
@@ -1490,9 +1412,7 @@ final class UsageHistoryTests: XCTestCase {
     }
 
     func testTwoInstallationsMergeWithoutLosingSamples() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
 
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)

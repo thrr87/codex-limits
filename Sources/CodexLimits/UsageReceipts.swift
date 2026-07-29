@@ -216,8 +216,6 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
     fileprivate let observation: LocalActivityObservation
     let interval: DateInterval
 
-    var diagnosticFactCount: Int { diagnostics.count }
-
     func slice(
         in selectedInterval: DateInterval,
         filters: WorkspaceFilters

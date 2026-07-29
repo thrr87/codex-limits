@@ -480,14 +480,6 @@ struct UsageReaderSnapshot: Equatable, Sendable {
         return "Updated \(days) \(days == 1 ? "day" : "days") ago"
     }
 
-    func updateStatusText(at now: Date) -> String {
-        guard let fetchedAt = account?.fetchedAt else { return "Not updated" }
-        let isStale = sourceMessage != nil
-            || now.timeIntervalSince(fetchedAt) > CurrentUsagePolicy.tightBoundary
-        let updated = updatedText(at: now)
-        return isStale ? "Stale · \(updated)" : updated
-    }
-
 }
 
 private enum CurrentUsagePolicy {

@@ -76,60 +76,6 @@ actor CodexAssistedHistory {
         } ?? []
     }
 
-    func record(
-        result: CodexAssistedAnalysisResult,
-        scope: CodexAssistedAnalysisScope
-    ) throws {
-        guard let accountPartitionID = scope.accountPartitionID,
-              !scope.fingerprint.isEmpty else {
-            return
-        }
-        loadIfNeeded()
-        let previous = file
-        file?.results.append(
-            CodexAssistedHistoryResult(
-                id: UUID(),
-                accountPartitionID: accountPartitionID,
-                scopeFingerprint: scope.fingerprint,
-                sourceSelectionFingerprint:
-                    scope.sourceSelectionFingerprint,
-                sourceCategories: scope.sourceCategories,
-                result: result
-            )
-        )
-        do {
-            try persist()
-        } catch {
-            file = previous
-            throw error
-        }
-    }
-
-    func record(
-        overhead: CodexAnalyticsOverhead,
-        outcome: CodexAssistedHistoryOverhead.Outcome,
-        accountPartitionID: String,
-        observedAt: Date = Date()
-    ) throws {
-        loadIfNeeded()
-        let previous = file
-        file?.overhead.append(
-            CodexAssistedHistoryOverhead(
-                id: UUID(),
-                accountPartitionID: accountPartitionID,
-                observedAt: observedAt,
-                outcome: outcome,
-                overhead: overhead
-            )
-        )
-        do {
-            try persist()
-        } catch {
-            file = previous
-            throw error
-        }
-    }
-
     func recordAnalysis(
         result: CodexAssistedAnalysisResult?,
         overhead: CodexAnalyticsOverhead,

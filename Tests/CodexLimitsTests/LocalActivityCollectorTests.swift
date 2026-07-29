@@ -102,7 +102,13 @@ final class LocalActivityCollectorTests: XCTestCase {
         )
         await collector.selectPartition("stable-account")
         let interval = try fixture.interval()
-        _ = await collector.refresh(interval: interval)
+        let observedAt = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: "2026-07-28T12:00:00Z")
+        )
+        _ = await collector.refresh(
+            interval: interval,
+            observedAt: observedAt
+        )
         try Data(
             (
                 fixture.session(threadID: "task-1", ordinal: 0)
@@ -112,14 +118,23 @@ final class LocalActivityCollectorTests: XCTestCase {
             ).utf8
         ).write(to: file, options: .atomic)
 
-        let result = await collector.refresh(interval: interval)
-        let unchanged = await collector.refresh(interval: interval)
+        let result = await collector.refresh(
+            interval: interval,
+            observedAt: observedAt
+        )
+        let unchanged = await collector.refresh(
+            interval: interval,
+            observedAt: observedAt
+        )
         let restarted = LocalActivityCollector(
             rootDirectory: fixture.root,
             stateDirectory: stateDirectory
         )
         await restarted.selectPartition("stable-account")
-        let afterRestart = await restarted.refresh(interval: interval)
+        let afterRestart = await restarted.refresh(
+            interval: interval,
+            observedAt: observedAt
+        )
 
         XCTAssertEqual(result.observation.coverage, .low)
         XCTAssertEqual(

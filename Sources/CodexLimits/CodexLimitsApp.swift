@@ -52,17 +52,7 @@ struct CodexLimitsApp: App {
         _assistedInsights = StateObject(
             wrappedValue: CodexAssistedInsightStore(
                 service: QACodexAssistedService(),
-                sourceReader: QACodexSourceContentReader(),
-                availabilityOverride: CodexAssistedModelProfile(
-                    id: "gpt-5.6-luna",
-                    model: "gpt-5.6-luna",
-                    reasoningEffort: "medium"
-                ),
-                strongerProfileOverride: CodexAssistedModelProfile(
-                    id: "gpt-5.6-luna",
-                    model: "gpt-5.6-luna",
-                    reasoningEffort: "high"
-                )
+                sourceReader: QACodexSourceContentReader()
             )
         )
         #else

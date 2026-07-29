@@ -59,7 +59,7 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
             sourceVersion: nil,
             observedAt: nil,
             points: [],
-            accountComparison: LocalCoverageEvaluator().evaluate()
+            accountComparison: .unavailable
         )
     }
 
@@ -159,7 +159,7 @@ enum LocalTokenActivityAggregator {
                     sourceVersion: sourceVersion(observation),
                     observedAt: observedAt(observation),
                     points: [],
-                    accountComparison: LocalCoverageEvaluator().evaluate()
+                    accountComparison: .unavailable
                 )
             }
             total = addition.partialValue
@@ -203,7 +203,7 @@ enum LocalTokenActivityAggregator {
             sourceVersion: sourceVersion(observation),
             observedAt: observedAt(observation),
             points: points,
-            accountComparison: LocalCoverageEvaluator().evaluate()
+            accountComparison: .unavailable
         )
     }
 

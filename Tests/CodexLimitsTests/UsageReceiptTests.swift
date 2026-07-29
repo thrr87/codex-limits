@@ -968,7 +968,7 @@ final class UsageReceiptTests: XCTestCase {
         )
     }
 
-    func testDiagnosticSnapshotKeepsOnlyFactsThatIntersectItsInterval() {
+    func testDiagnosticSnapshotKeepsOnlyFactsThatIntersectItsInterval() throws {
         let interval = testInterval()
         let context = LocalActivityContext(
             taskID: "root",
@@ -1008,7 +1008,12 @@ final class UsageReceiptTests: XCTestCase {
             observation: continuousObservation(for: interval)
         )
 
-        XCTAssertEqual(snapshot.diagnosticFactCount, 2)
+        let diagnostics = try XCTUnwrap(
+            snapshot.slice(in: interval, filters: .all)
+                .receipts.first?.diagnostics
+        )
+        XCTAssertEqual(diagnostics.tools.first?.count, 1)
+        XCTAssertEqual(diagnostics.duration.waitingMilliseconds, 5_000)
     }
 
     func testDiagnosticOnlyScopeAppearsInSharedFilterOptions() {

@@ -8,9 +8,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let sample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
             remainingPercent: 80,
@@ -89,9 +87,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(
             at: root,
             withIntermediateDirectories: true
@@ -128,9 +124,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(
             at: root,
             withIntermediateDirectories: true
@@ -176,9 +170,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let first = makeFetchResult(
             identity: "first@example.com",
             fetchedAt: Date(timeIntervalSince1970: 1_900_000),
@@ -217,9 +209,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let weeklyStart = Date(timeIntervalSince1970: 1_395_200)
         let source = FetchSequence([
             makeFetchResult(
@@ -268,9 +258,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
@@ -312,9 +300,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
@@ -348,9 +334,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let firstReadAt = Date(timeIntervalSince1970: 1_900_000)
         let secondReadAt = Date(timeIntervalSince1970: 1_900_060)
         let source = FetchSequence([
@@ -388,9 +372,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let source = DelayedFetchSource(
             makeFetchResult(
                 identity: "user@example.com",
@@ -424,9 +406,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
@@ -459,9 +439,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let localRoot = root.appendingPathComponent(
             "rollouts",
             isDirectory: true
@@ -573,9 +551,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let first = makeFetchResult(
             identity: "user@example.com",
             fetchedAt: Date(timeIntervalSince1970: 1_900_000),
@@ -637,9 +613,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let result = CodexFetchResult(
             snapshot: makeFetchResult(
                 identity: "unused@example.com",
@@ -669,9 +643,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let cached = makeFetchResult(
             identity: "user@example.com",
             fetchedAt: Date(timeIntervalSince1970: 1_900_000),
@@ -703,9 +675,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let source = FetchSequence([
             makeFetchResult(
                 account: .unknown(state: "apiKey"),
@@ -741,9 +711,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let source = FetchSequence([
@@ -773,9 +741,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let times = Array(stride(
             from: 1_395_200.0,
             through: 1_890_000.0,
@@ -830,9 +796,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let firstSource = FetchSequence([
             makeFetchResult(
                 identity: "first@example.com",
@@ -895,9 +859,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let firstSource = FetchSequence([
             makeFetchResult(
                 identity: "first@example.com",
@@ -936,9 +898,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let local = root.appendingPathComponent("local", isDirectory: true)
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -994,9 +954,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let legacy = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_899_940),
             remainingPercent: 81,
@@ -1034,9 +992,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(Data("unresolvable".utf8), forKey: "historySyncBookmark")
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let monitor = UsageMonitor(
             defaults: defaults,
             historyDirectory: root,
@@ -1053,9 +1009,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let source = FetchSequence([
@@ -1086,9 +1040,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(Data("unresolvable".utf8), forKey: "historySyncBookmark")
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let source = FetchSequence([
@@ -1119,9 +1071,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(Data("unresolvable".utf8), forKey: "historySyncBookmark")
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let source = FetchSequence([])
@@ -1149,9 +1099,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.set(Data("unresolvable".utf8), forKey: "historySyncBookmark")
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
         let first = UsageMonitor(
@@ -1183,9 +1131,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
         let parked = root.appendingPathComponent("parked", isDirectory: true)
         try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
@@ -1247,9 +1193,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = temporaryDirectory()
         let working = root.appendingPathComponent("working", isDirectory: true)
         let invalid = root.appendingPathComponent("invalid", isDirectory: true)
         try FileManager.default.createDirectory(at: working, withIntermediateDirectories: true)

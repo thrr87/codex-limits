@@ -88,7 +88,7 @@ actor LocalActivityCollector {
 
     private let rootDirectory: URL
     private let stateDirectory: URL?
-    private let projectionSource: (any ThreadProjectionSource)?
+    private let projectionSource: ReadOnlyThreadProjectionSource?
     private let installedCLIVersion: (@Sendable () async -> String?)?
     private let tail = IncrementalRolloutTailSource()
     private let normalizer = LocalActivityNormalizer()
@@ -117,7 +117,7 @@ actor LocalActivityCollector {
         ).first?
             .appendingPathComponent("Codex Limits", isDirectory: true)
             .appendingPathComponent("local-activity", isDirectory: true),
-        projectionSource: (any ThreadProjectionSource)? = nil,
+        projectionSource: ReadOnlyThreadProjectionSource? = nil,
         installedCLIVersion: (@Sendable () async -> String?)? = nil
     ) {
         self.rootDirectory = rootDirectory.resolvingSymlinksInPath()

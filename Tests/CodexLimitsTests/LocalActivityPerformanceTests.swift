@@ -5,13 +5,11 @@ import XCTest
 
 final class LocalActivityPerformanceTests: XCTestCase {
     func testRepresentativeFixtureMetrics() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = temporaryDirectory()
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true
         )
-        defer { try? FileManager.default.removeItem(at: directory) }
         let fileURL = directory.appendingPathComponent("representative.jsonl")
 
         let recordCount = 20_000

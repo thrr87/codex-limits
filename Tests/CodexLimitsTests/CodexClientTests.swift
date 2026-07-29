@@ -3,8 +3,7 @@ import XCTest
 
 final class CodexClientTests: XCTestCase {
     func testIsolatedHomeLinksCredentialsAndRemovesTheLink() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         let source = root.appendingPathComponent("source", isDirectory: true)
         let temporary = root.appendingPathComponent(
             "temporary",
@@ -20,8 +19,6 @@ final class CodexClientTests: XCTestCase {
         )
         let sourceAuthentication = source.appendingPathComponent("auth.json")
         try Data("secret".utf8).write(to: sourceAuthentication)
-        defer { try? FileManager.default.removeItem(at: root) }
-
         let isolated = try CodexIsolatedHome.prepare(
             sourceHome: source,
             temporaryDirectory: temporary,
@@ -52,13 +49,11 @@ final class CodexClientTests: XCTestCase {
     }
 
     func testIsolatedHomeRemovesOnlyStaleOwnedDirectories() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(
             at: root,
             withIntermediateDirectories: true
         )
-        defer { try? FileManager.default.removeItem(at: root) }
         let stale = root.appendingPathComponent(
             "\(CodexIsolatedHome.directoryPrefix)stale",
             isDirectory: true

@@ -8,14 +8,10 @@ struct LocalCoverageEvaluation: Equatable, Sendable {
     let comparable: Bool
     let numericPercent: Double?
     let reason: LocalCoverageUnavailableReason?
-}
 
-struct LocalCoverageEvaluator {
-    func evaluate() -> LocalCoverageEvaluation {
-        return LocalCoverageEvaluation(
-            comparable: false,
-            numericPercent: nil,
-            reason: .tokenDefinitionsNotProvenCompatible
-        )
-    }
+    static let unavailable = LocalCoverageEvaluation(
+        comparable: false,
+        numericPercent: nil,
+        reason: .tokenDefinitionsNotProvenCompatible
+    )
 }

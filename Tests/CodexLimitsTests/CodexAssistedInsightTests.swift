@@ -451,11 +451,9 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     func testResultAndOverheadPersistByAccountUntilDeletion() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         let fileURL = root.appendingPathComponent("assisted.json")
         let history = CodexAssistedHistory(fileURL: fileURL)
-        defer { try? FileManager.default.removeItem(at: root) }
         let service = AssistedServiceFixture(
             catalogResult: .success(eligibleProfile()),
             analysisResult: .succeeded(analysisResult())
@@ -519,15 +517,13 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     func testSuccessfulAnalysisFailsClosedWhenHistoryCannotBeSaved() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         try FileManager.default.createDirectory(
             at: root,
             withIntermediateDirectories: true
         )
         let blockedParent = root.appendingPathComponent("not-a-folder")
         try Data("blocked".utf8).write(to: blockedParent)
-        defer { try? FileManager.default.removeItem(at: root) }
         let history = CodexAssistedHistory(
             fileURL: blockedParent.appendingPathComponent("assisted.json")
         )
@@ -559,8 +555,7 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     func testDeletionMarkerSuppressesOldRecordsAndKeepsANewGeneration() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         let historyDirectory = root.appendingPathComponent(
             "history",
             isDirectory: true
@@ -584,7 +579,7 @@ final class CodexAssistedInsightTests: XCTestCase {
             )
             try? FileManager.default.removeItem(at: root)
         }
-        try await history.record(result: analysisResult(), scope: scope)
+        try await history.recordResult(analysisResult(), scope: scope)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o500],
             ofItemAtPath: historyDirectory.path
@@ -610,8 +605,8 @@ final class CodexAssistedInsightTests: XCTestCase {
         )
         XCTAssertTrue(restoredResults.isEmpty)
 
-        try await restarted.record(
-            result: analysisResult(
+        try await restarted.recordResult(
+            analysisResult(
                 observedAt: Date(timeIntervalSince1970: 3_000)
             ),
             scope: scope
@@ -630,19 +625,19 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     func testDeleteAnalyticsHistoryRemovesCodexAssistedRecords() async throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         let fileURL = root.appendingPathComponent("assisted.json")
         let assistedHistory = CodexAssistedHistory(fileURL: fileURL)
         let scope = analysisScope(accountPartitionID: "account-a")
-        try await assistedHistory.record(
-            result: analysisResult(),
+        try await assistedHistory.recordResult(
+            analysisResult(),
             scope: scope
         )
-        try await assistedHistory.record(
+        try await assistedHistory.recordAnalysis(
+            result: nil,
             overhead: failedOverhead(),
             outcome: .failed,
-            accountPartitionID: "account-a"
+            scope: scope
         )
         let defaultsSuiteName =
             "CodexAssistedDelete-\(UUID().uuidString)"
@@ -677,8 +672,7 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     func testDeleteHistoryCancelsAnAnalysisWithoutRecreatingHistory() async {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let root = temporaryDirectory()
         let fileURL = root.appendingPathComponent("assisted.json")
         let history = CodexAssistedHistory(fileURL: fileURL)
         let defaultsSuite = "DeleteDuringAnalysis-\(UUID().uuidString)"

@@ -947,10 +947,6 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             reader.updatedText(at: fetchedAt.addingTimeInterval(3_600)),
             "Updated 1 hr ago"
         )
-        XCTAssertEqual(
-            reader.updateStatusText(at: fetchedAt.addingTimeInterval(3_600)),
-            "Stale · Updated 1 hr ago"
-        )
     }
 
     func testShortDenseTailDoesNotQualifyAsHighCoverage() {

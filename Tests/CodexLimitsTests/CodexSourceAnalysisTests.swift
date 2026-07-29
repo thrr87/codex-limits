@@ -830,11 +830,8 @@ final class CodexSourceAnalysisTests: XCTestCase {
     }
 
     func testSourceContentNeverEntersAnalyticsHistory() async throws {
-        let fileURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "CodexSourceHistory-\(UUID().uuidString).json"
-            )
-        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let fileURL = temporaryDirectory()
+            .appendingPathComponent("history.json")
         let selection = sourceSelection()
         let history = CodexAssistedHistory(fileURL: fileURL)
         let result = CodexAssistedAnalysisResult(
@@ -926,11 +923,8 @@ final class CodexSourceAnalysisTests: XCTestCase {
     }
 
     func testLatestMatchingResultWinsWhenMetadataAndSourceCoexist() async throws {
-        let fileURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "CodexSourceCoexist-\(UUID().uuidString).json"
-            )
-        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let fileURL = temporaryDirectory()
+            .appendingPathComponent("history.json")
         let history = CodexAssistedHistory(fileURL: fileURL)
         let metadataScope = CodexAssistedAnalysisScope(
             exploration: .initial,
@@ -949,14 +943,8 @@ final class CodexSourceAnalysisTests: XCTestCase {
             title: "Source result",
             observedAt: 2_100
         )
-        try await history.record(
-            result: metadataResult,
-            scope: metadataScope
-        )
-        try await history.record(
-            result: sourceResult,
-            scope: sourceScope
-        )
+        try await history.recordResult(metadataResult, scope: metadataScope)
+        try await history.recordResult(sourceResult, scope: sourceScope)
         let store = CodexAssistedInsightStore(
             service: SourceAnalysisServiceFixture(),
             history: history

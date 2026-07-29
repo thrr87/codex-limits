@@ -158,15 +158,7 @@ struct RolloutTailBatch: Equatable, Sendable {
     let requiresRebuild: Bool
 }
 
-protocol RolloutTailSource {
-    func read(
-        fileURL: URL,
-        cursor: RolloutCursor?,
-        observedAt: Date
-    ) throws -> RolloutTailBatch
-}
-
-struct IncrementalRolloutTailSource: RolloutTailSource {
+struct IncrementalRolloutTailSource {
     private static let fingerprintOffsetBasis: UInt64 = 14_695_981_039_346_656_037
     private static let fingerprintPrime: UInt64 = 1_099_511_628_211
 

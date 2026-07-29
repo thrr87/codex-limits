@@ -1052,8 +1052,6 @@ final class CodexAssistedInsightStore: ObservableObject {
     private let service: any CodexAssistedInsightServicing
     private let sourceReader: any CodexSourceContentReading
     private let history: CodexAssistedHistory?
-    private var availabilityOverride: CodexAssistedModelProfile?
-    private var strongerProfileOverride: CodexAssistedModelProfile?
     private var profile: CodexAssistedModelProfile?
     private var strongerProfile: CodexAssistedModelProfile?
     private var lastSourceRequest: (
@@ -1086,8 +1084,6 @@ final class CodexAssistedInsightStore: ObservableObject {
         self.service = service
         self.sourceReader = sourceReader
         self.history = history
-        availabilityOverride = nil
-        strongerProfileOverride = nil
         deletionCancellable = NotificationCenter.default.publisher(
             for: .codexAssistedHistoryDeleted
         )
@@ -1109,22 +1105,6 @@ final class CodexAssistedInsightStore: ObservableObject {
             history: CodexAssistedHistory.shared
         )
     }
-
-    #if CODEX_LIMITS_QA
-    convenience init(
-        service: any CodexAssistedInsightServicing,
-        sourceReader: any CodexSourceContentReading,
-        availabilityOverride: CodexAssistedModelProfile,
-        strongerProfileOverride: CodexAssistedModelProfile?
-    ) {
-        self.init(
-            service: service,
-            sourceReader: sourceReader
-        )
-        self.availabilityOverride = availabilityOverride
-        self.strongerProfileOverride = strongerProfileOverride
-    }
-    #endif
 
     var result: CodexAssistedAnalysisResult? {
         guard case let .succeeded(result) = runState else { return nil }
@@ -1266,13 +1246,6 @@ final class CodexAssistedInsightStore: ObservableObject {
             persistedResults = await history.results(
                 accountPartitionID: accountPartitionID
             )
-        }
-        if let availabilityOverride {
-            profile = availabilityOverride
-            strongerProfile = strongerProfileOverride
-            showsAnalyzeAction = true
-            didCheckAvailability = true
-            return
         }
         do {
             let eligible = try await service.eligibleProfile()

@@ -1461,15 +1461,11 @@ private struct ConcurrencyWorkspace: View {
         proxy: ChartProxy,
         geometry: GeometryProxy
     ) {
-        guard let plotFrame = proxy.plotFrame else { return }
-        let frame = geometry[plotFrame]
-        guard frame.contains(location),
-              let date = proxy.value(
-                  atX: location.x - frame.origin.x,
-                  as: Date.self
-              ) else {
-            return
-        }
+        guard let date = chartDate(
+            at: location,
+            proxy: proxy,
+            geometry: geometry
+        ) else { return }
         selectedPoint = nearestPoint(
             in: slice.points,
             to: date,
@@ -1907,15 +1903,11 @@ private struct TokenActivityWorkspace: View {
         proxy: ChartProxy,
         geometry: GeometryProxy
     ) {
-        guard let plotFrame = proxy.plotFrame else { return }
-        let frame = geometry[plotFrame]
-        guard frame.contains(location),
-              let date = proxy.value(
-                  atX: location.x - frame.origin.x,
-                  as: Date.self
-              ) else {
-            return
-        }
+        guard let date = chartDate(
+            at: location,
+            proxy: proxy,
+            geometry: geometry
+        ) else { return }
         selectedPoint = nearestPoint(
             in: localSlice.points,
             to: date,
@@ -2539,20 +2531,6 @@ private struct UsageRemainingChart: View {
         )
     }
 
-    private func chartDate(
-        at location: CGPoint,
-        proxy: ChartProxy,
-        geometry: GeometryProxy
-    ) -> Date? {
-        guard let plotFrame = proxy.plotFrame else { return nil }
-        let frame = geometry[plotFrame]
-        guard frame.contains(location) else { return nil }
-        return proxy.value(
-            atX: location.x - frame.origin.x,
-            as: Date.self
-        )
-    }
-
     private func zoom(by factor: CGFloat) {
         let anchor = selection?.date
             ?? chart.preferredZoomAnchor
@@ -3157,6 +3135,20 @@ private func nearestPoint<Point>(
         abs($0[keyPath: date].timeIntervalSince(target))
             < abs($1[keyPath: date].timeIntervalSince(target))
     }
+}
+
+private func chartDate(
+    at location: CGPoint,
+    proxy: ChartProxy,
+    geometry: GeometryProxy
+) -> Date? {
+    guard let plotFrame = proxy.plotFrame else { return nil }
+    let frame = geometry[plotFrame]
+    guard frame.contains(location) else { return nil }
+    return proxy.value(
+        atX: location.x - frame.origin.x,
+        as: Date.self
+    )
 }
 
 private struct UsageReceiptTaskTreeView: View {

@@ -37,12 +37,7 @@ struct ThreadProjectionPage: Equatable, Sendable {
     let nextCursor: String?
 }
 
-protocol ThreadProjectionSource: Sendable {
-    func list(cursor: String?, limit: Int) async throws -> ThreadProjectionPage
-    func read(threadID: String) async throws -> ThreadProjection?
-}
-
-struct ReadOnlyThreadProjectionSource: ThreadProjectionSource {
+struct ReadOnlyThreadProjectionSource: Sendable {
     typealias Request = @Sendable (ThreadProjectionReadRequest) async throws -> Data
 
     private let request: Request
