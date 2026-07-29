@@ -922,6 +922,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.coverage, .low)
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertNil(reader.guidance)
+        XCTAssertTrue(reader.chart.currentProjection.isEmpty)
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
         XCTAssertEqual(reader.guidanceTitle, "Not enough data")
         XCTAssertEqual(
             reader.guidanceMessage,
@@ -975,6 +977,126 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Less than half of this weekly window is observed")
         XCTAssertNil(reader.guidance)
+        XCTAssertFalse(reader.chart.currentProjection.isEmpty)
+    }
+
+    func testLowCoverageChartStillShowsCurrentAndPastEstimates() {
+        let now = Date(timeIntervalSince1970: 5_600_000)
+        let day: TimeInterval = 86_400
+        let account = makeSnapshot(
+            remaining: 55,
+            fetchedAt: now,
+            tokenHistory: (-33 ... -6).map {
+                TokenDay(
+                    date: now.addingTimeInterval(Double($0) * day),
+                    tokens: 200
+                )
+            } + (-5 ... -1).map {
+                TokenDay(
+                    date: now.addingTimeInterval(Double($0) * day),
+                    tokens: 100
+                )
+            }
+        )
+        let currentWindow = account.mainLimit!.window
+        let previousReset = currentWindow.startsAt
+        let history = weeklySamples(
+            start: previousReset.addingTimeInterval(-5 * day),
+            end: previousReset.addingTimeInterval(-3 * day),
+            reset: previousReset,
+            startRemaining: 80,
+            endRemaining: 40,
+            startTokens: 1_000,
+            endTokens: 2_000
+        )
+        let recent = stride(from: 60, through: 10, by: -10).map { minutesAgo in
+            UsageSample(
+                observedAt: now.addingTimeInterval(-Double(minutesAgo) * 60),
+                remainingPercent: 55,
+                resetsAt: currentWindow.resetsAt
+            )
+        }
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: history + recent,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.evidence.confidence, .low)
+        XCTAssertNil(reader.guidance)
+        XCTAssertEqual(reader.chart.currentProjection.count, 2)
+        XCTAssertEqual(reader.chart.historicalProjection.count, 2)
+        XCTAssertTrue(reader.chart.estimatedBackfill.isEmpty)
+        XCTAssertEqual(
+            reader.chart.historicalProjection.last?.remaining ?? .nan,
+            15,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testOutOfWindowHistoryDoesNotCreatePastEstimate() {
+        let now = Date(timeIntervalSince1970: 5_700_000)
+        let account = makeSnapshot(remaining: 55, fetchedAt: now)
+        let priorReset = account.mainLimit!.window.startsAt
+        let stale = weeklySamples(
+            start: priorReset.addingTimeInterval(-9 * 86_400),
+            end: priorReset.addingTimeInterval(-8 * 86_400),
+            reset: priorReset,
+            startRemaining: 80,
+            endRemaining: 40,
+            startTokens: 1_000,
+            endTokens: 2_000
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: stale,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
+    }
+
+    func testSparseHistoryDoesNotCreatePastEstimate() {
+        let now = Date(timeIntervalSince1970: 5_800_000)
+        let account = makeSnapshot(remaining: 55, fetchedAt: now)
+        let priorReset = account.mainLimit!.window.startsAt
+        let sparse = [
+            UsageSample(
+                observedAt: priorReset.addingTimeInterval(-2 * 86_400),
+                remainingPercent: 80,
+                resetsAt: priorReset
+            ),
+            UsageSample(
+                observedAt: priorReset.addingTimeInterval(-2 * 86_400 + 6 * 3_600),
+                remainingPercent: 40,
+                resetsAt: priorReset
+            )
+        ]
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: sparse,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
     }
 
     func testTokenBucketsNeverBecomeObservedAllowancePoints() {
@@ -1395,6 +1517,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(unavailable.freshness, .unavailable)
         XCTAssertEqual(ended.evidence.coverage, .notApplicable)
         XCTAssertEqual(ended.evidence.confidence, .unavailable)
+        XCTAssertTrue(ended.chart.currentProjection.isEmpty)
+        XCTAssertTrue(ended.chart.historicalProjection.isEmpty)
     }
 
     func testQuietDenseHistoryLeavesRoomToUseMore() {

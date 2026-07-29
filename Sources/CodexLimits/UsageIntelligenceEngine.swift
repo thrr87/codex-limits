@@ -534,12 +534,14 @@ enum UsageIntelligenceEngine {
             now: input.now,
             workloadMixChanged: workloadMixChanged
         )
-        let guidance: UsageGuidance? = input.account.flatMap { account in
+        let forecast: Forecast? = input.account.flatMap { account in
             guard let weeklyLimit = account.mainLimit else { return nil }
-            guard evidence.confidence == .high || evidence.confidence == .medium else {
+            guard case .available = input.sourceState,
+                  input.now >= weeklyLimit.window.startsAt,
+                  input.now < weeklyLimit.window.resetsAt else {
                 return nil
             }
-            let forecast = ForecastEngine.evaluate(
+            return ForecastEngine.evaluate(
                 window: weeklyLimit.window,
                 samples: input.samples,
                 tokenHistory: account.tokenHistory,
@@ -547,6 +549,12 @@ enum UsageIntelligenceEngine {
                 now: input.now,
                 previousStatus: input.previousStatus
             )
+        }
+        let guidance: UsageGuidance? = forecast.flatMap { forecast in
+            guard evidence.confidence == .high || evidence.confidence == .medium else {
+                return nil
+            }
+            guard let weeklyLimit = input.account?.mainLimit else { return nil }
             return UsageGuidance(
                 source: .derivedEstimate,
                 status: forecast.status,
@@ -577,7 +585,7 @@ enum UsageIntelligenceEngine {
         let chart = chart(
             account: input.account,
             samples: input.samples,
-            guidance: guidance,
+            forecast: forecast,
             safetyBuffer: input.safetyBuffer
         )
         let currentFreshness = freshness(
@@ -955,7 +963,7 @@ enum UsageIntelligenceEngine {
     private static func chart(
         account: UsageSnapshot?,
         samples: [UsageSample],
-        guidance: UsageGuidance?,
+        forecast: Forecast?,
         safetyBuffer: Double
     ) -> UsageChartSnapshot {
         guard let account, let weeklyLimit = account.mainLimit else {
@@ -978,7 +986,7 @@ enum UsageIntelligenceEngine {
             account: account,
             samples: samples
         )
-        guard let forecast = guidance?.forecast else {
+        guard let forecast else {
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: target,
@@ -989,20 +997,35 @@ enum UsageIntelligenceEngine {
                 accessibilityValue: "Now has \(Int(window.remainingPercent.rounded())) percent remaining. A forecast is not available."
             )
         }
-        let referenceProjection = projection(
-            account: account,
-            window: window,
-            rate: forecast.historicalPercentPerDay,
-            remainingAtReset: forecast.historicalRemainingAtReset
-        )
-        let reference = forecast.historicalReferenceSource.map {
+        let strictAccountReference = forecast.historicalReference?.source
+            == .accountHistory
+            ? forecast.historicalReference
+            : nil
+        let chartReference = strictAccountReference
+            ?? chartHistoricalReference(
+                samples: samples,
+                excluding: window.resetsAt,
+                remaining: window.remainingPercent,
+                daysLeft: max(
+                    window.resetsAt.timeIntervalSince(account.fetchedAt)
+                        / 86_400,
+                    0
+                )
+            )
+            ?? forecast.historicalReference
+        let reference = chartReference.map {
             UsageChartReferenceSeries(
-                source: $0,
-                points: referenceProjection
+                source: $0.source,
+                points: projection(
+                    account: account,
+                    window: window,
+                    rate: $0.percentPerDay,
+                    remainingAtReset: $0.remainingAtReset
+                )
             )
         }
-        let referenceDescription = forecast.historicalReferenceSource.map {
-            " and the \($0.rawValue.lowercased()) leaves \(Int(forecast.historicalRemainingAtReset.rounded())) percent"
+        let referenceDescription = chartReference.map {
+            " and the \($0.source.rawValue.lowercased()) leaves \(Int($0.remainingAtReset.rounded())) percent"
         } ?? ""
         return UsageChartSnapshot(
             observedSource: .account,
@@ -1016,9 +1039,64 @@ enum UsageIntelligenceEngine {
             reference: reference,
             currentAllowanceReset: window.resetsAt,
             allowanceWindows: allowanceWindows,
-            currentRunsFaster: forecast.currentPercentPerDay
-                > forecast.historicalPercentPerDay,
+            currentRunsFaster: chartReference.map {
+                forecast.currentPercentPerDay > $0.percentPerDay
+            } ?? false,
             accessibilityValue: "Now has \(Int(window.remainingPercent.rounded())) percent remaining. At reset, the current pace leaves \(Int(forecast.expectedRemainingAtReset.rounded())) percent\(referenceDescription)."
+        )
+    }
+
+    private static func chartHistoricalReference(
+        samples: [UsageSample],
+        excluding currentReset: Date,
+        remaining: Double,
+        daysLeft: Double
+    ) -> UsageForecastReference? {
+        let day: TimeInterval = 86_400
+        let minimumSpan: TimeInterval = 6 * 3_600
+        let rates = Dictionary(
+            grouping: samples.filter { $0.resetsAt != currentReset },
+            by: \.resetsAt
+        )
+        .compactMap { reset, windowSamples -> (Date, Double)? in
+            let startsAt = reset.addingTimeInterval(
+                -Double(UsageHistoryPolicy.weeklyDurationMinutes) * 60
+            )
+            let segment = UsageHistoryPolicy.segments(
+                windowSamples.filter {
+                    $0.observedAt >= startsAt && $0.observedAt <= reset
+                }
+            ).last ?? []
+            guard let first = segment.first,
+                  let last = segment.last,
+                  segment.count >= 2,
+                  last.observedAt.timeIntervalSince(first.observedAt)
+                    >= minimumSpan,
+                  zip(segment, segment.dropFirst()).allSatisfy({
+                      $1.observedAt.timeIntervalSince($0.observedAt)
+                          <= UsageHistoryPolicy.maximumComparableGap
+                  }) else {
+                return nil
+            }
+            let elapsed = last.observedAt.timeIntervalSince(first.observedAt)
+                / day
+            return (
+                reset,
+                max(
+                    (first.remainingPercent - last.remainingPercent) / elapsed,
+                    0
+                )
+            )
+        }
+        .sorted { $0.0 > $1.0 }
+        .prefix(4)
+        .map(\.1)
+        guard !rates.isEmpty else { return nil }
+        let rate = ForecastEngine.median(Array(rates))
+        return UsageForecastReference(
+            source: .accountHistory,
+            percentPerDay: rate,
+            remainingAtReset: max(remaining - rate * daysLeft, 0)
         )
     }
 

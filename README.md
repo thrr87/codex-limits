@@ -59,7 +59,7 @@ Codex Limits keeps three kinds of values separate:
 - **Local facts** come from Codex records on this Mac.
 - **Derived estimates** name their Coverage and Confidence.
 
-The app hides weak estimates and says what data is missing. It shows account and local token totals side by side when they differ.
+The app keeps weak estimates out of guidance and Insights. The Usage remaining chart may still show a Current or Past estimate when it has enough fresh points to show a useful direction. The chart names its source, Coverage, and Confidence.
 
 ## Features
 
@@ -87,7 +87,7 @@ The app hides weak estimates and says what data is missing. It shows account and
 4. It uses those sources to make charts, facts, and Insights.
 5. It sends a request to Codex only when you choose an `Analyze with Codex` action.
 
-Coverage says how much needed data the app saw. Confidence says how well that data supports an estimate. The app hides Low-confidence estimates.
+Coverage says how much needed data the app saw. Confidence says how well that data supports an estimate. Low-confidence chart lines do not change guidance or Insights.
 
 ## Privacy
 

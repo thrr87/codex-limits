@@ -2286,7 +2286,7 @@ private struct UsageRemainingChart: View {
         }
         if !chart.historicalProjection.isEmpty {
             ChartLegendItem(
-                label: "Past estimate",
+                label: "Past estimate · Account history",
                 color: .secondary,
                 dash: [2, 3]
             )
