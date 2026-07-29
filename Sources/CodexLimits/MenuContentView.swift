@@ -278,24 +278,18 @@ private struct WorkspaceHeader: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 if let weekly = reader.weeklyUsageRemaining {
-                    Text("Usage remaining")
-                        .font(.headline)
                     Text(
                         weekly.window.remainingPercent,
                         format: .number.precision(.fractionLength(0))
                     )
-                    .font(.system(size: 30, weight: .semibold, design: .rounded))
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                    Text("%")
+                    Text("% remaining")
                         .foregroundStyle(.secondary)
                 } else {
                     Text("Weekly usage unavailable")
                         .font(.headline)
                 }
-
-                Text("Account")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
 
                 Spacer()
 
