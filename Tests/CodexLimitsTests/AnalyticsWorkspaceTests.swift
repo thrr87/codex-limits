@@ -400,6 +400,45 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testObservedSegmentsWithinCurrentWindowExcludePriorWindow() {
+        let currentWindow = DateInterval(
+            start: Date(timeIntervalSince1970: 4_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        let currentPoint = UsageChartPoint(
+            date: Date(timeIntervalSince1970: 5_000),
+            remaining: 70
+        )
+        let chart = UsageChartSnapshot(
+            observedSource: .account,
+            target: [],
+            currentProjection: [],
+            currentAllowanceReset: currentWindow.end,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: currentWindow.start,
+                    observedSegments: [[
+                        UsageChartPoint(
+                            date: currentWindow.start,
+                            remaining: 40
+                        )
+                    ]]
+                ),
+                UsageAllowanceWindowSeries(
+                    resetsAt: currentWindow.end,
+                    observedSegments: [[currentPoint]]
+                )
+            ],
+            currentRunsFaster: false,
+            accessibilityValue: "Observed usage"
+        )
+
+        XCTAssertEqual(
+            chart.observedSegments(within: currentWindow),
+            [[currentPoint]]
+        )
+    }
+
     func testHistoricalUsagePresetsReachBeyondTheCurrentWindow() {
         let suite = "AnalyticsWorkspaceTests.historicalUsagePresets"
         let defaults = UserDefaults(suiteName: suite)!

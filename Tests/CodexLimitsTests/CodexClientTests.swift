@@ -112,6 +112,39 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.initializationCount, 1)
     }
 
+    func testClosedServerOutputReportsConnectionLost() async {
+        let client = CodexClient(
+            makeConnection: {
+                let requests = Pipe()
+                let responses = Pipe()
+                let connection = CodexAppServerConnection(
+                    input: requests.fileHandleForWriting,
+                    output: responses.fileHandleForReading,
+                    isRunning: { true },
+                    stop: {
+                        try? requests.fileHandleForWriting.close()
+                        try? responses.fileHandleForWriting.close()
+                    }
+                )
+                try responses.fileHandleForReading.close()
+                try responses.fileHandleForWriting.close()
+                return connection
+            },
+            timeout: 1
+        )
+
+        do {
+            _ = try await client.fetch(
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+            )
+            XCTFail("Expected the closed connection to fail")
+        } catch CodexClientError.connectionLost {
+            // Expected.
+        } catch {
+            XCTFail("Expected connectionLost, got \(error)")
+        }
+    }
+
     func testThreadProjectionReadsReuseTheInitializedAccountSession() async throws {
         let server = PersistentAppServerFixture()
         let client = CodexClient(
@@ -1288,6 +1321,7 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
             isRunning: { true },
             stop: {
                 try? requests.fileHandleForWriting.close()
+                try? responses.fileHandleForReading.close()
                 try? responses.fileHandleForWriting.close()
             }
         )

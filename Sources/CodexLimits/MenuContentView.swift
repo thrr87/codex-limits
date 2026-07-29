@@ -2316,7 +2316,7 @@ private struct UsageRemainingChart: View {
     @ChartContentBuilder
     private var observedMarks: some ChartContent {
         ForEach(
-            Array(chart.allObservedSegments.enumerated()),
+            Array(chart.observedSegments(within: visibleRange).enumerated()),
             id: \.offset
         ) { segmentIndex, segment in
             ForEach(segment) { point in

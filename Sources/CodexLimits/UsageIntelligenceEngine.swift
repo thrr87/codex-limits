@@ -305,6 +305,20 @@ struct UsageChartSnapshot: Equatable, Sendable {
         allObservedSegments.flatMap { $0 }
     }
 
+    func observedSegments(
+        within range: DateInterval
+    ) -> [[UsageChartPoint]] {
+        allowanceWindows
+            .filter { $0.resetsAt > range.start }
+            .flatMap(\.observedSegments)
+            .compactMap { segment in
+                let visible = segment.filter {
+                    $0.date >= range.start && $0.date <= range.end
+                }
+                return visible.isEmpty ? nil : visible
+            }
+    }
+
     var historicalProjection: [UsageChartPoint] {
         reference?.source == .accountHistory ? reference?.points ?? [] : []
     }
