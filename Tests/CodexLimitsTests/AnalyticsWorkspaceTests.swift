@@ -327,6 +327,130 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertEqual(selection?.date, visible)
     }
 
+    func testNearestPointIncludesPriorAllowanceWindows() {
+        let historical = Date(timeIntervalSince1970: 1_000)
+        let current = Date(timeIntervalSince1970: 5_000)
+        let chart = UsageChartSnapshot(
+            observedSource: .account,
+            target: [],
+            currentProjection: [],
+            currentAllowanceReset: current,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: Date(timeIntervalSince1970: 2_000),
+                    observedSegments: [[
+                        UsageChartPoint(date: historical, remaining: 40)
+                    ]]
+                ),
+                UsageAllowanceWindowSeries(
+                    resetsAt: current,
+                    observedSegments: [[
+                        UsageChartPoint(date: current, remaining: 70)
+                    ]]
+                )
+            ],
+            currentRunsFaster: false,
+            accessibilityValue: "Observed usage"
+        )
+
+        let selection = UsageChartSelection.nearest(
+            to: historical,
+            in: chart
+        )
+
+        XCTAssertEqual(selection?.date, historical)
+        XCTAssertEqual(selection?.remaining, 40)
+    }
+
+    func testUsageChartRangeIncludesPriorAllowanceWindows() {
+        let historical = Date(timeIntervalSince1970: 1_000)
+        let currentWindow = DateInterval(
+            start: Date(timeIntervalSince1970: 4_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        let chart = UsageChartSnapshot(
+            observedSource: .account,
+            target: [],
+            currentProjection: [],
+            currentAllowanceReset: currentWindow.end,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: Date(timeIntervalSince1970: 2_000),
+                    observedSegments: [[
+                        UsageChartPoint(date: historical, remaining: 40)
+                    ]]
+                ),
+                UsageAllowanceWindowSeries(
+                    resetsAt: currentWindow.end,
+                    observedSegments: [[
+                        UsageChartPoint(
+                            date: Date(timeIntervalSince1970: 5_000),
+                            remaining: 70
+                        )
+                    ]]
+                )
+            ],
+            currentRunsFaster: false,
+            accessibilityValue: "Observed usage"
+        )
+
+        XCTAssertEqual(
+            chart.availableRange(including: currentWindow),
+            DateInterval(start: historical, end: currentWindow.end)
+        )
+    }
+
+    func testHistoricalUsagePresetsReachBeyondTheCurrentWindow() {
+        let suite = "AnalyticsWorkspaceTests.historicalUsagePresets"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AnalyticsWorkspaceStore(defaults: defaults)
+        let observedAt = Date(timeIntervalSince1970: 10_000_000)
+        let oldest = observedAt.addingTimeInterval(-84 * 86_400)
+        let currentWindow = DateInterval(
+            start: observedAt.addingTimeInterval(-7 * 86_400),
+            end: observedAt.addingTimeInterval(86_400)
+        )
+        let chart = UsageChartSnapshot(
+            observedSource: .account,
+            target: [],
+            currentProjection: [],
+            currentAllowanceReset: currentWindow.end,
+            allowanceWindows: [
+                UsageAllowanceWindowSeries(
+                    resetsAt: oldest.addingTimeInterval(7 * 86_400),
+                    observedSegments: [[
+                        UsageChartPoint(date: oldest, remaining: 100)
+                    ]]
+                ),
+                UsageAllowanceWindowSeries(
+                    resetsAt: currentWindow.end,
+                    observedSegments: [[
+                        UsageChartPoint(date: observedAt, remaining: 70)
+                    ]]
+                )
+            ],
+            currentRunsFaster: false,
+            accessibilityValue: "Observed usage"
+        )
+        let bounds = chart.availableRange(including: currentWindow)
+
+        store.selectTimeRange(.fourWeeks)
+        XCTAssertEqual(
+            store.effectiveRange(within: bounds, endingAt: observedAt),
+            DateInterval(
+                start: observedAt.addingTimeInterval(-28 * 86_400),
+                end: observedAt
+            )
+        )
+
+        store.selectTimeRange(.twelveWeeks)
+        XCTAssertEqual(
+            store.effectiveRange(within: bounds, endingAt: observedAt),
+            DateInterval(start: oldest, end: observedAt)
+        )
+    }
+
     func testKeyboardPointNavigationStartsWithoutPointerSelection() {
         let first = Date(timeIntervalSince1970: 4_000)
         let second = Date(timeIntervalSince1970: 5_000)

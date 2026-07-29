@@ -297,6 +297,14 @@ struct UsageChartSnapshot: Equatable, Sendable {
         observedSegments.flatMap { $0 }
     }
 
+    var allObservedSegments: [[UsageChartPoint]] {
+        allowanceWindows.flatMap(\.observedSegments)
+    }
+
+    var allObserved: [UsageChartPoint] {
+        allObservedSegments.flatMap { $0 }
+    }
+
     var historicalProjection: [UsageChartPoint] {
         reference?.source == .accountHistory ? reference?.points ?? [] : []
     }
@@ -566,17 +574,9 @@ enum UsageIntelligenceEngine {
                 forecast: forecast
             )
         }
-        let chartSamples = input.samples.filter { sample in
-            guard let currentReset = input.account?.mainLimit?.window.resetsAt,
-                  sample.resetsAt == currentReset,
-                  let epoch = input.accountEpochStartedAt else {
-                return true
-            }
-            return sample.observedAt >= epoch
-        }
         let chart = chart(
             account: input.account,
-            samples: chartSamples,
+            samples: input.samples,
             guidance: guidance,
             safetyBuffer: input.safetyBuffer
         )

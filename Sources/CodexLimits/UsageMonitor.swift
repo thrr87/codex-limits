@@ -32,6 +32,8 @@ final class UsageMonitor: ObservableObject {
     private static let historyAuthStateKey = "historyAccountState"
     private static let historyPlanTypeKey = "historyAccountPlanType"
     private static let historyAccountEpochStartedAtKey = "historyAccountEpochStartedAt"
+    private static let historyAccountEpochMigrationVersionKey =
+        "historyAccountEpochMigrationVersion"
     private static let historySyncSelectedKey = "historySyncSelected"
     private static let historySyncAccountBindingKey = "historySyncAccountBinding"
     private static let localHistoryDeletionCutoffKey =
@@ -217,6 +219,7 @@ final class UsageMonitor: ObservableObject {
             }
             let historyState = await exchangeHistory()
             apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
+            repairInitialAccountEpochIfNeeded()
             let exchangeErrorMessage = historyState.errorMessage
             let newSnapshot = result.snapshot
             if let window = newSnapshot.mainLimit?.window {
@@ -362,6 +365,7 @@ final class UsageMonitor: ObservableObject {
         let previousPlanType = defaults.string(
             forKey: Self.historyPlanTypeKey
         )
+        var migratedEpoch: Date?
         switch observation {
         case let .stable(identity):
             historyAccountIdentity = identity
@@ -370,6 +374,11 @@ final class UsageMonitor: ObservableObject {
                 key: Self.fingerprintKey(in: defaults)
             )
             authState = "stable:\(partition.id)"
+            if previousAuthState == nil, accountEpochStartedAt == nil {
+                migratedEpoch = legacySamplesAwaitingMigration
+                    .map(\.observedAt)
+                    .min()
+            }
         case let .unknown(state):
             historyAccountIdentity = nil
             authState = "unknown:\(state)"
@@ -386,9 +395,10 @@ final class UsageMonitor: ObservableObject {
         if previousAuthState != authState
             || planChanged
             || accountEpochStartedAt == nil {
-            accountEpochStartedAt = observedAt
+            let epoch = migratedEpoch ?? observedAt
+            accountEpochStartedAt = epoch
             defaults.set(
-                observedAt,
+                epoch,
                 forKey: Self.historyAccountEpochStartedAtKey
             )
         }
@@ -419,6 +429,46 @@ final class UsageMonitor: ObservableObject {
         if historyPrepared {
             persist()
         }
+    }
+
+    private func repairInitialAccountEpochIfNeeded() {
+        guard defaults.integer(
+            forKey: Self.historyAccountEpochMigrationVersionKey
+        ) < 1,
+        historyAccountIdentity != nil,
+        historyUsesFiles,
+        !defaults.bool(forKey: Self.historySyncSelectedKey)
+            || historyConnectionActive else {
+            return
+        }
+        defer {
+            defaults.set(
+                1,
+                forKey: Self.historyAccountEpochMigrationVersionKey
+            )
+        }
+        guard let epoch = accountEpochStartedAt,
+              let epochSample = samples.first(where: {
+                  $0.observedAt == epoch && $0.comparisonBreak
+              }),
+              !samples.contains(where: {
+                  $0.observedAt < epoch && $0.comparisonBreak
+              }) else {
+            return
+        }
+        let earlierDates = samples.compactMap {
+            $0.resetsAt == epochSample.resetsAt && $0.observedAt < epoch
+                ? $0.observedAt
+                : nil
+        }
+        guard let restoredEpoch = earlierDates.min() else {
+            return
+        }
+        accountEpochStartedAt = restoredEpoch
+        defaults.set(
+            restoredEpoch,
+            forKey: Self.historyAccountEpochStartedAtKey
+        )
     }
 
     func deleteAnalyticsHistory() async {

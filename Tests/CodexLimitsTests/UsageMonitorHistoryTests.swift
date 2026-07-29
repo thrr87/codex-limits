@@ -252,6 +252,31 @@ final class UsageMonitorHistoryTests: XCTestCase {
             monitor.readerSnapshot.accountTokenActivity.reason,
             "No lifetime token reading at the weekly boundary"
         )
+
+        defaults.removeObject(
+            forKey: "historyAccountEpochMigrationVersion"
+        )
+        let restartSource = FetchSequence([
+            makeFetchResult(
+                identity: "first@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_060),
+                remaining: 79,
+                lifetimeTokens: 1_610
+            )
+        ])
+        let restarted = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await restartSource.next() }
+        )
+
+        await restarted.refresh()
+
+        XCTAssertEqual(
+            defaults.object(forKey: "historyAccountEpochStartedAt") as? Date,
+            Date(timeIntervalSince1970: 1_900_000)
+        )
     }
 
     func testPlanChangeRecordsADurableComparisonBreak() async throws {
@@ -985,6 +1010,133 @@ final class UsageMonitorHistoryTests: XCTestCase {
         await monitor.refresh()
 
         XCTAssertEqual(monitor.samples.map(\.remainingPercent), [81, 80])
+    }
+
+    func testFirstStableAccountKeepsLegacyCurrentWindowCoverage() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let windowStart = Date(timeIntervalSince1970: 1_395_200)
+        let fetchedAt = Date(timeIntervalSince1970: 1_900_000)
+        let observations = Array(
+            stride(
+                from: windowStart.timeIntervalSince1970,
+                to: fetchedAt.timeIntervalSince1970,
+                by: 30 * 60
+            )
+        )
+        let legacy = observations.enumerated().map { index, timestamp in
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: timestamp),
+                remainingPercent:
+                    100 - 20 * Double(index) / Double(observations.count),
+                resetsAt: Date(timeIntervalSince1970: 2_000_000)
+            )
+        }
+        defaults.set(
+            try JSONEncoder().encode(StoredStateFixture(
+                snapshot: nil,
+                samples: legacy,
+                previousStatus: nil
+            )),
+            forKey: "usageState"
+        )
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 80
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.refresh()
+
+        XCTAssertEqual(monitor.readerSnapshot.evidence.coverage, .complete)
+        XCTAssertEqual(monitor.readerSnapshot.evidence.confidence, .high)
+    }
+
+    func testExistingV02EpochRestoresEarlierFileBackedCoverage() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let windowStart = Date(timeIntervalSince1970: 1_395_200)
+        let firstReadAt = Date(timeIntervalSince1970: 1_900_000)
+        let firstSource = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: firstReadAt,
+                remaining: 80
+            )
+        ])
+        let first = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await firstSource.next() }
+        )
+        await first.refresh()
+        defaults.removeObject(
+            forKey: "historyAccountEpochMigrationVersion"
+        )
+        let partitionData = try XCTUnwrap(
+            defaults.data(forKey: "historyAccountPartition")
+        )
+        let partition = try JSONDecoder().decode(
+            AccountHistoryPartition.self,
+            from: partitionData
+        )
+        let observations = Array(
+            stride(
+                from: windowStart.timeIntervalSince1970,
+                to: firstReadAt.timeIntervalSince1970,
+                by: 30 * 60
+            )
+        )
+        let legacy = observations.enumerated().map { index, timestamp in
+            UsageSample(
+                observedAt: Date(timeIntervalSince1970: timestamp),
+                remainingPercent:
+                    100 - 20 * Double(index) / Double(observations.count),
+                resetsAt: Date(timeIntervalSince1970: 2_000_000)
+            )
+        }
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "v02-fixture",
+            partition: partition
+        )
+        _ = await history.load(legacySamples: legacy)
+        let secondReadAt = firstReadAt.addingTimeInterval(60)
+        let secondSource = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: secondReadAt,
+                remaining: 79
+            )
+        ])
+        let restarted = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await secondSource.next() }
+        )
+
+        await restarted.refresh()
+
+        XCTAssertEqual(restarted.readerSnapshot.evidence.coverage, .complete)
+        XCTAssertEqual(restarted.readerSnapshot.evidence.confidence, .high)
+        XCTAssertEqual(
+            defaults.object(forKey: "historyAccountEpochStartedAt") as? Date,
+            windowStart
+        )
     }
 
     func testUnresolvableSavedSyncTargetKeepsDeletionPending() async throws {

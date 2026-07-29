@@ -1277,6 +1277,40 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    func testAccountEpochDoesNotHideStoredChartPoints() {
+        let now = Date(timeIntervalSince1970: 6_400_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let beforeEpoch = now.addingTimeInterval(-2 * 3_600)
+        let afterEpoch = now.addingTimeInterval(-30 * 60)
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: beforeEpoch,
+                        remainingPercent: 80,
+                        resetsAt: reset
+                    ),
+                    UsageSample(
+                        observedAt: afterEpoch,
+                        remainingPercent: 72,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountEpochStartedAt: now.addingTimeInterval(-3_600)
+            )
+        )
+
+        XCTAssertTrue(
+            reader.chart.observed.contains { $0.date == beforeEpoch }
+        )
+    }
+
     func testSparseHistoryWithholdsGuidance() {
         let now = Date(timeIntervalSince1970: 6_000_000)
         let reader = UsageIntelligenceEngine.evaluate(

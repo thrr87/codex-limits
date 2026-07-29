@@ -376,7 +376,7 @@ struct UsageChartSelection: Equatable, Sendable {
     private static func candidates(
         in chart: UsageChartSnapshot
     ) -> [Candidate] {
-        chart.observed.map {
+        chart.allObserved.map {
             Candidate(
                 series: .observed,
                 point: $0,
@@ -463,8 +463,21 @@ struct UsageChartSelection: Equatable, Sendable {
 }
 
 extension UsageChartSnapshot {
+    func availableRange(
+        including currentWindow: DateInterval
+    ) -> DateInterval {
+        guard let first = allObserved.first?.date,
+              let last = allObserved.last?.date else {
+            return currentWindow
+        }
+        return DateInterval(
+            start: min(first, currentWindow.start),
+            end: max(last, currentWindow.end)
+        )
+    }
+
     var preferredZoomAnchor: Date? {
-        observed.last?.date
+        allObserved.last?.date
     }
 }
 

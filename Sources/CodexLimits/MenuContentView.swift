@@ -2087,12 +2087,19 @@ private struct UsageRemainingChart: View {
     @State private var rangeStart: Date?
     @State private var keyboardRangeStart: Date?
 
-    private var bounds: DateInterval {
+    private var currentWindowBounds: DateInterval {
         DateInterval(start: window.startsAt, end: window.resetsAt)
     }
 
+    private var bounds: DateInterval {
+        chart.availableRange(including: currentWindowBounds)
+    }
+
     private var visibleRange: DateInterval {
-        store.effectiveRange(
+        if store.state.timeRange == .currentWindow {
+            return currentWindowBounds
+        }
+        return store.effectiveRange(
             within: bounds,
             endingAt: chart.preferredZoomAnchor ?? min(Date(), bounds.end)
         )
@@ -2103,9 +2110,16 @@ private struct UsageRemainingChart: View {
     }
 
     private var xAxisDates: [Date] {
-        let step: TimeInterval = visibleRange.duration <= 2 * 86_400
-            ? 6 * 3_600
-            : 86_400
+        let step: TimeInterval
+        if visibleRange.duration <= 2 * 86_400 {
+            step = 6 * 3_600
+        } else if visibleRange.duration <= 10 * 86_400 {
+            step = 86_400
+        } else if visibleRange.duration <= 35 * 86_400 {
+            step = 7 * 86_400
+        } else {
+            step = 14 * 86_400
+        }
         return Array(
             stride(
                 from: visibleRange.start,
@@ -2138,12 +2152,21 @@ private struct UsageRemainingChart: View {
                         .foregroundStyle(Color.secondary)
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
-                            Text(
-                                date,
-                                format: visibleRange.duration <= 2 * 86_400
-                                    ? .dateTime.hour()
-                                    : .dateTime.weekday(.abbreviated)
-                            )
+                            if visibleRange.duration <= 2 * 86_400 {
+                                Text(date, format: .dateTime.hour())
+                            } else if visibleRange.duration <= 10 * 86_400 {
+                                Text(
+                                    date,
+                                    format: .dateTime.weekday(.abbreviated)
+                                )
+                            } else {
+                                Text(
+                                    date,
+                                    format: .dateTime
+                                        .month(.abbreviated)
+                                        .day()
+                                )
+                            }
                         }
                     }
                     .foregroundStyle(Color.secondary)
@@ -2223,7 +2246,7 @@ private struct UsageRemainingChart: View {
     private var selectedRangeDetail: some View {
         if store.state.timeRange == .selected,
            let range = store.state.visibleRange {
-            let points = chart.observed
+            let points = chart.allObserved
                 .filter { range.contains($0.date) }
                 .sorted { $0.date < $1.date }
             if let first = points.first, let last = points.last {
@@ -2233,7 +2256,11 @@ private struct UsageRemainingChart: View {
                     )
                     .monospacedDigit()
                     Text(
-                        "\(chart.observedSource.rawValue) · \(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
+                        evidenceLabel(
+                            inCurrentWindow:
+                                range.start >= currentWindowBounds.start
+                                && range.end <= currentWindowBounds.end
+                        )
                     )
                     .foregroundStyle(.secondary)
                 }
@@ -2289,7 +2316,7 @@ private struct UsageRemainingChart: View {
     @ChartContentBuilder
     private var observedMarks: some ChartContent {
         ForEach(
-            Array(chart.observedSegments.enumerated()),
+            Array(chart.allObservedSegments.enumerated()),
             id: \.offset
         ) { segmentIndex, segment in
             ForEach(segment) { point in
@@ -2410,14 +2437,13 @@ private struct UsageRemainingChart: View {
         .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
 
         if let selection {
-            Text(
-                "\(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
+            let label = evidenceLabel(
+                inCurrentWindow: currentWindowBounds.contains(selection.date)
             )
+            Text(label)
             .font(.caption)
             .foregroundStyle(.secondary)
-            .accessibilityLabel(
-                "\(evidence.coverage.displayName) coverage, \(evidence.confidence.displayName) confidence"
-            )
+            .accessibilityLabel(label)
 
             HStack(spacing: 10) {
                 if let keyboardRangeStart {
@@ -2566,6 +2592,13 @@ private struct UsageRemainingChart: View {
         case .pastEstimate: .secondary
         case .estimatedBackfill: .orange
         }
+    }
+
+    private func evidenceLabel(
+        inCurrentWindow: Bool
+    ) -> String {
+        guard inCurrentWindow else { return "Account history" }
+        return "\(chart.observedSource.rawValue) · \(evidence.coverage.displayName) coverage · \(evidence.confidence.displayName) confidence"
     }
 
 }
