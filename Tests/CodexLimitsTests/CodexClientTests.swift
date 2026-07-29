@@ -136,6 +136,31 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(server.threadReadCount, 1)
     }
 
+    func testThreadProjectionRejectsResultAndErrorEnvelope() async {
+        let server = PersistentAppServerFixture(
+            errorBodiesByMethod: [
+                "thread/list":
+                    #"{"code":-32603,"message":"Error"},"result":{"data":[],"nextCursor":null}"#
+            ]
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+        let source = ReadOnlyThreadProjectionSource { request in
+            try await client.threadProjectionResponse(for: request)
+        }
+
+        do {
+            _ = try await source.list(cursor: nil, limit: 25)
+            XCTFail("Expected result and error to be rejected")
+        } catch is DecodingError {
+            // Expected.
+        } catch {
+            XCTFail("Expected DecodingError, got \(error)")
+        }
+    }
+
     func testReadsInstalledCLIVersionFromTheInitializedSession() async throws {
         let server = PersistentAppServerFixture(
             initializeUserAgent: "Codex Desktop/0.145.0 (Mac OS 15.5)"
@@ -446,6 +471,66 @@ final class CodexClientTests: XCTestCase {
             XCTFail("Expected invalidResponse, got \(error)")
         }
         XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testUsageRPCErrorKeepsRateLimitsAvailable() async throws {
+        let server = PersistentAppServerFixture(
+            errorBodiesByMethod: [
+                "account/usage/read":
+                    #"{"code":-32603,"message":"Usage is temporarily unavailable"}"#
+            ]
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+
+        let result = try await client.fetch(
+            fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+        )
+
+        XCTAssertEqual(result.snapshot.mainLimit?.window.remainingPercent, 80)
+        XCTAssertEqual(result.snapshot.tokenHistory, [])
+        XCTAssertEqual(
+            result.account,
+            .stable(identity: "user@example.com")
+        )
+    }
+
+    func testRequiredRPCErrorRemainsFatal() async {
+        let error =
+            #"{"code":-32603,"message":"Temporarily unavailable"}"#
+
+        for method in ["initialize", "account/rateLimits/read"] {
+            await assertInvalidFetch(
+                errorBodiesByMethod: [method: error]
+            )
+        }
+    }
+
+    func testNullInitializationResultRemainsFatal() async {
+        await assertInvalidFetch(
+            initializationResultBody: "null"
+        )
+    }
+
+    func testMalformedUsageRPCErrorRemainsFatal() async {
+        let malformedErrors = [
+            "null",
+            #""bad envelope""#,
+            #"{"message":"Missing code"}"#,
+            #"{"code":-32603}"#,
+            #"{"code":-32603.5,"message":"Code must be an integer"}"#,
+            #"{"code":-32603,"message":"Error"},"result":{}"#,
+            #"null,"result":{}"#,
+            #"{"code":-32603,"message":"Error"},"result":null"#
+        ]
+
+        for error in malformedErrors {
+            await assertInvalidFetch(
+                errorBodiesByMethod: ["account/usage/read": error]
+            )
+        }
     }
 
     func testMissingWeeklyWindowKeepsOtherLimitsWithoutRestarting() async throws {
@@ -913,6 +998,36 @@ final class CodexClientTests: XCTestCase {
         XCTAssertNil(result.account)
     }
 
+    private func assertInvalidFetch(
+        errorBodiesByMethod: [String: String] = [:],
+        initializationResultBody: String? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let server = PersistentAppServerFixture(
+            errorBodiesByMethod: errorBodiesByMethod,
+            initializationResultBody: initializationResultBody
+        )
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1
+        )
+        do {
+            _ = try await client.fetch(
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000)
+            )
+            XCTFail("Expected invalidResponse", file: file, line: line)
+        } catch CodexClientError.invalidResponse {
+            // Expected.
+        } catch {
+            XCTFail(
+                "Expected invalidResponse, got \(error)",
+                file: file,
+                line: line
+            )
+        }
+    }
+
 }
 
 private final class ExecutableIdentityFixture: @unchecked Sendable {
@@ -946,6 +1061,8 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
     private let delaysFirstRateLimitResponse: Bool
     private let initializeUserAgent: String?
     private let includesChangingResetDetails: Bool
+    private let errorBodiesByMethod: [String: String]
+    private let initializationResultBody: String?
     private var connections = 0
     private var initializations = 0
     private var rateLimitReads = 0
@@ -994,7 +1111,9 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         omitsWeeklyWindow: Bool = false,
         delaysFirstRateLimitResponse: Bool = false,
         initializeUserAgent: String? = nil,
-        includesChangingResetDetails: Bool = false
+        includesChangingResetDetails: Bool = false,
+        errorBodiesByMethod: [String: String] = [:],
+        initializationResultBody: String? = nil
     ) {
         self.dropsFirstConnection = dropsFirstConnection
         self.stallsFirstConnection = stallsFirstConnection
@@ -1008,6 +1127,8 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
         self.delaysFirstRateLimitResponse = delaysFirstRateLimitResponse
         self.initializeUserAgent = initializeUserAgent
         self.includesChangingResetDetails = includesChangingResetDetails
+        self.errorBodiesByMethod = errorBodiesByMethod
+        self.initializationResultBody = initializationResultBody
     }
 
     func makeConnection() throws -> CodexAppServerConnection {
@@ -1027,10 +1148,20 @@ private final class PersistentAppServerFixture: @unchecked Sendable {
                     continue
                 }
                 var response: String
+                if let error = errorBodiesByMethod[method] {
+                    response = #"{"id":\#(id),"error":\#(error)}"#
+                    try responses.fileHandleForWriting.write(
+                        contentsOf: Data((response + "\n").utf8)
+                    )
+                    continue
+                }
                 switch method {
                 case "initialize":
                     lock.withLock { initializations += 1 }
-                    if let initializeUserAgent {
+                    if let initializationResultBody {
+                        response =
+                            #"{"id":\#(id),"result":\#(initializationResultBody)}"#
+                    } else if let initializeUserAgent {
                         response = #"{"id":\#(id),"result":{"userAgent":"\#(initializeUserAgent)"}}"#
                     } else {
                         response = #"{"id":\#(id),"result":{}}"#

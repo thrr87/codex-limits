@@ -443,13 +443,13 @@ actor CodexClient {
             from: connection
         ).values[initializeID]
         guard let response,
-              let object = try JSONSerialization.jsonObject(
-                with: response
-              ) as? [String: Any],
-              object["error"] == nil else {
+              let result = try? JSONDecoder().decode(
+                  RPCResponse<InitializeResult>.self,
+                  from: response
+              ).result else {
             throw CodexClientError.invalidResponse
         }
-        serverCLIVersion = Self.serverCLIVersion(in: object)
+        serverCLIVersion = Self.serverCLIVersion(in: result.userAgent)
         try Self.write(#"{"method":"initialized"}"#, to: connection.input)
         initialized = true
     }
@@ -491,12 +491,9 @@ actor CodexClient {
     }
 
     private static func serverCLIVersion(
-        in response: [String: Any]
+        in userAgent: String?
     ) -> String? {
-        guard let result = response["result"] as? [String: Any],
-              let userAgent = result["userAgent"] as? String else {
-            return nil
-        }
+        guard let userAgent else { return nil }
         return userAgent.split(separator: " ").compactMap { component in
             let parts = component.split(separator: "/", maxSplits: 1)
             guard parts.count == 2,
@@ -750,10 +747,16 @@ actor CodexClient {
         fetchedAt: Date
     ) throws -> UsageSnapshot {
         let decoder = JSONDecoder()
-        guard let rateResult = try decoder.decode(RPCResponse<RateLimitsResult>.self, from: rateLimitsResponse).result,
-              let usageResult = try decoder.decode(RPCResponse<UsageResult>.self, from: usageResponse).result else {
+        guard let rateResult = try decoder.decode(
+            RPCResponse<RateLimitsResult>.self,
+            from: rateLimitsResponse
+        ).result else {
             throw CodexClientError.invalidResponse
         }
+        let usageResult = try decoder.decode(
+            RPCResponse<UsageResult>.self,
+            from: usageResponse
+        ).result
 
         let snapshots = rateResult.rateLimitsByLimitId ?? ["codex": rateResult.rateLimits]
         let mainSnapshot = snapshots["codex"] ?? rateResult.rateLimits
@@ -788,7 +791,7 @@ actor CodexClient {
         dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
         dateFormatter.dateFormat = "yyyy-MM-dd"
         dateFormatter.isLenient = false
-        let tokenHistory = try (usageResult.dailyUsageBuckets ?? []).map { bucket in
+        let tokenHistory = try (usageResult?.dailyUsageBuckets ?? []).map { bucket in
             guard bucket.tokens >= 0,
                   let date = dateFormatter.date(from: bucket.startDate) else {
                 throw CodexClientError.invalidResponse
@@ -800,7 +803,7 @@ actor CodexClient {
                 completeness: endOfDay <= fetchedAt ? .complete : .partial
             )
         }
-        let summary = usageResult.summary
+        let summary = usageResult?.summary
         let summaryCounts = [
             summary?.lifetimeTokens,
             summary?.peakDailyTokens,
@@ -1011,8 +1014,41 @@ actor CodexClient {
 
 }
 
-private struct RPCResponse<Result: Decodable>: Decodable {
+private struct RPCError: Decodable {
+    let code: Int
+    let message: String
+}
+
+private struct InitializeResult: Decodable {
+    let userAgent: String?
+}
+
+struct RPCResponse<Result: Decodable>: Decodable {
     let result: Result?
+    private let error: RPCError?
+
+    private enum CodingKeys: String, CodingKey {
+        case result
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let containsOneMember =
+            container.contains(.result) != container.contains(.error)
+        result = try container.decodeIfPresent(Result.self, forKey: .result)
+        error = try container.decodeIfPresent(RPCError.self, forKey: .error)
+        guard containsOneMember,
+              (result != nil) != (error != nil) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription:
+                        "JSON-RPC response needs either result or error"
+                )
+            )
+        }
+    }
 }
 
 private struct RateLimitsResult: Decodable {

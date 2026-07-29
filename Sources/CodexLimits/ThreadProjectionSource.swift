@@ -61,12 +61,15 @@ struct ReadOnlyThreadProjectionSource: Sendable {
             )
         )
         let response = try JSONDecoder().decode(
-            ThreadListRPCResponse.self,
+            RPCResponse<ThreadListResult>.self,
             from: data
         )
+        guard let result = response.result else {
+            throw CodexClientError.invalidResponse
+        }
         return ThreadProjectionPage(
-            tasks: response.result.data.map(projection),
-            nextCursor: response.result.nextCursor
+            tasks: result.data.map(projection),
+            nextCursor: result.nextCursor
         )
     }
 
@@ -75,10 +78,13 @@ struct ReadOnlyThreadProjectionSource: Sendable {
             .read(threadID: threadID, includeTurns: false)
         )
         let response = try JSONDecoder().decode(
-            ThreadReadRPCResponse.self,
+            RPCResponse<ThreadReadResult>.self,
             from: data
         )
-        return projection(response.result.thread)
+        guard let result = response.result else {
+            throw CodexClientError.invalidResponse
+        }
+        return projection(result.thread)
     }
 
     private func projection(_ thread: ThreadProjectionWire) -> ThreadProjection {
@@ -113,21 +119,13 @@ struct ReadOnlyThreadProjectionSource: Sendable {
     }
 }
 
-private struct ThreadListRPCResponse: Decodable {
-    let result: Result
-
-    struct Result: Decodable {
-        let data: [ThreadProjectionWire]
-        let nextCursor: String?
-    }
+private struct ThreadListResult: Decodable {
+    let data: [ThreadProjectionWire]
+    let nextCursor: String?
 }
 
-private struct ThreadReadRPCResponse: Decodable {
-    let result: Result
-
-    struct Result: Decodable {
-        let thread: ThreadProjectionWire
-    }
+private struct ThreadReadResult: Decodable {
+    let thread: ThreadProjectionWire
 }
 
 private struct ThreadProjectionWire: Decodable {
