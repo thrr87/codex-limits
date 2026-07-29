@@ -4,6 +4,77 @@ import XCTest
 @testable import CodexLimits
 
 final class LocalActivityPerformanceTests: XCTestCase {
+    func testPersistedFactRestoreStaysResponsive() async throws {
+        let root = temporaryDirectory()
+        let rolloutDirectory = root.appendingPathComponent(
+            "2026/07/28",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: rolloutDirectory,
+            withIntermediateDirectories: true
+        )
+        let rollout = rolloutDirectory.appendingPathComponent(
+            "rollout-2026-07-28T10-00-00-benchmark.jsonl"
+        )
+        let recordCount = 20_000
+        var fixture =
+            #"{"timestamp":"2026-07-28T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"benchmark","cli_version":"0.145.0"}}"#
+            + "\n"
+        fixture.reserveCapacity(recordCount * 180)
+        for ordinal in 1...recordCount {
+            fixture +=
+                #"{"timestamp":"2026-07-28T10:00:01.000Z","ordinal":\#(ordinal),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":\#(ordinal * 100)}}}}"#
+                + "\n"
+        }
+        try Data(fixture.utf8).write(to: rollout)
+        fixture.removeAll(keepingCapacity: false)
+
+        let stateDirectory = root.appendingPathComponent(
+            "state",
+            isDirectory: true
+        )
+        let interval = DateInterval(
+            start: try XCTUnwrap(
+                ISO8601DateFormatter().date(from: "2026-07-28T00:00:00Z")
+            ),
+            end: try XCTUnwrap(
+                ISO8601DateFormatter().date(from: "2026-07-29T00:00:00Z")
+            )
+        )
+        let first = LocalActivityCollector(
+            rootDirectory: root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("benchmark")
+        _ = await first.refresh(interval: interval)
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("benchmark")
+        let start = ProcessInfo.processInfo.systemUptime
+        let restored = await restarted.refresh(interval: interval)
+        let milliseconds =
+            (ProcessInfo.processInfo.systemUptime - start) * 1_000
+
+        print(
+            String(
+                format: "PERSISTED_FACT_RESTORE records=%d wall_ms=%.3f",
+                restored.facts.count,
+                milliseconds
+            )
+        )
+        XCTAssertEqual(restored.bytesRead, 0)
+        XCTAssertEqual(
+            restored.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta).count,
+            recordCount - 1
+        )
+        XCTAssertLessThan(milliseconds, 3_000)
+    }
+
     func testRepresentativeFixtureMetrics() throws {
         let directory = temporaryDirectory()
         try FileManager.default.createDirectory(
