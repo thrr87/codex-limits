@@ -135,7 +135,7 @@ enum ForecastEngine {
         .map(\.1)
     }
 
-    private static func median(_ values: [Double]) -> Double {
+    static func median(_ values: [Double]) -> Double {
         let ordered = values.sorted()
         guard !ordered.isEmpty else { return 0 }
         let middle = ordered.count / 2
