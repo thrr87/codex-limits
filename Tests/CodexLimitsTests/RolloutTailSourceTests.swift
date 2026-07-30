@@ -791,6 +791,32 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertGreaterThan(batch.cursor.byteOffset, 0)
     }
 
+    func testTokenActivityScopeSkipsLargeUnusedPayloadsBeforeDecode() throws {
+        let fixture = try TemporaryRollout()
+        let unused = String(repeating: "x", count: 1_000_000)
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"response_item","payload":{"type":"message","content":"\#(unused)","broken":not-json}}"#
+                + "\n"
+                + #"{"timestamp":"2026-07-27T10:00:10.000Z","ordinal":1,"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","output":"\#(unused)","broken":not-json}}}"#
+                + "\n"
+                + #"{"timestamp":"2026-07-27T10:00:20.000Z","ordinal":2,"type":"compacted","payload":{"replacement_history":"\#(unused)","broken":not-json}}"#
+                + "\n"
+                + #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200}}}}"#
+                + "\n"
+        )
+
+        let batch = try IncrementalRolloutTailSource().read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            recordScope: .tokenActivity
+        )
+
+        XCTAssertEqual(batch.records.map(\.totalTokens), [200])
+        XCTAssertEqual(batch.unsupportedRecordCount, 3)
+        XCTAssertEqual(batch.malformedRecordCount, 0)
+    }
+
     func testCompactedRecordSkipsItsUnusedLargePayload() throws {
         let fixture = try TemporaryRollout()
         let sourceContent = String(repeating: "x", count: 1_000_000)

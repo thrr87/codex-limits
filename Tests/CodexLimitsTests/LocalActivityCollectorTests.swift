@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import CodexLimits
 
 final class LocalActivityCollectorTests: XCTestCase {
@@ -2384,6 +2385,1118 @@ final class LocalActivityCollectorTests: XCTestCase {
             7
         )
     }
+
+    func testStoredTokenActivityStreamsLargeLegacyFactsAcrossRestartAndCutoff()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        _ = await seed.refresh(
+            interval: interval,
+            observedAt: interval.start.addingTimeInterval(60)
+        )
+        let partition = stateDirectory.appendingPathComponent("stable-account")
+        let factsFile = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: partition,
+                includingPropertiesForKeys: nil
+            ).first { $0.lastPathComponent.hasSuffix(".facts.jsonl") }
+        )
+        let template = try XCTUnwrap(
+            String(contentsOf: factsFile, encoding: .utf8)
+                .split(separator: "\n")
+                .compactMap {
+                    try? JSONDecoder().decode(
+                        LocalActivityFact.self,
+                        from: Data($0.utf8)
+                    )
+                }
+                .first { $0.key == .token }
+        )
+        let formatter = ISO8601DateFormatter()
+        let cutoff = try XCTUnwrap(
+            formatter.date(from: "2026-07-28T10:01:30Z")
+        )
+        let firstRetained = try XCTUnwrap(
+            formatter.date(from: "2026-07-28T10:02:00Z")
+        )
+        let generation = template.source.sourceGeneration
+        let tokenLine: (String, Date, Int64, String) -> String = {
+            eventID, date, delta, unusedPayload in
+            """
+            {"key":"token","availability":"available","numericDelta":\(delta),"reason":null,"eventID":"\(eventID)","eventTimestamp":"\(formatter.string(from: date))","source":{"sourceGeneration":\(generation)},"value":{"unusedPayload":"\(unusedPayload)"}}
+            """
+        }
+        var legacy = Data()
+        legacy.append(
+            Data(
+                tokenLine(
+                    "before-cutoff",
+                    cutoff.addingTimeInterval(-30),
+                    99,
+                    ""
+                ).utf8
+            )
+        )
+        legacy.append(0x0A)
+        legacy.append(
+            Data(
+                tokenLine(
+                    "first-retained",
+                    firstRetained,
+                    500,
+                    String(repeating: "x", count: 800_000)
+                ).utf8
+            )
+        )
+        legacy.append(0x0A)
+        for index in 1 ... 9_999 {
+            legacy.append(
+                Data(
+                    tokenLine(
+                        "stored-\(index)",
+                        firstRetained.addingTimeInterval(
+                            TimeInterval(index)
+                        ),
+                        1,
+                        ""
+                    ).utf8
+                )
+            )
+            legacy.append(0x0A)
+        }
+        try legacy.write(to: factsFile)
+        struct TestDeletionMarker: Encodable {
+            let version: Int
+            let cutoff: Date
+            let cleanupPending: Bool
+        }
+        let marker = stateDirectory.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(stateDirectory.lastPathComponent)-deletion.json"
+            )
+        try JSONEncoder().encode(
+            TestDeletionMarker(
+                version: 1,
+                cutoff: cutoff,
+                cleanupPending: false
+            )
+        ).write(to: marker)
+
+        let first = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await first.selectPartition("stable-account")
+        let partial = await first.refreshStoredTokenActivity(
+            interval: interval
+        )
+
+        XCTAssertTrue(partial.importPending)
+        XCTAssertNil(partial.snapshot.tokens)
+        await first.selectPartition("other-account")
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        var completed = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        for _ in 0 ..< 5 where completed.importPending {
+            completed = await restarted.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertFalse(completed.importPending)
+        XCTAssertEqual(completed.snapshot.tokens, 9_999)
+        XCTAssertEqual(completed.snapshot.points.last?.tokens, 9_999)
+        XCTAssertLessThanOrEqual(completed.snapshot.points.count, 1_000)
+    }
+
+    func testStoredTokenActivityRebuildsAnOlderDerivedSchema() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        _ = await seed.refresh(
+            interval: interval,
+            observedAt: interval.start.addingTimeInterval(60)
+        )
+        let database = stateDirectory
+            .appendingPathComponent("stable-account")
+            .appendingPathComponent("local-activity-v1.sqlite3")
+        var connection: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &connection), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                connection,
+                "PRAGMA user_version = 1",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close_v2(connection)
+
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        var result = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        while result.importPending {
+            result = await collector.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivitySkipsSavedSourcesOutsideTheRange() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        _ = await seed.refresh(interval: interval)
+        let partition = stateDirectory.appendingPathComponent("stable-account")
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: partition,
+            includingPropertiesForKeys: nil
+        )
+        let metadata = try XCTUnwrap(
+            entries.first {
+                $0.pathExtension == "json"
+                    && !$0.lastPathComponent.hasSuffix(".facts.jsonl")
+            }
+        )
+        let facts = partition.appendingPathComponent(
+            metadata.deletingPathExtension().lastPathComponent
+                + ".facts.jsonl"
+        )
+        let oldMetadata = partition.appendingPathComponent("old.json")
+        let oldFacts = partition.appendingPathComponent("old.facts.jsonl")
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: metadata))
+                as? [String: Any]
+        )
+        object["activityStart"] = 0.0
+        object["activityEnd"] = 1.0
+        try JSONSerialization.data(withJSONObject: object)
+            .write(to: oldMetadata)
+        try FileManager.default.copyItem(at: facts, to: oldFacts)
+
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root.appendingPathComponent("empty"),
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        var result = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        while result.importPending {
+            result = await collector.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        let database = partition.appendingPathComponent(
+            "local-activity-v1.sqlite3"
+        )
+        var connection: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &connection), SQLITE_OK)
+        defer { sqlite3_close_v2(connection) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(
+                connection,
+                "SELECT COUNT(*) FROM source WHERE is_active = 1",
+                -1,
+                &statement,
+                nil
+            ),
+            SQLITE_OK
+        )
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 1)
+    }
+
+    func testStoredTokenActivityKeepsPersistedMalformedCoverage() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                #"{"timestamp":"2026-07-28T10:01:30Z","type":"event_msg""#,
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        let seeded = await seed.refresh(interval: interval)
+        XCTAssertEqual(
+            seeded.observation.reason,
+            "Some local diagnostic records could not be read"
+        )
+        let emptyRoot = fixture.root.appendingPathComponent(
+            "empty-rollouts",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: emptyRoot,
+            withIntermediateDirectories: true
+        )
+        let restarted = LocalActivityCollector(
+            rootDirectory: emptyRoot,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+
+        var stored = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        for _ in 0 ..< 10 where stored.importPending {
+            stored = await restarted.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertEqual(stored.snapshot.tokens, 500)
+        XCTAssertEqual(stored.snapshot.coverage, .low)
+        XCTAssertEqual(
+            stored.snapshot.reason,
+            "Some local diagnostic records could not be read"
+        )
+    }
+
+    func testStoredTokenActivityKeepsPersistedContinuityGap() async throws {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        _ = await seed.refresh(
+            interval: interval,
+            observedAt: interval.start.addingTimeInterval(60)
+        )
+        var replacement =
+            fixture.session(threadID: "task-1", ordinal: 0) + "\n"
+        for ordinal in 1 ... 5_000 {
+            replacement +=
+                #"{"timestamp":"2026-07-28T10:01:00.000Z","ordinal":\#(ordinal),"type":"compacted","payload":{}}"#
+                + "\n"
+        }
+        replacement += fixture.tokens(
+            total: 900,
+            ordinal: 5_001,
+            minute: 3
+        ) + "\n"
+        try Data(replacement.utf8).write(to: file, options: .atomic)
+        let changed = await seed.refresh(
+            interval: interval,
+            observedAt: interval.start.addingTimeInterval(180)
+        )
+        XCTAssertEqual(
+            changed.observation.reason,
+            "Local task record continuity changed"
+        )
+        let emptyRoot = fixture.root.appendingPathComponent(
+            "empty-rollouts",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: emptyRoot,
+            withIntermediateDirectories: true
+        )
+        let restarted = LocalActivityCollector(
+            rootDirectory: emptyRoot,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+
+        var stored = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        for _ in 0 ..< 10 where stored.importPending {
+            stored = await restarted.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertEqual(stored.snapshot.coverage, .low)
+        XCTAssertEqual(
+            stored.snapshot.reason,
+            "Local task record continuity changed"
+        )
+    }
+
+    func testStoredTokenActivityRetriesEveryFactAfterASQLiteWriteFailure()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let first = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        XCTAssertEqual(first.snapshot.tokens, 500)
+        let partition = stateDirectory.appendingPathComponent(
+            "stable-account",
+            isDirectory: true
+        )
+        let database = partition.appendingPathComponent(
+            "local-activity-v1.sqlite3"
+        )
+        var lock: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &lock), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(lock, "BEGIN IMMEDIATE", nil, nil, nil),
+            SQLITE_OK
+        )
+        defer {
+            sqlite3_exec(lock, "ROLLBACK", nil, nil, nil)
+            sqlite3_close_v2(lock)
+        }
+        try fixture.append(
+            fixture.tokens(total: 800, ordinal: 3, minute: 3),
+            to: file
+        )
+        let failed = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        XCTAssertEqual(failed.snapshot.coverage, .unavailable)
+        XCTAssertEqual(sqlite3_exec(lock, "ROLLBACK", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_close_v2(lock), SQLITE_OK)
+        lock = nil
+        try fixture.append(
+            fixture.tokens(total: 1_000, ordinal: 4, minute: 4),
+            to: file
+        )
+
+        let recovered = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        let unchanged = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+
+        XCTAssertEqual(recovered.snapshot.tokens, 900)
+        XCTAssertEqual(unchanged.snapshot.tokens, 900)
+    }
+
+    func testCancelledStoredTokenRefreshStopsInsteadOfReportingAReadFailure()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let seed = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await seed.selectPartition("stable-account")
+        _ = await seed.refresh(interval: try fixture.interval())
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let refresh = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            return await collector.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+        refresh.cancel()
+
+        let result = await refresh.value
+
+        XCTAssertEqual(result.snapshot.coverage, .unavailable)
+        XCTAssertEqual(
+            result.snapshot.reason,
+            "Local activity read was cancelled"
+        )
+    }
+
+    func testStoredTokenActivityTailsOnlyNewRolloutBytesAfterRestart()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        do {
+            let seed = LocalActivityCollector(
+                rootDirectory: fixture.root,
+                stateDirectory: stateDirectory
+            )
+            await seed.selectPartition("stable-account")
+            _ = await seed.refresh(interval: interval)
+            let importing = await seed.refreshStoredTokenActivity(
+                interval: interval
+            )
+            XCTAssertTrue(importing.importPending)
+            let migrated = await seed.refreshStoredTokenActivity(
+                interval: interval
+            )
+            XCTAssertEqual(migrated.snapshot.tokens, 500)
+        }
+        try fixture.append(
+            fixture.tokens(total: 800, ordinal: 3, minute: 3),
+            to: file
+        )
+        let projectionRequests = CollectorProjectionRequests()
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory,
+            projectionSource: ReadOnlyThreadProjectionSource { request in
+                await projectionRequests.record(request)
+                throw CocoaError(.fileReadUnknown)
+            }
+        )
+        await restarted.selectPartition("stable-account")
+
+        let updated = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        let unchanged = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        let requests = await projectionRequests.values
+
+        XCTAssertEqual(updated.snapshot.tokens, 700)
+        XCTAssertGreaterThan(updated.bytesRead, 0)
+        XCTAssertEqual(unchanged.snapshot.tokens, 700)
+        XCTAssertEqual(unchanged.bytesRead, 0)
+        XCTAssertEqual(requests, [])
+    }
+
+    func testStoredTokenActivityBootstrapsFromRolloutWithoutFullRefresh()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let projectionRequests = CollectorProjectionRequests()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state"),
+            projectionSource: ReadOnlyThreadProjectionSource { request in
+                await projectionRequests.record(request)
+                throw CocoaError(.fileReadUnknown)
+            }
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+        let requests = await projectionRequests.values
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+        XCTAssertGreaterThan(result.bytesRead, 0)
+        XCTAssertEqual(requests, [])
+    }
+
+    func testStoredTokenActivityImportsRawRolloutDirectlyAcrossRestart()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        var lines = [
+            fixture.session(threadID: "task-1", ordinal: 0),
+            fixture.tokens(total: 100, ordinal: 1, minute: 1)
+        ]
+        lines.append(
+            contentsOf: (2 ..< 10_000).map {
+                #"{"timestamp":"2026-07-28T10:01:30.000Z","ordinal":\#($0),"type":"compacted","payload":{}}"#
+            }
+        )
+        lines.append(
+            fixture.tokens(total: 600, ordinal: 10_000, minute: 2)
+        )
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: lines
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let partition = stateDirectory.appendingPathComponent(
+            "stable-account"
+        )
+        let interval = try fixture.interval()
+
+        do {
+            let collector = LocalActivityCollector(
+                rootDirectory: fixture.root,
+                stateDirectory: stateDirectory
+            )
+            await collector.selectPartition("stable-account")
+            let first = await collector.refreshStoredTokenActivity(
+                interval: interval
+            )
+
+            XCTAssertTrue(first.importPending)
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: partition.appendingPathComponent(
+                        "local-activity-v1.sqlite3"
+                    ).path
+                )
+            )
+            XCTAssertEqual(try storedFactSidecars(in: partition), [])
+        }
+
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        var completed = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        for _ in 0 ..< 3 where completed.importPending {
+            completed = await restarted.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertFalse(completed.importPending)
+        XCTAssertEqual(completed.snapshot.tokens, 500)
+        XCTAssertEqual(try storedFactSidecars(in: partition), [])
+    }
+
+    func testStoredTokenActivityCountsOnlyAChildTasksOwnCopiedHistory()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let child = "019fb303-6225-7592-96dd-15504bb96fbd"
+        let parent = "019fa3d9-328e-7ca0-8d40-e61dec66d483"
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: child,
+            lines: [
+                #"{"timestamp":"2026-07-28T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"\#(child)","parent_thread_id":"\#(parent)","cli_version":"0.145.0"}}"#,
+                #"{"timestamp":"2026-07-28T10:00:00.100Z","ordinal":1,"type":"session_meta","payload":{"id":"\#(parent)","cli_version":"0.145.0"}}"#,
+                #"{"timestamp":"2026-07-28T10:00:00.200Z","ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"019fa3da-0000-7000-8000-000000000000"}}"#,
+                #"{"timestamp":"2026-07-28T10:00:00.300Z","ordinal":3,"type":"event_msg","payload":{"type":"task_started","turn_id":"e30f1c44-bcc4-4b16-ab4a-576ed6b5aa46"}}"#,
+                fixture.tokens(total: 100, ordinal: 4, minute: 1),
+                fixture.tokens(total: 600, ordinal: 5, minute: 2),
+                #"{"timestamp":"2026-07-28T10:03:00.000Z","ordinal":6,"type":"event_msg","payload":{"type":"task_started","turn_id":"019fb304-0000-7000-8000-000000000000"}}"#,
+                #"{"timestamp":"2026-07-28T10:04:00.000Z","ordinal":7,"type":"turn_context","payload":{"turn_id":"019fb304-0000-7000-8000-000000000000","model":"gpt-5.6","effort":"high"}}"#,
+                #"{"timestamp":"2026-07-28T10:05:00.000Z","ordinal":8,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":700},"last_token_usage":{"total_tokens":100}}}}"#,
+                #"{"timestamp":"2026-07-28T10:06:00.000Z","ordinal":9,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":900},"last_token_usage":{"total_tokens":200}}}}"#
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 300)
+        XCTAssertEqual(result.filterOptions.models, ["gpt-5.6"])
+        XCTAssertEqual(result.filterOptions.reasoningLevels, ["high"])
+    }
+
+    func testStoredTokenActivityDeduplicatesAResumedTaskCopy()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let task = "019fb303-6225-7592-96dd-15504bb96fbd"
+        let turn = "019fb304-0000-7000-8000-000000000000"
+        let lines = [
+            #"{"timestamp":"2026-07-28T10:00:00.000Z","type":"session_meta","payload":{"id":"\#(task)","cli_version":"0.145.0"}}"#,
+            #"{"timestamp":"2026-07-28T10:00:30.000Z","type":"turn_context","payload":{"turn_id":"\#(turn)","model":"gpt-5.6","effort":"high"}}"#,
+            #"{"timestamp":"2026-07-28T10:01:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#,
+            #"{"timestamp":"2026-07-28T10:02:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":600}}}}"#
+        ]
+        _ = try fixture.rollout(
+            day: "2026/07/27",
+            threadID: task,
+            lines: lines
+        )
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: task,
+            lines: lines
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityBuildsProjectFiltersFromRolloutMetadata()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                """
+                {"timestamp":"2026-07-28T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task-1","cli_version":"0.145.0","cwd":"/work/client-project"}}
+                """,
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.filterOptions.projects, ["client-project"])
+        XCTAssertEqual(result.filterOptions.taskTrees, ["task-1"])
+    }
+
+    func testStoredTokenActivityAdvancesPastOneAcceptedLargeRecord()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let padding = String(repeating: "x", count: 5 * 1_024 * 1_024)
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                #"{"timestamp":"2026-07-28T10:00:30.000Z","ordinal":1,"type":"compacted","payload":{"padding":"\#(padding)"}}"#,
+                fixture.tokens(total: 100, ordinal: 2, minute: 1),
+                fixture.tokens(total: 600, ordinal: 3, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertFalse(result.importPending)
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityFindsAContinuingRolloutFromPreviousDay()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/27",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityFindsARecentlyUpdatedOlderRollout()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/20",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityDiscoversTheWholeSelectedRange() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/06/15",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval(
+                start: "2026-06-01T00:00:00Z",
+                end: "2026-07-29T00:00:00Z"
+            )
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityKeepsLastActiveFactsAfterContinuityChange()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        let first = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        try Data(
+            (
+                fixture.session(threadID: "task-1", ordinal: 0)
+                    + "\n"
+                    + fixture.tokens(total: 900, ordinal: 3, minute: 3)
+                    + "\n"
+            ).utf8
+        ).write(to: file, options: .atomic)
+
+        let changed = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        let unchanged = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+        let afterRestart = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+
+        XCTAssertEqual(first.snapshot.tokens, 500)
+        XCTAssertEqual(changed.snapshot.tokens, 500)
+        XCTAssertEqual(changed.snapshot.coverage, .low)
+        XCTAssertEqual(
+            changed.snapshot.reason,
+            "Local task record continuity changed"
+        )
+        XCTAssertFalse(unchanged.importPending)
+        XCTAssertEqual(unchanged.bytesRead, 0)
+        XCTAssertFalse(afterRestart.importPending)
+        XCTAssertEqual(afterRestart.bytesRead, 0)
+        XCTAssertEqual(afterRestart.snapshot.tokens, 500)
+    }
+
+    func testStoredTokenActivityRebuildsSQLiteFromLegacyAfterLiveAppend()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let stateDirectory = fixture.root.appendingPathComponent("state")
+        let interval = try fixture.interval()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await collector.selectPartition("stable-account")
+        _ = await collector.refreshStoredTokenActivity(interval: interval)
+        try fixture.append(
+            fixture.tokens(total: 800, ordinal: 3, minute: 3),
+            to: file
+        )
+        let updated = await collector.refreshStoredTokenActivity(
+            interval: interval
+        )
+        await collector.selectPartition("other-account")
+        let partition = stateDirectory.appendingPathComponent("stable-account")
+        for name in [
+            "local-activity-v1.sqlite3",
+            "local-activity-v1.sqlite3-wal",
+            "local-activity-v1.sqlite3-shm",
+            "local-activity-v1.sqlite3-journal"
+        ] {
+            let file = partition.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: file.path) {
+                try FileManager.default.removeItem(at: file)
+            }
+        }
+        let restarted = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: stateDirectory
+        )
+        await restarted.selectPartition("stable-account")
+
+        var rebuilt = await restarted.refreshStoredTokenActivity(
+            interval: interval
+        )
+        while rebuilt.importPending {
+            rebuilt = await restarted.refreshStoredTokenActivity(
+                interval: interval
+            )
+        }
+
+        XCTAssertEqual(updated.snapshot.tokens, 700)
+        XCTAssertEqual(rebuilt.snapshot.tokens, 700)
+    }
+
+    func testStoredTokenActivityNoChangeRefreshesReadNoRolloutBytes()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        _ = await collector.refreshStoredTokenActivity(interval: interval)
+
+        for _ in 0 ..< 10 {
+            let unchanged = await collector.refreshStoredTokenActivity(
+                interval: interval
+            )
+            XCTAssertEqual(unchanged.snapshot.tokens, 500)
+            XCTAssertEqual(unchanged.bytesRead, 0)
+        }
+    }
+
+    func testStoredTokenActivityWithoutSavedOrRolloutDataIsUnavailable()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.coverage, .unavailable)
+        XCTAssertEqual(
+            result.snapshot.reason,
+            "No saved local activity is available"
+        )
+    }
+
+    func testStoredTokenActivityLowersCoverageForUncheckedCLIVersion()
+        async throws
+    {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(
+                    threadID: "task-1",
+                    ordinal: 0,
+                    cliVersion: "0.146.0"
+                ),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent("state")
+        )
+        await collector.selectPartition("stable-account")
+
+        let result = await collector.refreshStoredTokenActivity(
+            interval: try fixture.interval()
+        )
+
+        XCTAssertEqual(result.snapshot.tokens, 500)
+        XCTAssertEqual(result.snapshot.coverage, .low)
+        XCTAssertEqual(
+            result.snapshot.reason,
+            "This Codex CLI version has not been checked"
+        )
+    }
+}
+
+private func storedFactSidecars(in directory: URL) throws -> [String] {
+    try FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil
+    )
+    .filter { $0.lastPathComponent.hasSuffix(".facts.jsonl") }
+    .map(\.lastPathComponent)
+    .sorted()
 }
 
 private actor CollectorProjectionRequests {

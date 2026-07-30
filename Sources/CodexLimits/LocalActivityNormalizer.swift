@@ -98,6 +98,9 @@ struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
     var lastTokenUsage: LocalTokenUsage? = nil
     var tokenSegment: UInt64
     var context: LocalActivityContext? = nil
+    var primaryTaskID: String? = nil
+    var awaitsPrimaryTaskStart: Bool? = nil
+    var usesNextContextTokenUsage: Bool? = nil
 }
 
 struct LocalActivityNormalizationResult: Equatable, Sendable {
@@ -143,6 +146,9 @@ struct LocalActivityNormalizer {
                 state.tokenSegment += 1
             }
             state.context = nil
+            state.primaryTaskID = nil
+            state.awaitsPrimaryTaskStart = nil
+            state.usesNextContextTokenUsage = nil
         }
         state.sourceGeneration = sourceGeneration
         if let observedVersion {
@@ -168,6 +174,31 @@ struct LocalActivityNormalizer {
         var currentModelContextWindow = state.context?.modelContextWindow
 
         for record in records {
+            if state.primaryTaskID == nil,
+               record.type == "session_meta",
+               let taskID = record.threadID {
+                state.primaryTaskID = taskID
+                state.awaitsPrimaryTaskStart =
+                    record.parentThreadID == nil ? nil : true
+            }
+            if state.awaitsPrimaryTaskStart == true {
+                guard isPrimaryTaskStart(
+                    record,
+                    taskID: state.primaryTaskID
+                ) else {
+                    continue
+                }
+                state.awaitsPrimaryTaskStart = nil
+                state.lastTotalTokens = nil
+                state.lastTokenUsage = nil
+                state.usesNextContextTokenUsage = true
+                currentTaskID = state.primaryTaskID
+                currentTurnID = nil
+                currentAgent = nil
+                currentModel = nil
+                currentReasoning = nil
+                currentModelContextWindow = nil
+            }
             if let taskID = record.threadID {
                 currentTaskID = taskID
             }
@@ -286,13 +317,15 @@ struct LocalActivityNormalizer {
             }
             if let tokenUsage = record.tokenUsage {
                 let totalTokens = tokenUsage.totalTokens
-                let delta = state.lastTotalTokens.flatMap { previous in
-                    totalTokens >= previous
-                        ? difference(totalTokens, previous)
+                let delta = state.lastTotalTokens.flatMap {
+                    totalTokens >= $0 ? difference(totalTokens, $0) : nil
+                } ?? (
+                    state.usesNextContextTokenUsage == true
+                        ? record.contextTokenUsage?.totalTokens
                         : nil
-                }
+                )
                 let reason: String?
-                if state.lastTotalTokens == nil {
+                if state.lastTotalTokens == nil, delta == nil {
                     reason = sourceChanged ? "source-discontinuity" : "segment-baseline"
                 } else if delta == nil {
                     reason = "cumulative-counter-decreased"
@@ -310,7 +343,12 @@ struct LocalActivityNormalizer {
                         numericDelta: delta,
                         tokenSegment: state.tokenSegment,
                         reason: reason,
-                        eventID: record.eventID,
+                        eventID: tokenEventID(
+                            record: record,
+                            context: context,
+                            totalTokens: totalTokens,
+                            tokenSegment: state.tokenSegment
+                        ),
                         eventTimestamp: record.timestamp,
                         source: source,
                         context: context,
@@ -322,6 +360,7 @@ struct LocalActivityNormalizer {
                 )
                 state.lastTotalTokens = totalTokens
                 state.lastTokenUsage = tokenUsage
+                state.usesNextContextTokenUsage = nil
             }
             if record.tokenUsage == nil,
                let contextTokenUsage = record.contextTokenUsage {
@@ -415,6 +454,47 @@ struct LocalActivityNormalizer {
             facts: facts,
             state: state
         )
+    }
+
+    private func tokenEventID(
+        record: RolloutRecord,
+        context: LocalActivityContext,
+        totalTokens: Int64,
+        tokenSegment: UInt64
+    ) -> String {
+        guard let taskID = context.taskID,
+              let turnID = context.turnID else {
+            return record.eventID
+        }
+        return [
+            "token",
+            taskID,
+            turnID,
+            String(tokenSegment),
+            String(totalTokens)
+        ].joined(separator: "|")
+    }
+
+    private func isPrimaryTaskStart(
+        _ record: RolloutRecord,
+        taskID: String?
+    ) -> Bool {
+        guard record.eventType == "task_started",
+              let taskTimestamp = taskID.flatMap(uuidV7Timestamp),
+              let turnTimestamp = record.turnID.flatMap(uuidV7Timestamp) else {
+            return false
+        }
+        return turnTimestamp >= taskTimestamp
+    }
+
+    private func uuidV7Timestamp(_ value: String) -> UInt64? {
+        let compact = value.replacingOccurrences(of: "-", with: "")
+        guard compact.count == 32,
+              compact[compact.index(compact.startIndex, offsetBy: 12)] == "7"
+        else {
+            return nil
+        }
+        return UInt64(compact.prefix(12), radix: 16)
     }
 
     private func tokenDelta(

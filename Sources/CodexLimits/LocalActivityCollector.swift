@@ -48,11 +48,22 @@ struct LocalActivityCollection: Equatable, Sendable {
     }
 }
 
+struct LocalStoredTokenActivityCollection: Equatable, Sendable {
+    let snapshot: LocalTokenActivitySnapshot
+    let filterOptions: UsageReceiptFilterOptions
+    let observation: LocalActivityObservation
+    let bytesRead: UInt64
+    let importPending: Bool
+}
+
 actor LocalActivityCollector {
     private static let maximumMetadataBytes = 1_048_576
     private static let maximumRefreshLines = 10_000
     private static let maximumRefreshBytes: UInt64 = 8 * 1_024 * 1_024
+    private static let maximumStoredRefreshLines = 10_000
     private static let maximumRolloutRecordBytes = 7 * 1_024 * 1_024
+    private static let maximumStoredRolloutRecordBytes = 256 * 1_024
+    private static let maximumStoredRefreshBytes: UInt64 = 64 * 1_024 * 1_024
 
     private struct ObservationSignature: Equatable {
         let sourceVersion: String?
@@ -107,6 +118,41 @@ actor LocalActivityCollector {
         var facts: [LocalActivityFact]
     }
 
+    private struct StoredTokenImportCheckpoint: Codable {
+        var retainedTokenAfterCutoff: Bool
+    }
+
+    private struct StoredTokenCacheKey: Equatable {
+        let interval: DateInterval
+        let filters: WorkspaceFilters
+    }
+
+    private struct StoredTokenCache {
+        let key: StoredTokenCacheKey
+        let snapshot: LocalTokenActivitySnapshot
+        let filterOptions: UsageReceiptFilterOptions
+    }
+
+    private struct StoredFilterOptionsCache {
+        let interval: DateInterval
+        let options: UsageReceiptFilterOptions
+    }
+
+    private struct StoredTokenFactProjection: Decodable {
+        struct Source: Decodable {
+            let sourceGeneration: UInt64
+        }
+
+        let key: LocalActivityFactKey
+        let availability: LocalActivityAvailability
+        let numericDelta: Int64?
+        let reason: String?
+        let eventID: String?
+        let eventTimestamp: String?
+        let source: Source
+        let context: LocalActivityContext?
+    }
+
     private struct DeletionMarker: Codable {
         let version: Int
         let cutoff: Date
@@ -155,6 +201,9 @@ actor LocalActivityCollector {
     private var refreshGeneration: UInt64 = 0
     private var didReadInstalledCLIVersion = false
     private var cachedInstalledCLIVersion: String?
+    private var storedTokenStore: LocalActivityStore?
+    private var storedTokenCache: StoredTokenCache?
+    private var storedFilterOptionsCache: StoredFilterOptionsCache?
 
     init(
         rootDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -194,6 +243,7 @@ actor LocalActivityCollector {
         guard partitionID != id else { return }
         stateGeneration = nextRevision(after: stateGeneration)
         persist()
+        closeStoredTokenStore()
         partitionID = id
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
@@ -808,6 +858,709 @@ actor LocalActivityCollector {
         )
     }
 
+    func refreshStoredTokenActivity(
+        interval: DateInterval,
+        filters: WorkspaceFilters = .all,
+        observedAt: Date = Date()
+    ) async -> LocalStoredTokenActivityCollection {
+        autoreleasepool {
+            refreshStoredTokenActivitySync(
+                interval: interval,
+                filters: filters,
+                observedAt: observedAt
+            )
+        }
+    }
+
+    private func refreshStoredTokenActivitySync(
+        interval: DateInterval,
+        filters: WorkspaceFilters,
+        observedAt: Date
+    ) -> LocalStoredTokenActivityCollection {
+        guard !historyDeletionPending else {
+            return unavailableStoredTokenActivity(
+                deletionMarkerInvalid
+                    ? "Saved deletion state could not be read"
+                    : "Analytics history deletion is pending",
+                interval: interval
+            )
+        }
+        guard interval.start < interval.end else {
+            return unavailableStoredTokenActivity(
+                "Weekly token interval is unavailable",
+                interval: interval
+            )
+        }
+        do {
+            let store = try openStoredTokenStore()
+            var result = try importStoredTokenFacts(
+                into: store,
+                interval: interval
+            )
+            if result.bytesRead > 0, !result.importPending {
+                result.importPending = true
+                result.gapReason = result.gapReason
+                    ?? "Local task import is still in progress"
+            } else if !result.importPending {
+                result.merge(
+                    try refreshStoredTokenRolloutTail(
+                        in: interval,
+                        observedAt: observedAt,
+                        store: store
+                    )
+                )
+            }
+            guard result.hasSources else {
+                return unavailableStoredTokenActivity(
+                    "No saved local activity is available",
+                    interval: interval
+                )
+            }
+            if result.importPending {
+                let reason = "Local task import is still in progress"
+                let version = result.sourceVersions.sorted().first ?? "unknown"
+                return LocalStoredTokenActivityCollection(
+                    snapshot: .unavailable(reason, interval: interval),
+                    filterOptions: UsageReceiptFilterOptions(
+                        projects: [],
+                        taskTrees: [],
+                        models: [],
+                        reasoningLevels: []
+                    ),
+                    observation: .gap(
+                        sourceVersion: version,
+                        observedAt: observedAt,
+                        reason: reason
+                    ),
+                    bytesRead: result.bytesRead,
+                    importPending: true
+                )
+            }
+            if !result.importPending, result.gapReason == nil {
+                if result.sourceVersions.isEmpty {
+                    result.gapReason = "Codex CLI version is unavailable"
+                } else if result.sourceVersions != Set(["0.145.0"]) {
+                    result.gapReason =
+                        "This Codex CLI version has not been checked"
+                } else {
+                    result.gapReason = "Local task discovery is incomplete"
+                }
+            }
+            let version = result.sourceVersions.sorted().first ?? "unknown"
+            let observation: LocalActivityObservation
+            if let reason = result.gapReason {
+                observation = .gap(
+                    sourceVersion: version,
+                    observedAt: observedAt,
+                    reason: reason
+                )
+            } else {
+                observation = .continuous(
+                    sourceVersion: version,
+                    observedAt: observedAt
+                )
+            }
+            let cacheKey = StoredTokenCacheKey(
+                interval: interval,
+                filters: filters
+            )
+            if result.bytesRead == 0,
+               let cached = storedTokenCache,
+               cached.key == cacheKey {
+                return LocalStoredTokenActivityCollection(
+                    snapshot: cached.snapshot.updating(
+                        interval: interval,
+                        observation: observation
+                    ),
+                    filterOptions: cached.filterOptions,
+                    observation: observation,
+                    bytesRead: 0,
+                    importPending: false
+                )
+            }
+            let snapshot = try store.tokenActivity(
+                in: interval,
+                filters: filters,
+                observation: observation
+            )
+            let filterOptions: UsageReceiptFilterOptions
+            if result.bytesRead == 0,
+               let cached = storedFilterOptionsCache,
+               cached.interval.start <= interval.start,
+               cached.interval.end >= interval.end {
+                filterOptions = cached.options
+            } else {
+                filterOptions = try store.filterOptions(in: interval)
+                storedFilterOptionsCache = StoredFilterOptionsCache(
+                    interval: interval,
+                    options: filterOptions
+                )
+            }
+            storedTokenCache = StoredTokenCache(
+                key: cacheKey,
+                snapshot: snapshot,
+                filterOptions: filterOptions
+            )
+            return LocalStoredTokenActivityCollection(
+                snapshot: snapshot,
+                filterOptions: filterOptions,
+                observation: observation,
+                bytesRead: result.bytesRead,
+                importPending: result.importPending
+            )
+        } catch is CancellationError {
+            return unavailableStoredTokenActivity(
+                "Local activity read was cancelled",
+                interval: interval
+            )
+        } catch {
+            return unavailableStoredTokenActivity(
+                "Saved local activity could not be read",
+                interval: interval
+            )
+        }
+    }
+
+    private struct StoredTokenImportResult {
+        var bytesRead: UInt64 = 0
+        var importPending = false
+        var hasSources = false
+        var sourceVersions = Set<String>()
+        var gapReason: String?
+
+        mutating func merge(_ other: StoredTokenImportResult) {
+            bytesRead += other.bytesRead
+            importPending = importPending || other.importPending
+            hasSources = hasSources || other.hasSources
+            sourceVersions.formUnion(other.sourceVersions)
+            if let reason = other.gapReason {
+                recordGap(reason)
+            }
+        }
+
+        mutating func recordGap(_ reason: String) {
+            guard Self.gapPriority(reason) > Self.gapPriority(gapReason)
+            else {
+                return
+            }
+            gapReason = reason
+        }
+
+        private static func gapPriority(_ reason: String?) -> Int {
+            switch reason {
+            case "Local task record continuity changed":
+                3
+            case "Some local diagnostic records could not be read":
+                2
+            case nil:
+                0
+            default:
+                1
+            }
+        }
+    }
+
+    private func importStoredTokenFacts(
+        into store: LocalActivityStore,
+        interval: DateInterval
+    ) throws -> StoredTokenImportResult {
+        guard let directory = stateURL,
+              let entries = try? FileManager.default.contentsOfDirectory(
+                  at: directory,
+                  includingPropertiesForKeys: nil,
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return StoredTokenImportResult()
+        }
+        var result = StoredTokenImportResult()
+        var remainingLines = Self.maximumStoredRefreshLines
+        var remainingBytes = Self.maximumStoredRefreshBytes
+        for entry in entries.sorted(by: { $0.path < $1.path })
+        where entry.pathExtension == "json" {
+            guard let data = Self.readMetadata(at: entry),
+                  let persisted = try? JSONDecoder().decode(
+                      PersistedFile.self,
+                      from: data
+                  ),
+                  [4, 5, 6, 7].contains(persisted.version) else {
+                result.recordGap("Saved local activity could not be read")
+                continue
+            }
+            if let activityStart = persisted.activityStart,
+               let activityEnd = persisted.activityEnd,
+               activityStart >= interval.end || activityEnd < interval.start {
+                continue
+            }
+            if let discontinuityAt = persisted.discontinuityAt,
+               discontinuityAt >= interval.start,
+               discontinuityAt <= interval.end {
+                result.recordGap("Local task record continuity changed")
+            } else if persisted.hasMalformedRecords == true,
+                      persisted.activityStart.map({ $0 < interval.end })
+                        ?? false,
+                      persisted.activityEnd.map({ $0 >= interval.start })
+                        ?? false {
+                result.recordGap(
+                    "Some local diagnostic records could not be read"
+                )
+            }
+            if persisted.normalization.sourceVersion != "unknown" {
+                result.sourceVersions.insert(
+                    persisted.normalization.sourceVersion
+                )
+            }
+            let fingerprint = entry.deletingPathExtension().lastPathComponent
+            let factsFile = factsURL(
+                forFingerprint: fingerprint,
+                in: directory
+            )
+            guard var source = try storedSource(
+                key: fingerprint,
+                persisted: persisted,
+                factsFile: factsFile
+            ) else {
+                result.recordGap("Saved local activity could not be read")
+                continue
+            }
+            result.hasSources = true
+            if try store.hasActiveSource(matching: source) {
+                continue
+            }
+            guard remainingLines > 0, remainingBytes > 0 else {
+                result.importPending = true
+                break
+            }
+            let replacement: Int64
+            if let resumed = try store.resumableReplacement(matching: source) {
+                replacement = resumed.storeGeneration
+                source = resumed.source
+            } else {
+                replacement = try store.beginReplacement(for: source)
+            }
+            let storedProjections = (
+                [persisted.projection].compactMap { $0 }
+                    + (persisted.ancestorProjections ?? [])
+            ).map(\.withoutRolloutFileURL)
+            do {
+                let step = try readStoredTokenFacts(
+                    from: factsFile,
+                    source: source,
+                    maximumLines: remainingLines,
+                    maximumBytes: remainingBytes
+                )
+                source = step.source
+                try store.appendReplacementTokenFacts(
+                    step.facts,
+                    to: source,
+                    storeGeneration: replacement,
+                    projections: storedProjections
+                )
+                remainingLines = max(
+                    remainingLines - step.linesRead,
+                    0
+                )
+                remainingBytes = step.bytesRead >= remainingBytes
+                    ? 0
+                    : remainingBytes - step.bytesRead
+                let total = result.bytesRead.addingReportingOverflow(
+                    step.bytesRead
+                )
+                result.bytesRead = total.overflow ? .max : total.partialValue
+                if step.complete {
+                    try store.activateReplacement(
+                        sourceKey: source.key,
+                        storeGeneration: replacement
+                    )
+                } else {
+                    result.importPending = true
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try? store.rollbackReplacement(
+                    sourceKey: source.key,
+                    storeGeneration: replacement
+                )
+                result.recordGap("Saved local activity could not be read")
+            }
+        }
+        return result
+    }
+
+    private func refreshStoredTokenRolloutTail(
+        in interval: DateInterval,
+        observedAt: Date,
+        store: LocalActivityStore
+    ) throws -> StoredTokenImportResult {
+        guard FileManager.default.fileExists(atPath: rootDirectory.path) else {
+            return StoredTokenImportResult(
+                gapReason: "Codex local records are unavailable"
+            )
+        }
+        let discoveryInterval = DateInterval(
+            start: interval.start.addingTimeInterval(-86_400),
+            end: interval.end
+        )
+        let paths = Set(
+            storedRolloutFiles(in: discoveryInterval).compactMap(fileKey)
+        )
+        guard !paths.isEmpty else {
+            return StoredTokenImportResult()
+        }
+        var result = StoredTokenImportResult(hasSources: true)
+        var remainingLines = Self.maximumStoredRefreshLines
+        var remainingBytes = Self.maximumStoredRefreshBytes
+
+        for path in paths.sorted(by: >) {
+            try Task.checkCancellation()
+            guard remainingLines > 0, remainingBytes > 0 else {
+                result.importPending = true
+                result.recordGap("Local task import is still in progress")
+                break
+            }
+            let file = fileURL(path)
+            let sourceKey = stateFileName(for: path)
+            let previousSource = try store.activeSource(key: sourceKey)
+            let previousCursor: RolloutCursor?
+            let previousNormalization: LocalActivityNormalizationState?
+            if let previousSource {
+                guard let cursorData = previousSource.cursorJSON,
+                      let normalizationData =
+                          previousSource.normalizationJSON,
+                      let cursor = try? JSONDecoder().decode(
+                          RolloutCursor.self,
+                          from: cursorData
+                      ),
+                      let normalization = try? JSONDecoder().decode(
+                          LocalActivityNormalizationState.self,
+                          from: normalizationData
+                      ) else {
+                    result.recordGap("Saved local activity could not be read")
+                    continue
+                }
+                previousCursor = cursor
+                previousNormalization = normalization
+            } else {
+                previousCursor = nil
+                previousNormalization = nil
+            }
+            if previousSource?.discontinuityAt != nil {
+                if let version = previousNormalization?.sourceVersion,
+                   version != "unknown" {
+                    result.sourceVersions.insert(version)
+                }
+                result.recordGap("Local task record continuity changed")
+                continue
+            }
+            let batch: RolloutTailBatch
+            do {
+                batch = try tail.read(
+                    fileURL: file,
+                    cursor: previousCursor,
+                    observedAt: observedAt,
+                    recordScope: .tokenActivity,
+                    maximumLines: remainingLines,
+                    maximumBytes: remainingBytes,
+                    maximumRecordBytes:
+                        Self.maximumStoredRolloutRecordBytes
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                result.recordGap("Local task records are missing")
+                continue
+            }
+            remainingLines = max(
+                remainingLines - batch.processedLineCount,
+                0
+            )
+            remainingBytes = batch.bytesRead >= remainingBytes
+                ? 0
+                : remainingBytes - batch.bytesRead
+            result.bytesRead += batch.bytesRead
+            if batch.malformedRecordCount > 0 {
+                result.recordGap(
+                    "Some local diagnostic records could not be read"
+                )
+            }
+            if previousSource != nil,
+               batch.requiresRebuild || batch.continuityChanged {
+                if var previousSource {
+                    previousSource.discontinuityAt = observedAt
+                    try store.appendTokenFacts([], to: previousSource)
+                }
+                result.recordGap("Local task record continuity changed")
+                continue
+            }
+            if batch.hasMoreRecords {
+                result.importPending = true
+                result.recordGap("Local task import is still in progress")
+            }
+            if batch.records.isEmpty,
+               batch.cursor == previousCursor,
+               batch.malformedRecordCount == 0 {
+                if let version = previousNormalization?.sourceVersion,
+                   version != "unknown" {
+                    result.sourceVersions.insert(version)
+                }
+                continue
+            }
+            captureRolloutProjections(
+                batch.records,
+                sourceGeneration: batch.cursor.sourceGeneration,
+                observedAt: observedAt
+            )
+            let normalized = normalizer.normalize(
+                records: recordsAfterHistoryCutoff(batch.records),
+                sourceGeneration: batch.cursor.sourceGeneration,
+                observedAt: observedAt,
+                previousState: previousNormalization
+            )
+            if normalized.state.sourceVersion != "unknown" {
+                result.sourceVersions.insert(normalized.state.sourceVersion)
+            }
+            let newFacts = factsAfterHistoryCutoff(normalized.facts).filter {
+                $0.key == .token
+                    && $0.availability == .available
+                    && $0.eventID != nil
+            }
+            var source = previousSource ?? LocalActivityStore.Source(
+                key: sourceKey,
+                sourceGeneration: batch.cursor.sourceGeneration
+            )
+            source.cursorJSON = try JSONEncoder().encode(batch.cursor)
+            source.normalizationJSON = try JSONEncoder().encode(
+                normalized.state
+            )
+            source.hasMalformedRecords =
+                source.hasMalformedRecords || batch.malformedRecordCount > 0
+            if let bounds = tokenActivityBounds(newFacts) {
+                source.activityStart = source.activityStart.map {
+                    min($0, bounds.start)
+                } ?? bounds.start
+                source.activityEnd = source.activityEnd.map {
+                    max($0, bounds.end)
+                } ?? bounds.end
+            }
+            let storedProjections =
+                normalized.state.context?.taskID.map {
+                    projectionChainIDs(for: $0).compactMap {
+                        projections[$0]?.withoutRolloutFileURL
+                    }
+                } ?? []
+            try store.append(
+                newFacts,
+                to: source,
+                projections: storedProjections
+            )
+        }
+        return result
+    }
+
+    private func storedSource(
+        key: String,
+        persisted: PersistedFile,
+        factsFile: URL
+    ) throws -> LocalActivityStore.Source? {
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: factsFile.path
+        ),
+        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+        let size = (attributes[.size] as? NSNumber)?.uint64Value,
+        let modificationDate = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+        var source = LocalActivityStore.Source(
+            key: key,
+            sourceGeneration: persisted.cursor.sourceGeneration
+        )
+        source.cursorJSON = try JSONEncoder().encode(persisted.cursor)
+        source.normalizationJSON = try JSONEncoder().encode(
+            persisted.normalization
+        )
+        source.activityStart = persisted.activityStart
+        source.activityEnd = persisted.activityEnd
+        source.discontinuityAt = persisted.discontinuityAt
+        source.hasMalformedRecords = persisted.hasMalformedRecords ?? false
+        source.legacyDevice = device
+        source.legacyInode = inode
+        source.legacyOffset = 0
+        source.legacySize = size
+        source.legacyModificationDate = modificationDate
+        return source
+    }
+
+    private func readStoredTokenFacts(
+        from file: URL,
+        source: LocalActivityStore.Source,
+        maximumLines: Int,
+        maximumBytes: UInt64
+    ) throws -> (
+        facts: [LocalActivityStore.TokenFact],
+        source: LocalActivityStore.Source,
+        linesRead: Int,
+        bytesRead: UInt64,
+        complete: Bool
+    ) {
+        guard let fileSize = source.legacySize,
+              let handle = try? FileHandle(forReadingFrom: file) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        defer { try? handle.close() }
+        let decoder = JSONDecoder()
+        let checkpoint: StoredTokenImportCheckpoint
+        if let data = source.pendingFactJSON {
+            checkpoint = try decoder.decode(
+                StoredTokenImportCheckpoint.self,
+                from: data
+            )
+        } else {
+            checkpoint = StoredTokenImportCheckpoint(
+                retainedTokenAfterCutoff: false
+            )
+        }
+        var retainedTokenAfterCutoff =
+            checkpoint.retainedTokenAfterCutoff
+        var facts: [LocalActivityStore.TokenFact] = []
+        var valid = true
+        let read = try BoundedJSONLReader.read(
+            handle: handle,
+            from: source.legacyOffset ?? 0,
+            maximumLines: maximumLines,
+            maximumBytes: maximumBytes,
+            maximumRecordBytes: Self.maximumMetadataBytes,
+            discardsPartialRecordAtByteLimit: false
+        ) { line, _ in
+            guard let decoded = autoreleasepool(invoking: {
+                try? decoder.decode(
+                    StoredTokenFactProjection.self,
+                    from: line
+                )
+            }) else {
+                valid = false
+                return false
+            }
+            guard decoded.key == .token,
+                  decoded.availability == .available,
+                  let eventID = decoded.eventID,
+                  !eventID.isEmpty,
+                  let timestamp = decoded.eventTimestamp,
+                  let occurredAt = parseTimestamp(timestamp),
+                  historyCutoff.map({ occurredAt >= $0 }) ?? true else {
+                return true
+            }
+            var numericDelta = decoded.numericDelta
+            var reason = decoded.reason
+            if historyCutoff != nil,
+               !retainedTokenAfterCutoff {
+                numericDelta = nil
+                reason = reason ?? "segment-baseline"
+                retainedTokenAfterCutoff = true
+            }
+            facts.append(
+                LocalActivityStore.TokenFact(
+                    eventID: eventID,
+                    occurredAt: occurredAt,
+                    numericDelta: numericDelta,
+                    reason: reason,
+                    sourceGeneration: decoded.source.sourceGeneration,
+                    taskID: decoded.context?.taskID,
+                    effectiveModel: decoded.context?.effectiveModel,
+                    reasoning: decoded.context?.reasoning
+                )
+            )
+            return true
+        }
+        guard valid, read.oversizedRecordCount == 0 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let complete = read.completeByteOffset == fileSize
+        guard complete || read.stoppedEarly else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var updated = source
+        if complete {
+            updated.legacyOffset = fileSize
+            updated.pendingFactJSON = nil
+        } else {
+            updated.legacyOffset = read.resumeByteOffset
+            updated.pendingFactJSON = try JSONEncoder().encode(
+                StoredTokenImportCheckpoint(
+                    retainedTokenAfterCutoff: retainedTokenAfterCutoff
+                )
+            )
+        }
+        return (
+            facts,
+            updated,
+            read.processedLineCount,
+            read.bytesRead,
+            complete
+        )
+    }
+
+    private func openStoredTokenStore() throws -> LocalActivityStore {
+        guard partitionID != nil, let directory = stateURL else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        if let storedTokenStore {
+            return storedTokenStore
+        }
+        let file = directory.appendingPathComponent(
+            "local-activity-v1.sqlite3"
+        )
+        do {
+            let store = try LocalActivityStore(
+                fileURL: file,
+                historyCutoff: historyCutoff
+            )
+            storedTokenStore = store
+            return store
+        } catch let error as LocalActivityStore.StoreError
+        where error == .historyCutoffMismatch || error == .schemaMismatch {
+            for candidate in [
+                file,
+                URL(fileURLWithPath: file.path + "-wal"),
+                URL(fileURLWithPath: file.path + "-shm"),
+                URL(fileURLWithPath: file.path + "-journal")
+            ] where FileManager.default.fileExists(atPath: candidate.path) {
+                try FileManager.default.removeItem(at: candidate)
+            }
+            let store = try LocalActivityStore(
+                fileURL: file,
+                historyCutoff: historyCutoff
+            )
+            storedTokenStore = store
+            return store
+        }
+    }
+
+    private func closeStoredTokenStore() {
+        storedTokenStore?.close()
+        storedTokenStore = nil
+        storedTokenCache = nil
+        storedFilterOptionsCache = nil
+    }
+
+    private func unavailableStoredTokenActivity(
+        _ reason: String,
+        interval: DateInterval
+    ) -> LocalStoredTokenActivityCollection {
+        LocalStoredTokenActivityCollection(
+            snapshot: .unavailable(reason, interval: interval),
+            filterOptions: UsageReceiptFilterOptions(
+                projects: [],
+                taskTrees: [],
+                models: [],
+                reasoningLevels: []
+            ),
+            observation: .unavailable(reason),
+            bytesRead: 0,
+            importPending: false
+        )
+    }
+
     private func advanceContentRevision() {
         contentRevision = nextRevision(after: contentRevision)
     }
@@ -842,6 +1595,7 @@ actor LocalActivityCollector {
                 for: stateDirectory
             )
         }
+        closeStoredTokenStore()
         stateGeneration = nextRevision(after: stateGeneration)
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
@@ -887,6 +1641,7 @@ actor LocalActivityCollector {
         )
         historyCutoff = cutoff
         deletionMarkerInvalid = false
+        closeStoredTokenStore()
         stateGeneration = nextRevision(after: stateGeneration)
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
@@ -915,6 +1670,7 @@ actor LocalActivityCollector {
     }
 
     func rebuildHistory() throws {
+        closeStoredTokenStore()
         if let stateDirectory {
             if FileManager.default.fileExists(atPath: stateDirectory.path) {
                 try FileManager.default.removeItem(at: stateDirectory)
@@ -941,14 +1697,17 @@ actor LocalActivityCollector {
         deletionMarkerInvalid = false
     }
 
-    private func rolloutFiles(in interval: DateInterval) -> Set<URL> {
+    private func rolloutFiles(
+        in interval: DateInterval,
+        maximumDays: Int = 14
+    ) -> Set<URL> {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         var date = calendar.startOfDay(for: interval.start)
         let end = calendar.startOfDay(for: interval.end)
         var result = Set<URL>()
 
-        for _ in 0 ..< 14 where date <= end {
+        for _ in 0 ..< max(maximumDays, 1) where date <= end {
             let components = calendar.dateComponents(
                 [.year, .month, .day],
                 from: date
@@ -981,6 +1740,32 @@ actor LocalActivityCollector {
             date = next
         }
         return result
+    }
+
+    private func storedRolloutFiles(
+        in interval: DateInterval
+    ) -> Set<URL> {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let end = calendar.startOfDay(for: interval.end)
+        guard let start = calendar.date(
+            byAdding: .day,
+            value: -85,
+            to: end
+        ) else {
+            return []
+        }
+        return rolloutFiles(
+            in: DateInterval(start: start, end: end),
+            maximumDays: 86
+        ).filter {
+            guard let modified = try? $0.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate else {
+                return true
+            }
+            return modified >= interval.start
+        }
     }
 
     private func taskIDs(in states: [FileState]) -> Set<String> {
@@ -1199,6 +1984,40 @@ actor LocalActivityCollector {
         }.last
     }
 
+    private func captureRolloutProjections(
+        _ records: [RolloutRecord],
+        sourceGeneration: UInt64,
+        observedAt: Date
+    ) {
+        for record in records
+        where record.type == "session_meta" {
+            guard let taskID = record.threadID,
+                  projections[taskID] == nil else {
+                continue
+            }
+            let label = record.cwd.flatMap {
+                let value = URL(fileURLWithPath: $0).lastPathComponent
+                return value.isEmpty ? nil : value
+            }
+            projections[taskID] = ThreadProjection(
+                taskID: taskID,
+                parentTaskID: record.parentThreadID,
+                projectLabel: label,
+                rolloutFileURL: nil,
+                createdAt: record.timestamp.flatMap(parseTimestamp),
+                updatedAt: nil,
+                source: LocalActivitySourceMetadata(
+                    source: .rolloutJSONL,
+                    sourceVersion: record.cliVersion ?? "unknown",
+                    schemaVersion: "rollout-jsonl-v1",
+                    sourceGeneration: sourceGeneration,
+                    historyMode: record.historyMode,
+                    observedAt: observedAt
+                )
+            )
+        }
+    }
+
     private func activeProjections(
         in interval: DateInterval
     ) -> [ThreadProjection] {
@@ -1249,6 +2068,8 @@ actor LocalActivityCollector {
         lastPublishedProjectionIdentities = nil
         lastObservationSignature = nil
         importContinuationPending = false
+        storedTokenCache = nil
+        storedFilterOptionsCache = nil
     }
 
     private func restartPartialFactRestores() {

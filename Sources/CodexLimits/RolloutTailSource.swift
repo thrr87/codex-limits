@@ -30,6 +30,7 @@ struct BoundedJSONLReader {
         discardsPartialRecordAtByteLimit: Bool = true,
         onLine: (Data, UInt64) throws -> Bool
     ) throws -> BoundedJSONLReadResult {
+        try Task.checkCancellation()
         let lineLimit = max(maximumLines, 1)
         let byteLimit = max(maximumBytes, 1)
         try handle.seek(toOffset: startOffset)
@@ -45,6 +46,7 @@ struct BoundedJSONLReader {
         var countedCurrentOversizedLine = startsByDiscardingOversizedRecord
 
         while true {
+            try Task.checkCancellation()
             let (currentOffset, currentOffsetOverflowed) =
                 startOffset.addingReportingOverflow(bytesRead)
             guard !currentOffsetOverflowed else {
@@ -83,7 +85,9 @@ struct BoundedJSONLReader {
                 Int(min(budgetRemaining, UInt64(Self.chunkBytes)))
             )
             guard count > 0,
-                  let chunk = try handle.read(upToCount: count),
+                  let chunk = try autoreleasepool(invoking: {
+                      try handle.read(upToCount: count)
+                  }),
                   !chunk.isEmpty else {
                 break
             }
@@ -139,6 +143,9 @@ struct BoundedJSONLReader {
                 }
                 processedBytes = nextProcessedBytes
                 processedLineCount += 1
+                if processedLineCount.isMultiple(of: 256) {
+                    try Task.checkCancellation()
+                }
                 line.removeAll(keepingCapacity: true)
                 skipsCurrentLine = false
                 countedCurrentOversizedLine = false
@@ -396,6 +403,7 @@ struct RolloutRecord: Equatable, Sendable {
     let eventType: String?
     let threadID: String?
     let parentThreadID: String?
+    let cwd: String?
     let cliVersion: String?
     let historyMode: String?
     let agentRole: String?
@@ -427,12 +435,20 @@ struct RolloutTailBatch: Equatable, Sendable {
     let processedLineCount: Int
 }
 
+enum RolloutTailRecordScope: Sendable {
+    case all
+    case tokenActivity
+}
+
 struct IncrementalRolloutTailSource {
     private static let fingerprintOffsetBasis: UInt64 = 14_695_981_039_346_656_037
     private static let fingerprintPrime: UInt64 = 1_099_511_628_211
     private static let payloadMarker = Data(#","payload":"#.utf8)
+    private static let typeValueMarker = Data(#""type":""#.utf8)
     private static let compactedTypeMarker = Data(#""type":"compacted""#.utf8)
     private static let emptyPayloadSuffix = Data(#","payload":{}}"#.utf8)
+    private static let maximumHeaderBytes = 1_024
+    private static let maximumPayloadHeaderBytes = 256
     // ponytail: bound one batch; stream normalization if one-pass import matters.
     static let maximumLinesPerBatch = 100_000
     static let maximumBytesPerBatch: UInt64 = 64 * 1_024 * 1_024
@@ -441,6 +457,7 @@ struct IncrementalRolloutTailSource {
         fileURL: URL,
         cursor: RolloutCursor?,
         observedAt: Date,
+        recordScope: RolloutTailRecordScope = .all,
         maximumLines: Int = Self.maximumLinesPerBatch,
         maximumBytes: UInt64 = Self.maximumBytesPerBatch,
         maximumRecordBytes: Int = BoundedJSONLReader.maximumRecordBytes
@@ -489,7 +506,8 @@ struct IncrementalRolloutTailSource {
                 handle: handle,
                 fileSize: fileSize,
                 cursor: cursor,
-                maximumBytes: byteBudget
+                maximumBytes: byteBudget,
+                recordScope: recordScope
             )
         }
         if continuationVerification.matches == nil,
@@ -563,14 +581,25 @@ struct IncrementalRolloutTailSource {
                     && cursor?.discardingOversizedRecord == true,
             discardsPartialRecordAtByteLimit: false
         ) { line, absoluteLineOffset in
-            guard let wire = decodeWire(line, decoder: decoder) else {
+            if recordScope == .tokenActivity,
+               autoreleasepool(invoking: {
+                   tokenActivityHeaderDisposition(line)
+               }) == .skip {
+                unsupportedRecordCount += 1
+                return true
+            }
+            guard let wire = autoreleasepool(invoking: {
+                decodeWire(line, decoder: decoder)
+            }) else {
                 unsupportedRecordCount += 1
                 malformedRecordCount += 1
                 return true
             }
             let type = wire.type
             let payload = wire.payload
-            if type == "session_meta", let observedThreadID = payload.id {
+            if type == "session_meta",
+               threadID == nil,
+               let observedThreadID = payload.id {
                 threadID = observedThreadID
             }
             let nonContentIdentity = replayIdentity(
@@ -618,11 +647,14 @@ struct IncrementalRolloutTailSource {
                 ].joined(separator: "|")
             }
             guard seenEventKeys.insert(eventKey).inserted else { return true }
-            guard isSupported(
-                type: type,
-                eventType: eventType,
-                toolClass: payload.item?.type
-            ) else {
+            let supported = recordScope == .tokenActivity
+                ? isTokenActivityRecord(type: type, eventType: eventType)
+                : isSupported(
+                    type: type,
+                    eventType: eventType,
+                    toolClass: payload.item?.type
+                )
+            guard supported else {
                 unsupportedRecordCount += 1
                 return true
             }
@@ -654,6 +686,7 @@ struct IncrementalRolloutTailSource {
                     eventType: eventType,
                     threadID: threadID,
                     parentThreadID: payload.parentThreadId,
+                    cwd: payload.cwd,
                     cliVersion: payload.cliVersion,
                     historyMode: payload.historyMode,
                     agentRole: payload.agentRole,
@@ -729,7 +762,8 @@ struct IncrementalRolloutTailSource {
         handle: FileHandle,
         fileSize: UInt64,
         cursor: RolloutCursor?,
-        maximumBytes: UInt64
+        maximumBytes: UInt64,
+        recordScope: RolloutTailRecordScope
     ) throws -> (matches: Bool?, bytesRead: UInt64) {
         guard
             let cursor,
@@ -750,10 +784,15 @@ struct IncrementalRolloutTailSource {
             from: 0,
             through: cursor.byteOffset
         ) { line, absoluteLineOffset in
+            if recordScope == .tokenActivity,
+               tokenActivityHeaderDisposition(line) == .skip {
+                return true
+            }
             guard let wire = decodeWire(line, decoder: decoder) else {
                 return true
             }
             if wire.type == "session_meta",
+               threadID == nil,
                let observedThreadID = wire.payload.id {
                 threadID = observedThreadID
             }
@@ -872,6 +911,7 @@ struct IncrementalRolloutTailSource {
         components.append(payload.type ?? "none")
         components.append(payload.id ?? "none")
         components.append(payload.parentThreadId ?? "none")
+        components.append(payload.cwd ?? "none")
         components.append(payload.cliVersion ?? "none")
         components.append(payload.historyMode ?? "none")
         components.append(payload.agentRole ?? "none")
@@ -1005,6 +1045,76 @@ struct IncrementalRolloutTailSource {
         return normalizedToolClass(toolClass) != nil
     }
 
+    private func isTokenActivityRecord(
+        type: String,
+        eventType: String?
+    ) -> Bool {
+        type == "session_meta"
+            || type == "turn_context"
+            || (
+                type == "event_msg"
+                    && ["task_started", "token_count"].contains(eventType)
+            )
+    }
+
+    private func tokenActivityHeaderDisposition(
+        _ data: Data
+    ) -> TokenActivityHeaderDisposition {
+        let headerEnd = data.index(
+            data.startIndex,
+            offsetBy: min(data.count, Self.maximumHeaderBytes)
+        )
+        guard let payload = data.range(
+            of: Self.payloadMarker,
+            in: data.startIndex..<headerEnd
+        ), let type = headerValue(
+            in: data,
+            range: data.startIndex..<payload.lowerBound
+        ) else {
+            return .decode
+        }
+        switch type {
+        case "session_meta", "turn_context":
+            return .decode
+        case "event_msg":
+            let payloadHeaderEnd = data.index(
+                payload.upperBound,
+                offsetBy: min(
+                    data.distance(
+                        from: payload.upperBound,
+                        to: data.endIndex
+                    ),
+                    Self.maximumPayloadHeaderBytes
+                )
+            )
+            guard let eventType = headerValue(
+                in: data,
+                range: payload.upperBound..<payloadHeaderEnd
+            ) else {
+                return .decode
+            }
+            return ["task_started", "token_count"].contains(eventType)
+                ? .decode
+                : .skip
+        default:
+            return .skip
+        }
+    }
+
+    private func headerValue(
+        in data: Data,
+        range: Range<Data.Index>
+    ) -> String? {
+        guard let marker = data.range(
+            of: Self.typeValueMarker,
+            in: range
+        ), let end = data[marker.upperBound..<range.upperBound]
+            .firstIndex(of: 0x22) else {
+            return nil
+        }
+        return String(decoding: data[marker.upperBound..<end], as: UTF8.self)
+    }
+
     private func normalizedToolClass(_ wireValue: String?) -> String? {
         switch wireValue {
         case "CommandExecution":
@@ -1031,6 +1141,11 @@ struct IncrementalRolloutTailSource {
     }
 }
 
+private enum TokenActivityHeaderDisposition {
+    case decode
+    case skip
+}
+
 private struct RolloutWire: Decodable {
     let timestamp: String?
     let ordinal: UInt64?
@@ -1041,6 +1156,7 @@ private struct RolloutWire: Decodable {
         let type: String?
         let id: String?
         let parentThreadId: String?
+        let cwd: String?
         let cliVersion: String?
         let historyMode: String?
         let agentRole: String?

@@ -45,24 +45,6 @@ struct MenuContentView: View {
 
             Divider()
 
-            Picker(
-                "View",
-                selection: Binding(
-                    get: { workspace.state.section },
-                    set: workspace.selectSection
-                )
-            ) {
-                ForEach(AnalyticsSection.allCases) { section in
-                    Text(section.rawValue).tag(section)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-
-            Divider()
-
             ScrollView {
                 workspaceContent
                     .padding(20)
@@ -77,7 +59,8 @@ struct MenuContentView: View {
         .frame(width: layout.width, height: layout.height)
         .task(id: workspace.state.usesLocalActivity) {
             await monitor.setLocalAnalyticsVisible(
-                workspace.state.usesLocalActivity
+                workspace.state.usesLocalActivity,
+                exploration: workspace.state
             )
         }
         .onDisappear {
@@ -495,7 +478,7 @@ private struct GraphsWorkspace: View {
                 set: store.selectGraph
             )
         ) {
-            ForEach(AnalyticsGraph.allCases) { graph in
+            ForEach(AnalyticsGraph.coreCases) { graph in
                 Text(graph.rawValue).tag(graph)
             }
         }
@@ -1537,13 +1520,7 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var localSlice: LocalTokenActivitySlice {
-        guard !store.state.filters.isEmpty else {
-            return reader.localTokenActivity.slice(in: visibleRange)
-        }
-        return reader.usageReceipts.localTokenSlice(
-            in: visibleRange,
-            filters: store.state.filters
-        )
+        reader.localTokenActivity.slice(in: visibleRange)
     }
 
     private var accountCoversVisibleRange: Bool {
@@ -1913,6 +1890,10 @@ private struct TokenActivityWorkspace: View {
             "Only activity on this Mac is included"
         case "Saved local activity could not be read":
             "Saved local activity could not be read"
+        case "Some local diagnostic records could not be read":
+            "Some local activity could not be read"
+        case "Saved deletion state could not be read":
+            "Saved history settings could not be read"
         case "Local activity could not be saved":
             "Local activity could not be saved"
         case "Local task import is still in progress":
@@ -2041,7 +2022,8 @@ private struct WorkspaceFilterMenu: View {
     }
 
     private var options: UsageReceiptFilterOptions {
-        reader.usageReceipts.filterOptions(in: range)
+        reader.localFilterOptions
+            ?? reader.usageReceipts.filterOptions(in: range)
     }
 
     var body: some View {

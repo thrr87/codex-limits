@@ -477,6 +477,7 @@ final class LocalActivityNormalizerTests: XCTestCase {
             eventType: nil,
             threadID: threadID,
             parentThreadID: nil,
+            cwd: nil,
             cliVersion: "0.145.0",
             historyMode: "paginated",
             agentRole: agent?.role,

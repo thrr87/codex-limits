@@ -18,6 +18,11 @@ enum AnalyticsGraph: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    static let coreCases: [AnalyticsGraph] = [
+        .usageRemaining,
+        .tokenActivity
+    ]
+
     var usesAccountScope: Bool {
         self == .usageRemaining || self == .usagePerToken
     }
@@ -103,7 +108,12 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
     )
 
     var usesLocalActivity: Bool {
-        section != .graphs || graph != .usageRemaining
+        usesStoredTokenActivity
+    }
+
+    var usesStoredTokenActivity: Bool {
+        section == .graphs
+            && graph == .tokenActivity
     }
 }
 
@@ -135,6 +145,10 @@ final class AnalyticsWorkspaceStore: ObservableObject {
                 AnalyticsExplorationState.self,
                 from: data
               ) else {
+            return .initial
+        }
+        guard restored.section == .graphs,
+              AnalyticsGraph.coreCases.contains(restored.graph) else {
             return .initial
         }
         return restored

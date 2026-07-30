@@ -298,6 +298,61 @@ final class LocalTokenActivityTests: XCTestCase {
         XCTAssertNil(reader.localTokenActivity.accountComparison.numericPercent)
     }
 
+    func testReaderUsesAStoredTokenSnapshotInsteadOfScanningFacts() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = accountSnapshot(
+            fetchedAt: now,
+            lifetimeTokens: 1_600
+        )
+        let boundary = UsageSample(
+            observedAt: account.mainLimit!.window.startsAt,
+            remainingPercent: 100,
+            resetsAt: account.mainLimit!.window.resetsAt,
+            lifetimeTokens: 1_000
+        )
+        let interval = DateInterval(
+            start: boundary.observedAt,
+            end: now
+        )
+        let stored = LocalTokenActivitySnapshot(
+            tokens: 900,
+            interval: interval,
+            coverage: .high,
+            reason: "Only local activity on this Mac is observed",
+            sourceVersion: "0.145.0",
+            observedAt: now,
+            points: [
+                LocalTokenActivityPoint(date: now, tokens: 900)
+            ],
+            accountComparison: .unavailable
+        )
+
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [boundary],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                localActivityFacts: [
+                    tokenFact(
+                        id: "legacy",
+                        timestamp: now.timeIntervalSince1970 - 60,
+                        delta: 100
+                    )
+                ],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                precomputedLocalTokenActivity: stored
+            )
+        )
+
+        XCTAssertEqual(reader.localTokenActivity, stored)
+    }
+
     func testOffDeviceActivityDoesNotTurnTheAccountLocalGapIntoCoverage() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let account = accountSnapshot(

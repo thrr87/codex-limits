@@ -26,8 +26,8 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let first = AnalyticsWorkspaceStore(defaults: defaults)
-        first.selectSection(.facts)
-        first.selectGraph(.concurrency)
+        first.selectSection(.graphs)
+        first.selectGraph(.tokenActivity)
         first.selectTimeRange(.threeDays)
         first.updateFilters(
             WorkspaceFilters(
@@ -50,8 +50,8 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         let restored = AnalyticsWorkspaceStore(defaults: defaults)
 
-        XCTAssertEqual(restored.state.section, .facts)
-        XCTAssertEqual(restored.state.graph, .concurrency)
+        XCTAssertEqual(restored.state.section, .graphs)
+        XCTAssertEqual(restored.state.graph, .tokenActivity)
         XCTAssertEqual(restored.state.timeRange, .selected)
         XCTAssertEqual(restored.state.filters.projectID, "codex-limits")
         XCTAssertEqual(restored.state.filters.taskTreeID, "task-42")
@@ -73,6 +73,20 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 ),
                 size: CGSize(width: 640, height: 780)
             )
+        )
+    }
+
+    func testRestoredDeferredViewFallsBackToTheCoreWorkspace() {
+        let suiteName = "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AnalyticsWorkspaceStore(defaults: defaults)
+        store.selectSection(.insights)
+        store.selectGraph(.concurrency)
+
+        XCTAssertEqual(
+            AnalyticsWorkspaceStore(defaults: defaults).state,
+            .initial
         )
     }
 
@@ -149,15 +163,46 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertFalse(AnalyticsGraph.tokenActivity.usesAccountScope)
     }
 
-    func testOnlyUsageRemainingSkipsLocalActivity() {
+    func testOnlyTokenActivityLoadsLocalActivity() {
         var state = AnalyticsExplorationState.initial
 
         XCTAssertFalse(state.usesLocalActivity)
         state.graph = .tokenActivity
         XCTAssertTrue(state.usesLocalActivity)
-        state.graph = .usageRemaining
         state.section = .facts
-        XCTAssertTrue(state.usesLocalActivity)
+        XCTAssertFalse(state.usesLocalActivity)
+        state.section = .graphs
+        state.graph = .usagePerToken
+        XCTAssertFalse(state.usesLocalActivity)
+        state.graph = .concurrency
+        XCTAssertFalse(state.usesLocalActivity)
+        state.section = .insights
+        XCTAssertFalse(state.usesLocalActivity)
+    }
+
+    func testEveryTokenGraphUsesTheBoundedTokenStore() {
+        var state = AnalyticsExplorationState.initial
+
+        state.graph = .tokenActivity
+        XCTAssertTrue(state.usesStoredTokenActivity)
+
+        state.filters.model = "gpt-5.6"
+        XCTAssertTrue(state.usesStoredTokenActivity)
+
+        state.filters = .all
+        state.timeRange = .fourWeeks
+        XCTAssertTrue(state.usesStoredTokenActivity)
+
+        state.timeRange = .currentWindow
+        state.visibleRange = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        XCTAssertTrue(state.usesStoredTokenActivity)
+
+        state.visibleRange = nil
+        state.section = .facts
+        XCTAssertFalse(state.usesStoredTokenActivity)
     }
 
     func testPresetRangeEndsAtLatestObservedTimeAndIsClampedToWindow() {

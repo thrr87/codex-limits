@@ -663,11 +663,14 @@ final class UsageMonitorHistoryTests: XCTestCase {
         var exploration = AnalyticsExplorationState.initial
         exploration.section = .insights
         exploration.timeRange = .threeDays
+        let callsBeforePreferenceChange = evaluator.callCount
 
         monitor.analyticsPreferencesDidChange(
             exploration: exploration,
             dispositions: [:]
         )
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(evaluator.callCount, callsBeforePreferenceChange)
         evaluator.release()
         await refresh.value
         let deadline = ContinuousClock.now + .seconds(2)
@@ -678,6 +681,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
             await Task.yield()
         }
 
+        XCTAssertEqual(evaluator.maximumConcurrentCalls, 1)
         XCTAssertEqual(evaluator.lastExploration, exploration)
         XCTAssertEqual(monitor.readerSnapshot.menuBarText, "80%")
     }
@@ -803,8 +807,13 @@ final class UsageMonitorHistoryTests: XCTestCase {
         await firstMonitor.refresh()
         await firstMonitor.refresh()
         XCTAssertNil(firstMonitor.readerSnapshot.localTokenActivity.tokens)
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
 
-        await firstMonitor.setLocalAnalyticsVisible(true)
+        await firstMonitor.setLocalAnalyticsVisible(
+            true,
+            exploration: exploration
+        )
 
         XCTAssertEqual(
             firstMonitor.readerSnapshot.localTokenActivity.tokens,
@@ -824,7 +833,10 @@ final class UsageMonitorHistoryTests: XCTestCase {
         await restarted.refresh()
         XCTAssertNil(restarted.readerSnapshot.localTokenActivity.tokens)
 
-        await restarted.setLocalAnalyticsVisible(true)
+        await restarted.setLocalAnalyticsVisible(
+            true,
+            exploration: exploration
+        )
 
         XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.tokens, 400)
         XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.coverage, .low)
@@ -834,7 +846,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
-    func testLocalCollectorReadsOnlyForVisibleAnalyticsAndManualRefresh()
+    func testDefaultViewDoesNotCreateLocalStoreAndTokenActivitySkipsFullScan()
         async throws
     {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
@@ -850,6 +862,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let requests = RequestCounter()
+        let stateRoot = root.appendingPathComponent("local-state")
         let fetches = DelayedFetchSource(
             makeFetchResult(
                 identity: "user@example.com",
@@ -863,7 +876,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
             startsAutomatically: false,
             localActivityCollector: LocalActivityCollector(
                 rootDirectory: localRoot,
-                stateDirectory: root.appendingPathComponent("local-state"),
+                stateDirectory: stateRoot,
                 projectionSource: ReadOnlyThreadProjectionSource { _ in
                     await requests.record()
                     return Data(
@@ -877,33 +890,47 @@ final class UsageMonitorHistoryTests: XCTestCase {
         await monitor.start()
         var requestCount = await requests.count
         XCTAssertEqual(requestCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateRoot.path))
 
         let automatic = Task { @MainActor in
             await monitor.automaticRefresh()
         }
         try await Task.sleep(for: .milliseconds(10))
-        await monitor.setLocalAnalyticsVisible(true)
         await automatic.value
         requestCount = await requests.count
-        XCTAssertEqual(requestCount, 1)
-        await monitor.setLocalAnalyticsVisible(true)
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateRoot.path))
+
+        await monitor.refresh()
         requestCount = await requests.count
-        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateRoot.path))
+
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
+        await monitor.setLocalAnalyticsVisible(
+            true,
+            exploration: exploration
+        )
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
 
         await monitor.automaticRefresh()
         requestCount = await requests.count
-        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(requestCount, 0)
         await monitor.refresh()
         requestCount = await requests.count
-        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(requestCount, 0)
 
         await monitor.setLocalAnalyticsVisible(false)
         await monitor.refresh()
         requestCount = await requests.count
-        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(requestCount, 0)
     }
 
-    func testHidingAnalyticsDiscardsAnInFlightLocalRead() async throws {
+    func testEveryTokenGraphUsesStoredActivityWithoutLoadingFullFacts()
+        async throws
+    {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -912,44 +939,134 @@ final class UsageMonitorHistoryTests: XCTestCase {
             "rollouts",
             isDirectory: true
         )
+        let rolloutDirectory = localRoot.appendingPathComponent(
+            "1970/01/22",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(
-            at: localRoot,
+            at: rolloutDirectory,
             withIntermediateDirectories: true
         )
-        let gate = ProjectionGate()
-        let fetchResult = makeFetchResult(
-            identity: "user@example.com",
-            fetchedAt: Date(timeIntervalSince1970: 1_700_000),
-            remaining: 90
+        let fetchedAt = Date(timeIntervalSince1970: 1_850_000)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds
+        ]
+        let timestamps = [
+            formatter.string(from: fetchedAt.addingTimeInterval(-120)),
+            formatter.string(from: fetchedAt.addingTimeInterval(-60)),
+            formatter.string(from: fetchedAt.addingTimeInterval(-1))
+        ]
+        let lines = [
+            #"{"timestamp":"\#(timestamps[0])","ordinal":0,"type":"session_meta","payload":{"id":"task-1","cli_version":"0.145.0"}}"#,
+            #"{"timestamp":"\#(timestamps[1])","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#,
+            #"{"timestamp":"\#(timestamps[2])","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":500}}}}"#
+        ]
+        let rolloutFile = rolloutDirectory.appendingPathComponent(
+            "rollout-test.jsonl"
         )
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(
+            to: rolloutFile
+        )
+        let requests = RequestCounter()
+        let collector = LocalActivityCollector(
+            rootDirectory: localRoot,
+            stateDirectory: root.appendingPathComponent("local-state"),
+            projectionSource: ReadOnlyThreadProjectionSource { _ in
+                await requests.record()
+                return Data(
+                    #"{"result":{"data":[],"nextCursor":null}}"#.utf8
+                )
+            }
+        )
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_700_000),
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 80
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt.addingTimeInterval(10),
+                remaining: 79
+            )
+        ])
         let monitor = UsageMonitor(
             defaults: defaults,
             historyDirectory: root.appendingPathComponent("history"),
             startsAutomatically: false,
-            localActivityCollector: LocalActivityCollector(
-                rootDirectory: localRoot,
-                stateDirectory: root.appendingPathComponent("local-state"),
-                projectionSource: ReadOnlyThreadProjectionSource { _ in
-                    await gate.response()
-                }
-            ),
-            fetchUsage: { fetchResult }
+            localActivityCollector: collector,
+            fetchUsage: { try await source.next() }
         )
         await monitor.refresh()
+        await monitor.refresh()
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
 
-        let load = Task { @MainActor in
-            await monitor.setLocalAnalyticsVisible(true)
-        }
-        await gate.waitUntilStarted()
-        let hide = Task { @MainActor in
-            await monitor.setLocalAnalyticsVisible(false)
-        }
-        try await Task.sleep(for: .milliseconds(10))
-        await gate.release()
-        await load.value
-        await hide.value
+        await monitor.setLocalAnalyticsVisible(
+            true,
+            exploration: exploration
+        )
 
-        XCTAssertNil(monitor.readerSnapshot.localTokenActivity.tokens)
+        for _ in 0 ..< 200
+        where monitor.readerSnapshot.localTokenActivity.tokens == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(monitor.readerSnapshot.localTokenActivity.tokens, 400)
+        var requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        let handle = try FileHandle(forWritingTo: rolloutFile)
+        try handle.seekToEnd()
+        try handle.write(
+            contentsOf: Data(
+                (
+                    #"{"timestamp":"\#(timestamps[2])","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":700}}}}"#
+                        + "\n"
+                ).utf8
+            )
+        )
+        try handle.close()
+        await monitor.automaticRefresh()
+        XCTAssertEqual(monitor.readerSnapshot.localTokenActivity.tokens, 600)
+
+        exploration.timeRange = .selected
+        exploration.visibleRange = DateInterval(
+            start: fetchedAt.addingTimeInterval(-3_600),
+            end: fetchedAt
+        )
+        monitor.analyticsPreferencesDidChange(
+            exploration: exploration,
+            dispositions: [:]
+        )
+        for _ in 0 ..< 200
+        where monitor.readerSnapshot.localTokenActivity.interval.duration
+            < 80 * 86_400 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertGreaterThanOrEqual(
+            monitor.readerSnapshot.localTokenActivity.interval.duration,
+            80 * 86_400
+        )
+
+        exploration.filters.model = "gpt-5.6"
+        monitor.analyticsPreferencesDidChange(
+            exploration: exploration,
+            dispositions: [:]
+        )
+        for _ in 0 ..< 200
+        where monitor.readerSnapshot.localTokenActivity.tokens != 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertEqual(monitor.readerSnapshot.localTokenActivity.tokens, 0)
     }
 
     func testMonitorFinishesABoundedLocalImportAcrossAutomaticRefresh()
@@ -1016,7 +1133,12 @@ final class UsageMonitorHistoryTests: XCTestCase {
             fetchUsage: { try await fetches.next() }
         )
 
-        await monitor.setLocalAnalyticsVisible(true)
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
+        await monitor.setLocalAnalyticsVisible(
+            true,
+            exploration: exploration
+        )
         await monitor.refresh()
         try Data(rollout.utf8).write(to: rolloutURL)
         await monitor.refresh()
@@ -2003,33 +2125,6 @@ private actor RequestCounter {
     var count: Int { requests }
 }
 
-private actor ProjectionGate {
-    private var started = false
-    private var continuation: CheckedContinuation<Data, Never>?
-
-    func response() async -> Data {
-        started = true
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
-        }
-    }
-
-    func waitUntilStarted() async {
-        while !started {
-            await Task.yield()
-        }
-    }
-
-    func release() {
-        continuation?.resume(
-            returning: Data(
-                #"{"result":{"data":[],"nextCursor":null}}"#.utf8
-            )
-        )
-        continuation = nil
-    }
-}
-
 private actor DelayedFetchSource {
     private let result: CodexFetchResult
     private var calls = 0
@@ -2053,6 +2148,8 @@ private final class BlockingUsageEvaluator: @unchecked Sendable {
     private let started: XCTestExpectation
     private var blockedFirstAccountEvaluation = false
     private var inputs: [UsageIntelligenceInput] = []
+    private var activeCalls = 0
+    private var peakActiveCalls = 0
 
     init(started: XCTestExpectation) {
         self.started = started
@@ -2063,6 +2160,8 @@ private final class BlockingUsageEvaluator: @unchecked Sendable {
     ) -> UsageReaderSnapshot {
         lock.lock()
         inputs.append(input)
+        activeCalls += 1
+        peakActiveCalls = max(peakActiveCalls, activeCalls)
         let shouldBlock = input.account != nil
             && !blockedFirstAccountEvaluation
         if shouldBlock {
@@ -2074,7 +2173,11 @@ private final class BlockingUsageEvaluator: @unchecked Sendable {
             started.fulfill()
             gate.wait()
         }
-        return UsageIntelligenceEngine.evaluate(input)
+        let result = UsageIntelligenceEngine.evaluate(input)
+        lock.lock()
+        activeCalls -= 1
+        lock.unlock()
+        return result
     }
 
     func release() {
@@ -2091,6 +2194,12 @@ private final class BlockingUsageEvaluator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return inputs.last?.analyticsExploration
+    }
+
+    var maximumConcurrentCalls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peakActiveCalls
     }
 }
 

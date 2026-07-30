@@ -396,6 +396,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let localActivityFacts: [LocalActivityFact]
     let localActivityHistoryFacts: [LocalActivityFact]
     let localActivityObservation: LocalActivityObservation
+    let precomputedLocalTokenActivity: LocalTokenActivitySnapshot?
+    let precomputedLocalFilterOptions: UsageReceiptFilterOptions?
     let localTaskProjections: [ThreadProjection]
     let localActivityContentRevision: UInt64?
     let reusableLocalAggregates: LocalAggregateCache?
@@ -417,6 +419,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         localActivityObservation: LocalActivityObservation = .unavailable(
             "Codex local records are unavailable"
         ),
+        precomputedLocalTokenActivity: LocalTokenActivitySnapshot? = nil,
+        precomputedLocalFilterOptions: UsageReceiptFilterOptions? = nil,
         localTaskProjections: [ThreadProjection] = [],
         localActivityContentRevision: UInt64? = nil,
         reusableLocalAggregates: LocalAggregateCache? = nil,
@@ -436,6 +440,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
         self.localActivityHistoryFacts =
             localActivityHistoryFacts ?? localActivityFacts
         self.localActivityObservation = localActivityObservation
+        self.precomputedLocalTokenActivity = precomputedLocalTokenActivity
+        self.precomputedLocalFilterOptions = precomputedLocalFilterOptions
         self.localTaskProjections = localTaskProjections
         self.localActivityContentRevision = localActivityContentRevision
         self.reusableLocalAggregates = reusableLocalAggregates
@@ -559,6 +565,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let bankedResets: BankedResetSummary?
     let accountTokenActivity: AccountTokenActivitySnapshot
     let localTokenActivity: LocalTokenActivitySnapshot
+    let localFilterOptions: UsageReceiptFilterOptions?
     let usagePerToken: UsagePerTokenSnapshot
     let usageReceipts: UsageReceiptSnapshot
     let activityTimeline: ActivityTimelineSnapshot
@@ -739,7 +746,12 @@ enum UsageIntelligenceEngine {
             samples: currentSamples
         )
         let localTokenActivity: LocalTokenActivitySnapshot
-        if let interval = tokenActivityInterval(
+        if let precomputed = input.precomputedLocalTokenActivity {
+            localTokenActivity = precomputed.updating(
+                interval: precomputed.interval,
+                observation: input.localActivityObservation
+            )
+        } else if let interval = tokenActivityInterval(
             account: input.account,
             accountActivity: accountTokenActivity,
             accountEpochStartedAt: input.accountEpochStartedAt
@@ -980,6 +992,7 @@ enum UsageIntelligenceEngine {
             ),
             accountTokenActivity: accountTokenActivity,
             localTokenActivity: localTokenActivity,
+            localFilterOptions: input.precomputedLocalFilterOptions,
             usagePerToken: usagePerToken,
             usageReceipts: usageReceipts,
             activityTimeline: activityTimeline,
