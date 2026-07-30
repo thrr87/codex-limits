@@ -18,8 +18,19 @@ enum AnalyticsGraph: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    static let coreCases: [AnalyticsGraph] = [
+        .usageRemaining,
+        .tokenActivity
+    ]
+
     var usesAccountScope: Bool {
-        self == .usageRemaining || self == .usagePerToken
+        self == .usageRemaining
+            || self == .tokenActivity
+            || self == .usagePerToken
+    }
+
+    var usesLocalAnalytics: Bool {
+        self == .usagePerToken || self == .concurrency
     }
 }
 
@@ -59,6 +70,57 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
             start: max(bounds.start, end.addingTimeInterval(-duration)),
             end: end
         )
+    }
+}
+
+struct AccountTokenActivityRange: Equatable, Sendable {
+    let days: [TokenDay]
+    let completeDayCount: Int
+    let completeTokens: Int64?
+
+    init(days: [TokenDay], interval: DateInterval) {
+        let day: TimeInterval = 86_400
+        self.days = days
+            .filter {
+                $0.date < interval.end
+                    && $0.date.addingTimeInterval(day) > interval.start
+            }
+            .sorted { $0.date < $1.date }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)
+            ?? calendar.timeZone
+        let startOfDay = calendar.startOfDay(for: interval.start)
+        var expected = startOfDay < interval.start
+            ? startOfDay.addingTimeInterval(day)
+            : startOfDay
+        var expectedDates: [Date] = []
+        while expected.addingTimeInterval(day) <= interval.end {
+            expectedDates.append(expected)
+            expected = expected.addingTimeInterval(day)
+        }
+        completeDayCount = expectedDates.count
+
+        guard !expectedDates.isEmpty else {
+            completeTokens = nil
+            return
+        }
+        var total: Int64 = 0
+        for date in expectedDates {
+            guard let bucket = self.days.first(where: { $0.date == date }),
+                  bucket.completeness == .complete,
+                  bucket.tokens >= 0 else {
+                completeTokens = nil
+                return
+            }
+            let result = total.addingReportingOverflow(bucket.tokens)
+            guard !result.overflow else {
+                completeTokens = nil
+                return
+            }
+            total = result.partialValue
+        }
+        completeTokens = total
     }
 }
 
@@ -102,8 +164,8 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
         pinnedUsageBaselineAccountPartitionID: nil
     )
 
-    var usesLocalActivity: Bool {
-        section != .graphs || graph != .usageRemaining
+    var usesLocalAnalytics: Bool {
+        section == .graphs && graph.usesLocalAnalytics
     }
 }
 
@@ -136,6 +198,12 @@ final class AnalyticsWorkspaceStore: ObservableObject {
                 from: data
               ) else {
             return .initial
+        }
+        guard AnalyticsGraph.coreCases.contains(restored.graph) else {
+            var core = restored
+            core.graph = .usageRemaining
+            core.filters = .all
+            return core
         }
         return restored
     }
