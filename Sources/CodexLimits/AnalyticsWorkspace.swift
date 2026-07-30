@@ -82,8 +82,8 @@ struct AccountTokenActivityRange: Equatable, Sendable {
         let day: TimeInterval = 86_400
         self.days = days
             .filter {
-                $0.date < interval.end
-                    && $0.date.addingTimeInterval(day) > interval.start
+                $0.date >= interval.start
+                    && $0.date.addingTimeInterval(day) <= interval.end
             }
             .sorted { $0.date < $1.date }
 
