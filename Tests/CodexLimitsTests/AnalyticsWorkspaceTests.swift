@@ -151,7 +151,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             interval: interval
         )
 
-        XCTAssertEqual(range.days.count, 4)
+        XCTAssertEqual(range.days.map(\.tokens), [200, 300])
         XCTAssertEqual(range.completeDayCount, 2)
         XCTAssertEqual(range.completeTokens, 500)
 

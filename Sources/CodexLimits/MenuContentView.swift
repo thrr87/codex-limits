@@ -1601,8 +1601,10 @@ private struct TokenActivityWorkspace: View {
                 if range.days.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
-                        title: "No account token activity",
-                        message: "Codex did not return daily totals for this range."
+                        title: "No complete daily totals",
+                        message: store.state.timeRange == .currentWindow
+                            ? "Choose 4 weeks to see account history."
+                            : "Codex did not return a complete day for this range."
                     ) {
                         EmptyView()
                     }
