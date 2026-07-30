@@ -554,6 +554,73 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertTrue(savedResults.isEmpty)
     }
 
+    func testHistoryBeyondLegacySizeLimitRemainsReadableAndAppendable() async throws {
+        let root = temporaryDirectory()
+        let fileURL = root.appendingPathComponent("assisted.json")
+        let scope = analysisScope(accountPartitionID: "account-a")
+        let history = CodexAssistedHistory(fileURL: fileURL)
+        try await history.recordResult(analysisResult(), scope: scope)
+
+        let handle = try FileHandle(forWritingTo: fileURL)
+        try handle.seekToEnd()
+        let whitespace = Data(repeating: 0x20, count: 1_024 * 1_024)
+        while try handle.offset() <= 64 * 1_024 * 1_024 {
+            try handle.write(contentsOf: whitespace)
+        }
+        try handle.close()
+
+        let restarted = CodexAssistedHistory(fileURL: fileURL)
+        let restored = await restarted.results(
+            accountPartitionID: "account-a"
+        )
+        try await restarted.recordResult(
+            analysisResult(
+                observedAt: Date(timeIntervalSince1970: 3_000)
+            ),
+            scope: scope
+        )
+
+        XCTAssertEqual(restored.count, 1)
+        let restoredAgain = await CodexAssistedHistory(fileURL: fileURL)
+            .results(accountPartitionID: "account-a")
+        XCTAssertEqual(
+            restoredAgain.map(\.result.observedAt),
+            [
+                Date(timeIntervalSince1970: 2_012),
+                Date(timeIntervalSince1970: 3_000)
+            ]
+        )
+    }
+
+    func testCorruptDeletionMarkerFailsClosed() async throws {
+        let root = temporaryDirectory()
+        let fileURL = root.appendingPathComponent("assisted.json")
+        let markerURL = root.appendingPathComponent("deleting.json")
+        let scope = analysisScope(accountPartitionID: "account-a")
+        let first = CodexAssistedHistory(
+            fileURL: fileURL,
+            deletionMarkerURL: markerURL
+        )
+        try await first.recordResult(analysisResult(), scope: scope)
+        let before = try Data(contentsOf: fileURL)
+        try Data("{not-json}".utf8).write(to: markerURL)
+
+        let restarted = CodexAssistedHistory(
+            fileURL: fileURL,
+            deletionMarkerURL: markerURL
+        )
+        let restored = await restarted.results(
+            accountPartitionID: "account-a"
+        )
+        XCTAssertTrue(restored.isEmpty)
+        do {
+            try await restarted.recordResult(analysisResult(), scope: scope)
+            XCTFail("Expected the corrupt deletion marker to fail closed")
+        } catch {}
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+    }
+
     func testDeletionMarkerSuppressesOldRecordsAndKeepsANewGeneration() async throws {
         let root = temporaryDirectory()
         let historyDirectory = root.appendingPathComponent(
@@ -1018,6 +1085,31 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertEqual(fixture.snapshot().connectionCount, 1)
     }
 
+    func testLiveClientRejectsOversizedCatalogLineAndUsesFreshConnection() async throws {
+        let fixture = CodexAssistedProtocolFixture(
+            oversizedCatalogLineOnFirstConnection: true,
+            maximumLineBytes: 1_024
+        )
+        let client = CodexAssistedClient(
+            makeConnection: { try fixture.makeConnection() },
+            timeout: 1,
+            now: { fixture.now() }
+        )
+
+        do {
+            _ = try await client.eligibleProfile()
+            XCTFail("Expected the oversized line to close the connection")
+        } catch CodexAssistedClientError.connectionLost {
+            // Expected.
+        } catch {
+            XCTFail("Expected connectionLost, got \(error)")
+        }
+
+        let selected = try await client.eligibleProfile()
+        XCTAssertNotNil(selected)
+        XCTAssertEqual(fixture.snapshot().connectionCount, 2)
+    }
+
     func testLiveCatalogHidesTheActionWithoutASignedInAccount() async throws {
         let fixture = CodexAssistedProtocolFixture(accountIsMissing: true)
         let client = CodexAssistedClient(
@@ -1441,6 +1533,8 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
     private let delaysThreadResponse: Bool
     private let accountIsMissing: Bool
     private let instructionSources: InstructionSourcesFixture
+    private let oversizedCatalogLineOnFirstConnection: Bool
+    private let maximumLineBytes: Int
     private var connections = 0
     private var modelLists = 0
     private var threadStarts = 0
@@ -1461,7 +1555,9 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
         addsUnknownEnabledFeature: Bool = false,
         delaysThreadResponse: Bool = false,
         accountIsMissing: Bool = false,
-        instructionSources: InstructionSourcesFixture = .empty
+        instructionSources: InstructionSourcesFixture = .empty,
+        oversizedCatalogLineOnFirstConnection: Bool = false,
+        maximumLineBytes: Int = 16 * 1_024 * 1_024
     ) {
         self.sendsToolCall = sendsToolCall
         self.sendsUnknownItem = sendsUnknownItem
@@ -1470,6 +1566,9 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
         self.delaysThreadResponse = delaysThreadResponse
         self.accountIsMissing = accountIsMissing
         self.instructionSources = instructionSources
+        self.oversizedCatalogLineOnFirstConnection =
+            oversizedCatalogLineOnFirstConnection
+        self.maximumLineBytes = maximumLineBytes
     }
 
     func now() -> Date {
@@ -1500,7 +1599,10 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
     func makeConnection() throws -> CodexAppServerConnection {
         let requests = Pipe()
         let responses = Pipe()
-        lock.withLock { connections += 1 }
+        let connectionNumber = lock.withLock {
+            connections += 1
+            return connections
+        }
         Task {
             for try await line in requests.fileHandleForReading.bytes.lines {
                 guard let request = try? JSONSerialization.jsonObject(
@@ -1524,7 +1626,12 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
                         try? responses.fileHandleForWriting.close()
                         return
                     }
-                    response = #"{"id":\#(id),"result":{"data":[{"id":"gpt-5.6-luna","model":"gpt-5.6-luna","displayName":"GPT-5.6 Luna","description":"","hidden":false,"isDefault":false,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Balanced"}]}],"nextCursor":null}}"#
+                    let padding =
+                        oversizedCatalogLineOnFirstConnection
+                            && connectionNumber == 1
+                        ? String(repeating: "x", count: maximumLineBytes)
+                        : ""
+                    response = #"{"id":\#(id),"result":{"data":[{"id":"gpt-5.6-luna","model":"gpt-5.6-luna","displayName":"GPT-5.6 Luna","description":"\#(padding)","hidden":false,"isDefault":false,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Balanced"}]}],"nextCursor":null}}"#
                 case "account/rateLimits/read":
                     let read = lock.withLock {
                         rateReads += 1
@@ -1624,6 +1731,7 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
         return CodexAppServerConnection(
             input: requests.fileHandleForWriting,
             output: responses.fileHandleForReading,
+            maximumLineBytes: maximumLineBytes,
             isRunning: { true },
             stop: {
                 try? requests.fileHandleForWriting.close()

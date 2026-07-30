@@ -201,6 +201,47 @@ struct UsageReceiptSlice: Equatable, Sendable {
     let receiptReason: String?
 }
 
+struct UsageReceiptSummary: Equatable, Identifiable, Sendable {
+    let rootTaskID: String
+    let projectLabel: String?
+    let tokens: Int64
+    let taskCount: Int
+    let coverage: CoverageLevel
+    let reason: String?
+
+    var id: String { rootTaskID }
+
+    var displayTaskID: String {
+        String(rootTaskID.prefix(8))
+    }
+
+    var accessibilityValue: String {
+        var parts = [
+            "Task \(displayTaskID)",
+            "\(tokens) local tokens",
+            "\(taskCount) \(taskCount == 1 ? "task" : "tasks") in the tree"
+        ]
+        if let projectLabel {
+            parts.insert("Project \(projectLabel)", at: 0)
+        }
+        parts.append("\(coverage.displayName) coverage")
+        if let reason {
+            parts.append(reason)
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+struct UsageReceiptOverview: Equatable, Sendable {
+    let receipts: [UsageReceiptSummary]
+    let totalTokens: Int64
+    let unattributedTokens: Int64
+    let coverage: CoverageLevel
+    let reason: String?
+    let receiptCoverage: CoverageLevel
+    let receiptReason: String?
+}
+
 struct UsageReceiptFilterOptions: Equatable, Sendable {
     let projects: [String]
     let taskTrees: [String]
@@ -216,34 +257,278 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
     fileprivate let observation: LocalActivityObservation
     let interval: DateInterval
 
+    func updating(
+        interval: DateInterval,
+        observation: LocalActivityObservation
+    ) -> UsageReceiptSnapshot {
+        UsageReceiptSnapshot(
+            contributions: contributions,
+            diagnostics: diagnostics,
+            projections: projections,
+            taskIDsByRoot: taskIDsByRoot,
+            observation: observation,
+            interval: interval
+        )
+    }
+
+    func overview(
+        in selectedInterval: DateInterval,
+        filters: WorkspaceFilters
+    ) -> UsageReceiptOverview {
+        var accumulators: [String: SummaryAccumulator] = [:]
+        var totalTokens: Int64 = 0
+        var unattributedTokens: Int64 = 0
+        var totalOverflow = false
+        var unattributedOverflow = false
+        var hasUnboundedCounter = false
+        var hasMissingProject = false
+        var hasTokenContribution = false
+        var contributionGaps = FilterGaps()
+        var diagnosticGaps = FilterGaps()
+
+        for contribution in contributions
+        where Self.contains(contribution.date, in: selectedInterval) {
+            contributionGaps.observe(
+                Self.metadata(for: contribution),
+                filters: filters
+            )
+            guard Self.matches(contribution, filters: filters) else {
+                continue
+            }
+            hasUnboundedCounter =
+                hasUnboundedCounter || contribution.hasUnboundedCounter
+            guard !totalOverflow else { continue }
+            let total = totalTokens.addingReportingOverflow(
+                contribution.tokens
+            )
+            totalOverflow = total.overflow
+            totalTokens = total.partialValue
+            if let rootTaskID = contribution.rootTaskID {
+                var accumulator = accumulators[rootTaskID]
+                    ?? SummaryAccumulator()
+                accumulator.hasUnboundedCounter =
+                    accumulator.hasUnboundedCounter
+                        || contribution.hasUnboundedCounter
+                if contribution.tokens > 0 {
+                    accumulator.add(contribution)
+                }
+                accumulators[rootTaskID] = accumulator
+            }
+            guard contribution.tokens > 0 else { continue }
+            hasTokenContribution = true
+            hasMissingProject =
+                hasMissingProject || contribution.projectLabel == nil
+            guard contribution.rootTaskID == nil else {
+                continue
+            }
+            let unattributed = unattributedTokens.addingReportingOverflow(
+                contribution.tokens
+            )
+            unattributedOverflow =
+                unattributedOverflow || unattributed.overflow
+            unattributedTokens = unattributed.partialValue
+        }
+
+        for diagnostic in diagnostics
+        where diagnostic.intersects(selectedInterval) {
+            diagnosticGaps.observe(
+                Self.metadata(for: diagnostic),
+                filters: filters
+            )
+            guard Self.matches(diagnostic, filters: filters),
+                  let rootTaskID = diagnostic.rootTaskID else {
+                continue
+            }
+            var accumulator = accumulators[rootTaskID]
+                ?? SummaryAccumulator()
+            accumulator.add(diagnostic)
+            accumulators[rootTaskID] = accumulator
+        }
+
+        guard !totalOverflow, !unattributedOverflow,
+              !accumulators.values.contains(where: \.tokensOverflow) else {
+            return UsageReceiptOverview(
+                receipts: [],
+                totalTokens: 0,
+                unattributedTokens: 0,
+                coverage: .unavailable,
+                reason: "Local token total is invalid",
+                receiptCoverage: .unavailable,
+                receiptReason: "Local token total is invalid"
+            )
+        }
+
+        let filterGapReason = contributionGaps.reason(
+            subject: "Some local activity",
+            verb: "has"
+        ) ?? diagnosticGaps.reason(
+            subject: "Some local diagnostics",
+            verb: "have"
+        )
+        let summaries: [UsageReceiptSummary] = accumulators.compactMap {
+            rootTaskID, accumulator -> UsageReceiptSummary? in
+            guard accumulator.hasReceiptEvidence else { return nil }
+            let evidence = receiptEvidence(
+                hasMissingProject: accumulator.hasMissingProject,
+                hasUnboundedCounter: accumulator.hasUnboundedCounter,
+                filterGapReason: filterGapReason
+            )
+            return UsageReceiptSummary(
+                rootTaskID: rootTaskID,
+                projectLabel: accumulator.projectLabel,
+                tokens: accumulator.tokens,
+                taskCount: max(
+                    taskIDsByRoot[rootTaskID]?.count ?? 0,
+                    1
+                ),
+                coverage: evidence.0,
+                reason: evidence.1
+            )
+        }
+        .sorted {
+            ($0.projectLabel ?? "", $0.rootTaskID)
+                < ($1.projectLabel ?? "", $1.rootTaskID)
+        }
+        let coverage = sliceEvidence(
+            hasTokenContribution: hasTokenContribution,
+            hasUnboundedCounter: hasUnboundedCounter,
+            hasMissingProject: hasMissingProject,
+            hasUnattributedTokens: unattributedTokens > 0,
+            hasReceipts: !summaries.isEmpty,
+            filterGapReason: filterGapReason
+        )
+        let combinedReceiptEvidence = Self.receiptEvidence(summaries)
+        return UsageReceiptOverview(
+            receipts: summaries,
+            totalTokens: totalTokens,
+            unattributedTokens: unattributedTokens,
+            coverage: coverage.0,
+            reason: coverage.1,
+            receiptCoverage: combinedReceiptEvidence.0,
+            receiptReason: combinedReceiptEvidence.1
+        )
+    }
+
+    func receipt(
+        rootTaskID: String,
+        in selectedInterval: DateInterval,
+        filters: WorkspaceFilters
+    ) -> UsageReceipt? {
+        return slice(
+            in: selectedInterval,
+            filters: filters,
+            onlyRootTaskID: rootTaskID
+        ).receipts.first
+    }
+
+    func localTokenSlice(
+        in selectedInterval: DateInterval,
+        filters: WorkspaceFilters
+    ) -> LocalTokenActivitySlice {
+        let overview = overview(
+            in: selectedInterval,
+            filters: filters
+        )
+        let selected = contributions.filter {
+            Self.contains($0.date, in: selectedInterval)
+                && $0.tokens > 0
+                && Self.matches($0, filters: filters)
+        }
+        return LocalTokenActivitySlice(
+            tokens: overview.totalTokens,
+            points: cumulativePoints(selected),
+            coverage: overview.coverage,
+            reason: overview.reason
+        )
+    }
+
     func slice(
         in selectedInterval: DateInterval,
         filters: WorkspaceFilters
     ) -> UsageReceiptSlice {
-        let inRange = contributions.filter {
-            Self.contains($0.date, in: selectedInterval)
-        }
-        let diagnosticsInRange = diagnostics.filter {
-            $0.intersects(selectedInterval)
-        }
-        let filterGapReason = Self.filterGapReason(
-            in: inRange,
-            filters: filters
-        ) ?? Self.filterGapReason(
-            in: diagnosticsInRange,
-            filters: filters
+        slice(
+            in: selectedInterval,
+            filters: filters,
+            onlyRootTaskID: nil
         )
-        let selected = inRange.filter {
-            Self.matches($0, filters: filters)
+    }
+
+    private func slice(
+        in selectedInterval: DateInterval,
+        filters: WorkspaceFilters,
+        onlyRootTaskID: String?
+    ) -> UsageReceiptSlice {
+        var groupedContributions: [String: [Contribution]] = [:]
+        var groupedDiagnostics: [String: [DiagnosticContribution]] = [:]
+        var tokenContributions: [Contribution] = []
+        var unboundedRoots = Set<String>()
+        var totalTokens: Int64 = 0
+        var unattributedTokens: Int64 = 0
+        var totalOverflow = false
+        var unattributedOverflow = false
+        var hasUnboundedCounter = false
+        var hasMissingProject = false
+        var contributionGaps = FilterGaps()
+        var diagnosticGaps = FilterGaps()
+
+        for contribution in contributions
+        where Self.contains(contribution.date, in: selectedInterval) {
+            contributionGaps.observe(
+                Self.metadata(for: contribution),
+                filters: filters
+            )
+            guard Self.matches(contribution, filters: filters),
+                  onlyRootTaskID == nil
+                    || contribution.rootTaskID == onlyRootTaskID else {
+                continue
+            }
+            let total = totalTokens.addingReportingOverflow(
+                contribution.tokens
+            )
+            totalOverflow = totalOverflow || total.overflow
+            totalTokens = total.partialValue
+            hasUnboundedCounter =
+                hasUnboundedCounter || contribution.hasUnboundedCounter
+            if contribution.hasUnboundedCounter,
+               let rootTaskID = contribution.rootTaskID {
+                unboundedRoots.insert(rootTaskID)
+            }
+            guard contribution.tokens > 0 else { continue }
+            tokenContributions.append(contribution)
+            hasMissingProject =
+                hasMissingProject || contribution.projectLabel == nil
+            if let rootTaskID = contribution.rootTaskID {
+                groupedContributions[rootTaskID, default: []]
+                    .append(contribution)
+            } else {
+                let unattributed = unattributedTokens.addingReportingOverflow(
+                    contribution.tokens
+                )
+                unattributedOverflow =
+                    unattributedOverflow || unattributed.overflow
+                unattributedTokens = unattributed.partialValue
+            }
         }
-        let selectedDiagnostics = diagnosticsInRange.filter {
-            Self.matches($0, filters: filters)
+
+        for diagnostic in diagnostics
+        where diagnostic.intersects(selectedInterval) {
+            diagnosticGaps.observe(
+                Self.metadata(for: diagnostic),
+                filters: filters
+            )
+            guard Self.matches(diagnostic, filters: filters),
+                  onlyRootTaskID == nil
+                    || diagnostic.rootTaskID == onlyRootTaskID,
+                  let rootTaskID = diagnostic.rootTaskID else {
+                continue
+            }
+            groupedDiagnostics[rootTaskID, default: []].append(diagnostic)
         }
-        let tokenContributions = selected.filter { $0.tokens > 0 }
-        let hasUnboundedCounter = selected.contains {
-            $0.hasUnboundedCounter
-        }
-        guard let total = Self.sum(selected.map(\.tokens)) else {
+
+        guard !totalOverflow, !unattributedOverflow,
+              groupedContributions.values.allSatisfy({
+                  Self.sum($0.lazy.map(\.tokens)) != nil
+              }) else {
             return UsageReceiptSlice(
                 receipts: [],
                 totalTokens: 0,
@@ -255,25 +540,18 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
                 receiptReason: "Local token total is invalid"
             )
         }
-        let groupedContributions = Dictionary(
-            grouping: tokenContributions.compactMap { contribution in
-                contribution.rootTaskID.map { ($0, contribution) }
-            },
-            by: \.0
-        )
-        let groupedDiagnostics = Dictionary(
-            grouping: selectedDiagnostics.compactMap { diagnostic in
-                diagnostic.rootTaskID.map { ($0, diagnostic) }
-            },
-            by: \.0
+        let filterGapReason = contributionGaps.reason(
+            subject: "Some local activity",
+            verb: "has"
+        ) ?? diagnosticGaps.reason(
+            subject: "Some local diagnostics",
+            verb: "have"
         )
         let rootTaskIDs = Set(groupedContributions.keys)
             .union(groupedDiagnostics.keys)
         let receipts = rootTaskIDs.map { rootTaskID in
-            let contributions = (groupedContributions[rootTaskID] ?? [])
-                .map(\.1)
-            let receiptDiagnostics = (groupedDiagnostics[rootTaskID] ?? [])
-                .map(\.1)
+            let contributions = groupedContributions[rootTaskID] ?? []
+            let receiptDiagnostics = groupedDiagnostics[rootTaskID] ?? []
             let project = contributions.compactMap(\.projectLabel).first
                 ?? receiptDiagnostics.compactMap(\.projectLabel).first
             let hasMissingProject = contributions.contains {
@@ -281,32 +559,11 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             } || receiptDiagnostics.contains {
                 $0.projectLabel == nil
             }
-            let receiptHasUnboundedCounter = selected.contains {
-                $0.rootTaskID == rootTaskID && $0.hasUnboundedCounter
-            }
-            let receiptEvidence: (CoverageLevel, String)
-            switch observation {
-            case let .unavailable(message):
-                receiptEvidence = (.unavailable, message)
-            case let .gap(_, _, message):
-                receiptEvidence = (.low, message)
-            case .continuous:
-                if receiptHasUnboundedCounter {
-                    receiptEvidence = (
-                        .low,
-                        "Local token activity starts from an unbounded counter"
-                    )
-                } else if let filterGapReason {
-                    receiptEvidence = (.partial, filterGapReason)
-                } else {
-                    receiptEvidence = hasMissingProject
-                    ? (.partial, "Project metadata is missing")
-                    : (
-                        .partial,
-                        "Task Tree may omit Review and Guardian Tasks"
-                    )
-                }
-            }
+            let receiptEvidence = receiptEvidence(
+                hasMissingProject: hasMissingProject,
+                hasUnboundedCounter: unboundedRoots.contains(rootTaskID),
+                filterGapReason: filterGapReason
+            )
             let taskTree = Self.taskTree(
                 rootTaskID: rootTaskID,
                 contributions: contributions,
@@ -321,7 +578,9 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             return UsageReceipt(
                 rootTaskID: rootTaskID,
                 projectLabel: project,
-                tokens: contributions.reduce(0) { $0 + $1.tokens },
+                tokens: Self.sum(
+                    contributions.lazy.map(\.tokens)
+                ) ?? 0,
                 interval: selectedInterval,
                 taskCount: taskTree.taskCount,
                 taskTree: taskTree,
@@ -332,6 +591,7 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
                     $0.context?.reasoning
                 },
                 diagnostics: Self.diagnosticSummary(
+                    contributions,
                     receiptDiagnostics,
                     selectedInterval: selectedInterval,
                     observation: observation
@@ -344,48 +604,22 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             ($0.projectLabel ?? "", $0.rootTaskID)
                 < ($1.projectLabel ?? "", $1.rootTaskID)
         }
-        let unattributed = tokenContributions
-            .filter { $0.rootTaskID == nil }
-            .reduce(0) { $0 + $1.tokens }
-        let coverage: CoverageLevel
-        let reason: String?
-        switch observation {
-        case .unavailable(let message):
-            coverage = .unavailable
-            reason = message
-        case .gap(_, _, let message):
-            coverage = .low
-            reason = message
-        case .continuous:
-            if hasUnboundedCounter {
-                coverage = .low
-                reason = "Local token activity starts from an unbounded counter"
-            } else if let filterGapReason {
-                coverage = tokenContributions.isEmpty ? .low : .partial
-                reason = filterGapReason
-            } else if tokenContributions.isEmpty {
-                coverage = .notApplicable
-                reason = "No local token activity was observed"
-            } else if unattributed > 0 || tokenContributions.contains(
-                where: { $0.projectLabel == nil }
-            ) {
-                coverage = receipts.isEmpty ? .low : .partial
-                reason = unattributed > 0
-                    ? "Task metadata is missing"
-                    : "Project metadata is missing"
-            } else {
-                coverage = .high
-                reason = "Only local activity on this Mac is observed"
-            }
-        }
+        let coverage = sliceEvidence(
+            hasTokenContribution: !tokenContributions.isEmpty,
+            hasUnboundedCounter: hasUnboundedCounter,
+            hasMissingProject: hasMissingProject,
+            hasUnattributedTokens: unattributedTokens > 0,
+            hasReceipts: !receipts.isEmpty,
+            filterGapReason: filterGapReason
+        )
         let combinedReceiptEvidence = Self.receiptEvidence(receipts)
         return UsageReceiptSlice(
             receipts: receipts,
-            totalTokens: total,
-            unattributedTokens: unattributed,
+            totalTokens: totalTokens,
+            unattributedTokens: unattributedTokens,
             points: cumulativePoints(tokenContributions),
-            coverage: coverage,
-            reason: reason,
+            coverage: coverage.0,
+            reason: coverage.1,
             receiptCoverage: combinedReceiptEvidence.0,
             receiptReason: combinedReceiptEvidence.1
         )
@@ -394,37 +628,46 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
     func filterOptions(
         in selectedInterval: DateInterval
     ) -> UsageReceiptFilterOptions {
-        let selected = contributions.filter {
-            Self.contains($0.date, in: selectedInterval) && $0.tokens > 0
+        var projects = Set<String>()
+        var taskTrees = Set<String>()
+        var models = Set<String>()
+        var reasoningLevels = Set<String>()
+        for contribution in contributions
+        where Self.contains(contribution.date, in: selectedInterval)
+            && contribution.tokens > 0 {
+            if let project = contribution.projectLabel {
+                projects.insert(project)
+            }
+            if let taskTree = contribution.rootTaskID {
+                taskTrees.insert(taskTree)
+            }
+            if let model = contribution.context?.effectiveModel {
+                models.insert(model)
+            }
+            if let reasoning = contribution.context?.reasoning {
+                reasoningLevels.insert(reasoning)
+            }
         }
-        let selectedDiagnostics = diagnostics.filter {
-            $0.intersects(selectedInterval)
+        for diagnostic in diagnostics
+        where diagnostic.intersects(selectedInterval) {
+            if let project = diagnostic.projectLabel {
+                projects.insert(project)
+            }
+            if let taskTree = diagnostic.rootTaskID {
+                taskTrees.insert(taskTree)
+            }
+            if let model = diagnostic.context?.effectiveModel {
+                models.insert(model)
+            }
+            if let reasoning = diagnostic.context?.reasoning {
+                reasoningLevels.insert(reasoning)
+            }
         }
         return UsageReceiptFilterOptions(
-            projects: Set(selected.compactMap(\.projectLabel))
-                .union(selectedDiagnostics.compactMap(\.projectLabel))
-                .sorted(),
-            taskTrees: Set(selected.compactMap(\.rootTaskID))
-                .union(selectedDiagnostics.compactMap(\.rootTaskID))
-                .sorted(),
-            models: Set(
-                selected.compactMap { $0.context?.effectiveModel }
-            )
-            .union(
-                selectedDiagnostics.compactMap {
-                    $0.context?.effectiveModel
-                }
-            )
-            .sorted(),
-            reasoningLevels: Set(
-                selected.compactMap { $0.context?.reasoning }
-            )
-            .union(
-                selectedDiagnostics.compactMap {
-                    $0.context?.reasoning
-                }
-            )
-            .sorted()
+            projects: projects.sorted(),
+            taskTrees: taskTrees.sorted(),
+            models: models.sorted(),
+            reasoningLevels: reasoningLevels.sorted()
         )
     }
 
@@ -433,24 +676,27 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
         let tokens: Int64
         let rootTaskID: String?
         let projectLabel: String?
-        let context: LocalActivityContext?
+        let sharedContext: SharedContext?
         let tokenSource: LocalActivitySourceKind
         let hasUnboundedCounter: Bool
+        let tokenDelta: LocalTokenUsage?
+        let contextUsage: LocalTokenUsage?
+
+        var context: LocalActivityContext? { sharedContext?.value }
     }
 
     fileprivate struct DiagnosticContribution: Equatable, Sendable {
         let date: Date
         let rootTaskID: String?
         let projectLabel: String?
-        let context: LocalActivityContext?
-        let key: LocalActivityFactKey
-        let value: LocalActivityFactValue?
-        let tokenDelta: LocalTokenUsage?
-        let availability: LocalActivityAvailability
-        let reason: String?
+        let sharedContext: SharedContext?
+        let payload: DiagnosticPayload
         let eventID: String
         let source: LocalActivitySourceKind
 
+        var context: LocalActivityContext? { sharedContext?.value }
+        var key: LocalActivityFactKey { payload.key }
+        var value: LocalActivityFactValue? { payload.value }
         func intersects(_ interval: DateInterval) -> Bool {
             if let durationInterval {
                 return durationInterval.start < interval.end
@@ -465,7 +711,7 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
         }
 
         var durationInterval: DateInterval? {
-            guard case let .duration(duration) = value,
+            guard let duration = payload.duration,
                   duration.completedAt > duration.startedAt else {
                 return nil
             }
@@ -473,6 +719,56 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
                 start: duration.startedAt,
                 end: duration.completedAt
             )
+        }
+    }
+
+    fileprivate final class SharedContext: Sendable, Equatable {
+        let value: LocalActivityContext
+
+        init(_ value: LocalActivityContext) {
+            self.value = value
+        }
+
+        static func == (lhs: SharedContext, rhs: SharedContext) -> Bool {
+            lhs.value == rhs.value
+        }
+    }
+
+    fileprivate enum DiagnosticPayload: Equatable, Sendable {
+        case context(LocalTokenUsage?)
+        case time(LocalTurnTiming?)
+        case tool(String?)
+        case duration(LocalActivityFactKey, LocalActivityDuration?)
+        case compaction
+
+        var key: LocalActivityFactKey {
+            switch self {
+            case .context: .context
+            case .time: .time
+            case .tool: .tool
+            case let .duration(key, _): key
+            case .compaction: .compaction
+            }
+        }
+
+        var value: LocalActivityFactValue? {
+            switch self {
+            case let .context(value):
+                value.map(LocalActivityFactValue.tokens)
+            case let .time(value):
+                value.map(LocalActivityFactValue.turnTiming)
+            case let .tool(value):
+                value.map(LocalActivityFactValue.text)
+            case let .duration(_, value):
+                value.map(LocalActivityFactValue.duration)
+            case .compaction:
+                .count(1)
+            }
+        }
+
+        var duration: LocalActivityDuration? {
+            guard case let .duration(_, value) = self else { return nil }
+            return value
         }
     }
 
@@ -488,6 +784,193 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
         case taskTree
         case model
         case reasoning
+    }
+
+    private struct FilterGaps {
+        var project = false
+        var taskTree = false
+        var model = false
+        var reasoning = false
+
+        mutating func observe(
+            _ metadata: FilterMetadata,
+            filters: WorkspaceFilters
+        ) {
+            if filters.projectID != nil,
+               metadata.projectID == nil,
+               UsageReceiptSnapshot.couldMatch(
+                   metadata,
+                   filters: filters,
+                   ignoring: .project
+               ) {
+                project = true
+            }
+            if filters.taskTreeID != nil,
+               metadata.taskTreeID == nil,
+               UsageReceiptSnapshot.couldMatch(
+                   metadata,
+                   filters: filters,
+                   ignoring: .taskTree
+               ) {
+                taskTree = true
+            }
+            if filters.model != nil,
+               metadata.model == nil,
+               UsageReceiptSnapshot.couldMatch(
+                   metadata,
+                   filters: filters,
+                   ignoring: .model
+               ) {
+                model = true
+            }
+            if filters.reasoning != nil,
+               metadata.reasoning == nil,
+               UsageReceiptSnapshot.couldMatch(
+                   metadata,
+                   filters: filters,
+                   ignoring: .reasoning
+               ) {
+                reasoning = true
+            }
+        }
+
+        func reason(subject: String, verb: String) -> String? {
+            if project {
+                return "\(subject) \(verb) no Project metadata"
+            }
+            if taskTree {
+                return "\(subject) \(verb) no Task metadata"
+            }
+            if model {
+                return "\(subject) \(verb) no model metadata"
+            }
+            if reasoning {
+                return "\(subject) \(verb) no reasoning metadata"
+            }
+            return nil
+        }
+    }
+
+    private struct SummaryAccumulator {
+        var projectLabel: String?
+        var tokens: Int64 = 0
+        var tokensOverflow = false
+        var hasMissingProject = false
+        var hasUnboundedCounter = false
+        var hasReceiptEvidence = false
+
+        mutating func add(_ contribution: Contribution) {
+            hasReceiptEvidence = true
+            projectLabel = projectLabel ?? contribution.projectLabel
+            hasMissingProject =
+                hasMissingProject || contribution.projectLabel == nil
+            let result = tokens.addingReportingOverflow(contribution.tokens)
+            tokensOverflow = tokensOverflow || result.overflow
+            tokens = result.partialValue
+        }
+
+        mutating func add(_ diagnostic: DiagnosticContribution) {
+            hasReceiptEvidence = true
+            projectLabel = projectLabel ?? diagnostic.projectLabel
+            hasMissingProject =
+                hasMissingProject || diagnostic.projectLabel == nil
+        }
+    }
+
+    private static func metadata(
+        for contribution: Contribution
+    ) -> FilterMetadata {
+        FilterMetadata(
+            projectID: contribution.projectLabel,
+            taskTreeID: contribution.rootTaskID,
+            model: contribution.context?.effectiveModel,
+            reasoning: contribution.context?.reasoning
+        )
+    }
+
+    private static func metadata(
+        for diagnostic: DiagnosticContribution
+    ) -> FilterMetadata {
+        FilterMetadata(
+            projectID: diagnostic.projectLabel,
+            taskTreeID: diagnostic.rootTaskID,
+            model: diagnostic.context?.effectiveModel,
+            reasoning: diagnostic.context?.reasoning
+        )
+    }
+
+    private func receiptEvidence(
+        hasMissingProject: Bool,
+        hasUnboundedCounter: Bool,
+        filterGapReason: String?
+    ) -> (CoverageLevel, String) {
+        switch observation {
+        case let .unavailable(message):
+            return (.unavailable, message)
+        case let .gap(_, _, message):
+            return (.low, message)
+        case .continuous:
+            if hasUnboundedCounter {
+                return (
+                    .low,
+                    "Local token activity starts from an unbounded counter"
+                )
+            }
+            if let filterGapReason {
+                return (.partial, filterGapReason)
+            }
+            if hasMissingProject {
+                return (.partial, "Project metadata is missing")
+            }
+            return (
+                .partial,
+                "Task Tree may omit Review and Guardian Tasks"
+            )
+        }
+    }
+
+    private func sliceEvidence(
+        hasTokenContribution: Bool,
+        hasUnboundedCounter: Bool,
+        hasMissingProject: Bool,
+        hasUnattributedTokens: Bool,
+        hasReceipts: Bool,
+        filterGapReason: String?
+    ) -> (CoverageLevel, String?) {
+        switch observation {
+        case let .unavailable(message):
+            return (.unavailable, message)
+        case let .gap(_, _, message):
+            return (.low, message)
+        case .continuous:
+            if hasUnboundedCounter {
+                return (
+                    .low,
+                    "Local token activity starts from an unbounded counter"
+                )
+            }
+            if let filterGapReason {
+                return (
+                    hasTokenContribution ? .partial : .low,
+                    filterGapReason
+                )
+            }
+            if !hasTokenContribution {
+                return (
+                    .notApplicable,
+                    "No local token activity was observed"
+                )
+            }
+            if hasUnattributedTokens || hasMissingProject {
+                return (
+                    hasReceipts ? .partial : .low,
+                    hasUnattributedTokens
+                        ? "Task metadata is missing"
+                        : "Project metadata is missing"
+                )
+            }
+            return (.high, "Only local activity on this Mac is observed")
+        }
     }
 
     private static func taskTree(
@@ -599,6 +1082,7 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
                         Set(turnContributions.map(\.tokenSource))
                     ).sorted { $0.rawValue < $1.rawValue },
                     diagnostics: diagnosticSummary(
+                        turnContributions,
                         diagnostics,
                         selectedInterval: selectedInterval,
                         observation: observation
@@ -878,17 +1362,27 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
     }
 
     private static func diagnosticSummary(
+        _ contributions: [Contribution],
         _ diagnostics: [DiagnosticContribution],
         selectedInterval: DateInterval,
         observation: LocalActivityObservation
     ) -> UsageReceiptDiagnostics {
-        let tokenDeltas = diagnostics.compactMap(\.tokenDelta)
+        let tokenDeltas = contributions.compactMap(\.tokenDelta)
         let tokenTotals = tokenDeltas.isEmpty
             ? nil
             : tokenDiagnostics(tokenDeltas)
-        let contextSamples = diagnostics
+        let contextSamples = (
+            contributions.compactMap { contribution in
+                contribution.contextUsage.map {
+                    (
+                        contribution.date,
+                        $0.totalTokens,
+                        contribution.context?.modelContextWindow
+                    )
+                }
+            }
+            + diagnostics
             .filter { $0.key == .context }
-            .sorted { $0.date < $1.date }
             .compactMap { diagnostic -> (Date, Int64, Int64?)? in
                 guard case let .tokens(usage) = diagnostic.value else {
                     return nil
@@ -899,6 +1393,8 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
                     diagnostic.context?.modelContextWindow
                 )
             }
+        )
+        .sorted { $0.0 < $1.0 }
         let context = contextSamples.last.map { last in
             UsageReceiptContextDiagnostics(
                 usedTokens: last.1,
@@ -960,7 +1456,7 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             } else if tokenTotals?.reconciles == false {
                 coverage = .low
                 reason = "Token components do not match total"
-            } else if diagnostics.isEmpty {
+            } else if diagnostics.isEmpty && contributions.isEmpty {
                 coverage = .unavailable
                 reason = "No local diagnostics were observed"
             } else {
@@ -974,7 +1470,10 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             tools: tools,
             compactions: compactions,
             duration: duration,
-            sources: Array(Set(diagnostics.map(\.source)))
+            sources: Array(
+                Set(diagnostics.map(\.source))
+                    .union(contributions.map(\.tokenSource))
+            )
                 .sorted { $0.rawValue < $1.rawValue },
             coverage: coverage,
             reason: reason
@@ -990,7 +1489,7 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
             _ value: KeyPath<LocalTokenUsage, Int64>
         ) -> Int64? {
             guard values.allSatisfy({
-                $0.observedComponents.contains(component)
+                $0.observes(component)
             }) else {
                 return nil
             }
@@ -1157,13 +1656,37 @@ struct UsageReceiptSnapshot: Equatable, Sendable {
         return (.notApplicable, "No Usage Receipts are available")
     }
 
+    private static func receiptEvidence(
+        _ receipts: [UsageReceiptSummary]
+    ) -> (CoverageLevel, String?) {
+        for level in [
+            CoverageLevel.unavailable,
+            .low,
+            .partial,
+            .high,
+            .complete,
+            .notApplicable
+        ] {
+            if let receipt = receipts.first(where: {
+                $0.coverage == level
+            }) {
+                return (level, receipt.reason)
+            }
+        }
+        return (.notApplicable, "No Usage Receipts are available")
+    }
+
     private func cumulativePoints(
         _ contributions: [Contribution]
     ) -> [LocalTokenActivityPoint] {
         var total: Int64 = 0
         var points: [LocalTokenActivityPoint] = []
         for contribution in contributions.sorted(by: { $0.date < $1.date }) {
-            total += contribution.tokens
+            let addition = total.addingReportingOverflow(
+                contribution.tokens
+            )
+            guard !addition.overflow else { return [] }
+            total = addition.partialValue
             let point = LocalTokenActivityPoint(
                 date: contribution.date,
                 tokens: total
@@ -1210,6 +1733,20 @@ enum UsageReceiptAggregator {
                 taskIDsByRoot[rootTaskID, default: []].insert(taskID)
             }
         }
+        var sharedContexts: [
+            LocalActivityContext: UsageReceiptSnapshot.SharedContext
+        ] = [:]
+        func sharedContext(
+            _ context: LocalActivityContext?
+        ) -> UsageReceiptSnapshot.SharedContext? {
+            guard let context else { return nil }
+            if let existing = sharedContexts[context] {
+                return existing
+            }
+            let shared = UsageReceiptSnapshot.SharedContext(context)
+            sharedContexts[context] = shared
+            return shared
+        }
         let timestampParser = LocalEventTimestampParser()
         var seen = Set<String>()
         var contributions: [UsageReceiptSnapshot.Contribution] = []
@@ -1220,8 +1757,7 @@ enum UsageReceiptAggregator {
                   seen.insert(eventID).inserted,
                   let timestamp = fact.eventTimestamp,
                   let date = timestampParser.date(from: timestamp),
-                  date >= interval.start,
-                  date < interval.end else {
+                  date >= interval.start else {
                 continue
             }
             let unboundedReasons = [
@@ -1258,16 +1794,17 @@ enum UsageReceiptAggregator {
                     tokens: tokens,
                     rootTaskID: rootID,
                     projectLabel: projectLabel,
-                    context: fact.context,
+                    sharedContext: sharedContext(fact.context),
                     tokenSource: fact.source.source,
-                    hasUnboundedCounter: hasUnboundedCounter
+                    hasUnboundedCounter: hasUnboundedCounter,
+                    tokenDelta: fact.tokenDelta,
+                    contextUsage: fact.contextUsage
                 )
             )
         }
         var seenDiagnostics = Set<String>()
         var diagnostics: [UsageReceiptSnapshot.DiagnosticContribution] = []
         let diagnosticKeys: Set<LocalActivityFactKey> = [
-            .token,
             .context,
             .time,
             .tool,
@@ -1297,22 +1834,24 @@ enum UsageReceiptAggregator {
             let projectLabel = rootID.flatMap {
                 projectionByTask[$0]?.projectLabel
             }
+            guard let payload = diagnosticPayload(for: fact) else {
+                continue
+            }
             let diagnostic = UsageReceiptSnapshot.DiagnosticContribution(
                 date: date,
                 rootTaskID: rootID,
                 projectLabel: projectLabel,
-                context: fact.context,
-                key: fact.key,
-                value: fact.value,
-                tokenDelta: fact.tokenDelta,
-                availability: fact.availability,
-                reason: fact.reason,
+                sharedContext: sharedContext(fact.context),
+                payload: payload,
                 eventID: eventID,
                 source: fact.source.source
             )
-            if diagnostic.intersects(interval) {
-                diagnostics.append(diagnostic)
+            guard diagnostic.intersects(
+                DateInterval(start: interval.start, end: .distantFuture)
+            ) else {
+                continue
             }
+            diagnostics.append(diagnostic)
         }
         return UsageReceiptSnapshot(
             contributions: contributions,
@@ -1322,6 +1861,37 @@ enum UsageReceiptAggregator {
             observation: observation,
             interval: interval
         )
+    }
+
+    private static func diagnosticPayload(
+        for fact: LocalActivityFact
+    ) -> UsageReceiptSnapshot.DiagnosticPayload? {
+        switch fact.key {
+        case .context:
+            guard case let .tokens(usage) = fact.value else {
+                return .context(nil)
+            }
+            return .context(usage)
+        case .time:
+            guard case let .turnTiming(timing) = fact.value else {
+                return .time(nil)
+            }
+            return .time(timing)
+        case .tool:
+            guard case let .text(toolClass) = fact.value else {
+                return .tool(nil)
+            }
+            return .tool(toolClass)
+        case .execution, .toolTime, .wait, .poll:
+            guard case let .duration(duration) = fact.value else {
+                return .duration(fact.key, nil)
+            }
+            return .duration(fact.key, duration)
+        case .compaction:
+            return .compaction
+        default:
+            return nil
+        }
     }
 
     private static func rootTaskID(

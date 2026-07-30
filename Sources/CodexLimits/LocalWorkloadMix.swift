@@ -1,20 +1,13 @@
 import Foundation
 
 struct LocalEventTimestampParser {
-    private let fractional: ISO8601DateFormatter
-    private let standard: ISO8601DateFormatter
-
-    init() {
-        fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [
-            .withInternetDateTime,
-            .withFractionalSeconds
-        ]
-        standard = ISO8601DateFormatter()
-    }
+    private let fractional = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true
+    )
+    private let standard = Date.ISO8601FormatStyle()
 
     func date(from value: String) -> Date? {
-        fractional.date(from: value) ?? standard.date(from: value)
+        (try? fractional.parse(value)) ?? (try? standard.parse(value))
     }
 }
 

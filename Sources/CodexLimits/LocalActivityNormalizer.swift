@@ -49,7 +49,7 @@ enum LocalActivityFactValue: Codable, Equatable, Sendable {
     case duration(LocalActivityDuration)
 }
 
-struct LocalAgentIdentity: Codable, Equatable, Sendable {
+struct LocalAgentIdentity: Codable, Equatable, Hashable, Sendable {
     let nickname: String?
     let role: String?
 }
@@ -66,7 +66,7 @@ struct LocalActivityDuration: Codable, Equatable, Sendable {
     let completedAt: Date
 }
 
-struct LocalActivityContext: Codable, Equatable, Sendable {
+struct LocalActivityContext: Codable, Equatable, Hashable, Sendable {
     let taskID: String?
     let turnID: String?
     let agent: LocalAgentIdentity?
@@ -87,6 +87,7 @@ struct LocalActivityFact: Codable, Equatable, Sendable {
     let source: LocalActivitySourceMetadata
     var context: LocalActivityContext? = nil
     var tokenDelta: LocalTokenUsage? = nil
+    var contextUsage: LocalTokenUsage? = nil
 }
 
 struct LocalActivityNormalizationState: Codable, Equatable, Sendable {
@@ -138,7 +139,9 @@ struct LocalActivityNormalizer {
         if sourceChanged {
             state.lastTotalTokens = nil
             state.lastTokenUsage = nil
-            state.tokenSegment += 1
+            if state.tokenSegment < .max {
+                state.tokenSegment += 1
+            }
             state.context = nil
         }
         state.sourceGeneration = sourceGeneration
@@ -284,14 +287,18 @@ struct LocalActivityNormalizer {
             if let tokenUsage = record.tokenUsage {
                 let totalTokens = tokenUsage.totalTokens
                 let delta = state.lastTotalTokens.flatMap { previous in
-                    totalTokens >= previous ? totalTokens - previous : nil
+                    totalTokens >= previous
+                        ? difference(totalTokens, previous)
+                        : nil
                 }
                 let reason: String?
                 if state.lastTotalTokens == nil {
                     reason = sourceChanged ? "source-discontinuity" : "segment-baseline"
                 } else if delta == nil {
                     reason = "cumulative-counter-decreased"
-                    state.tokenSegment += 1
+                    if state.tokenSegment < .max {
+                        state.tokenSegment += 1
+                    }
                 } else {
                     reason = nil
                 }
@@ -309,13 +316,15 @@ struct LocalActivityNormalizer {
                         context: context,
                         tokenDelta: state.lastTokenUsage.flatMap {
                             tokenDelta(from: $0, to: tokenUsage)
-                        }
+                        },
+                        contextUsage: record.contextTokenUsage
                     )
                 )
                 state.lastTotalTokens = totalTokens
                 state.lastTokenUsage = tokenUsage
             }
-            if let contextTokenUsage = record.contextTokenUsage {
+            if record.tokenUsage == nil,
+               let contextTokenUsage = record.contextTokenUsage {
                 facts.append(
                     LocalActivityFact(
                         key: .context,
@@ -412,10 +421,8 @@ struct LocalActivityNormalizer {
         from previous: LocalTokenUsage,
         to current: LocalTokenUsage
     ) -> LocalTokenUsage? {
-        let observed = previous.observedComponents.intersection(
-            current.observedComponents
-        )
-        guard observed.contains(.total),
+        let observedMask = previous.sharedObservedComponentMask(with: current)
+        guard previous.observes(.total), current.observes(.total),
               let total = difference(
                   current.totalTokens,
                   previous.totalTokens
@@ -427,7 +434,9 @@ struct LocalActivityNormalizer {
             _ currentValue: Int64,
             _ previousValue: Int64
         ) -> Int64? {
-            guard observed.contains(key) else { return 0 }
+            guard previous.observes(key), current.observes(key) else {
+                return 0
+            }
             return difference(currentValue, previousValue)
         }
         guard
@@ -466,7 +475,7 @@ struct LocalActivityNormalizer {
             outputTokens: output,
             reasoningOutputTokens: reasoning,
             totalTokens: total,
-            observedComponents: observed
+            observedComponentMask: observedMask
         )
     }
 

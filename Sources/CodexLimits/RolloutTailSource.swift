@@ -2,6 +2,224 @@ import Foundation
 
 enum RolloutTailSourceError: Error, Equatable {
     case missingFileMetadata
+    case counterOverflow
+}
+
+struct BoundedJSONLReadResult {
+    let completeByteOffset: UInt64
+    let resumeByteOffset: UInt64
+    let bytesRead: UInt64
+    let oversizedRecordCount: Int
+    let processedLineCount: Int
+    let stoppedEarly: Bool
+    let discardingOversizedRecord: Bool
+}
+
+struct BoundedJSONLReader {
+    static let maximumRecordBytes = 16 * 1_024 * 1_024
+    private static let chunkBytes = 65_536
+
+    static func read(
+        handle: FileHandle,
+        from startOffset: UInt64,
+        through endOffset: UInt64? = nil,
+        maximumLines: Int = .max,
+        maximumBytes: UInt64 = .max,
+        maximumRecordBytes: Int = Self.maximumRecordBytes,
+        startsByDiscardingOversizedRecord: Bool = false,
+        discardsPartialRecordAtByteLimit: Bool = true,
+        onLine: (Data, UInt64) throws -> Bool
+    ) throws -> BoundedJSONLReadResult {
+        let lineLimit = max(maximumLines, 1)
+        let byteLimit = max(maximumBytes, 1)
+        try handle.seek(toOffset: startOffset)
+        var line = Data()
+        var lineStart = startOffset
+        var completeByteOffset = startOffset
+        var bytesRead: UInt64 = 0
+        var oversizedRecordCount =
+            startsByDiscardingOversizedRecord ? 1 : 0
+        var processedLineCount = 0
+        var processedBytes: UInt64 = 0
+        var skipsCurrentLine = startsByDiscardingOversizedRecord
+        var countedCurrentOversizedLine = startsByDiscardingOversizedRecord
+
+        while true {
+            let (currentOffset, currentOffsetOverflowed) =
+                startOffset.addingReportingOverflow(bytesRead)
+            guard !currentOffsetOverflowed else {
+                throw RolloutTailSourceError.counterOverflow
+            }
+            let remaining = endOffset.map {
+                $0 >= currentOffset ? $0 - currentOffset : 0
+            }
+            if remaining == 0 { break }
+            let budgetRemaining = byteLimit > bytesRead
+                ? byteLimit - bytesRead
+                : 0
+            if budgetRemaining == 0 {
+                let discardsPartial = discardsPartialRecordAtByteLimit
+                    && !line.isEmpty
+                if discardsPartial, !countedCurrentOversizedLine {
+                    oversizedRecordCount += 1
+                }
+                return BoundedJSONLReadResult(
+                    completeByteOffset: completeByteOffset,
+                    resumeByteOffset: discardsPartial || skipsCurrentLine
+                        ? currentOffset
+                        : completeByteOffset,
+                    bytesRead: bytesRead,
+                    oversizedRecordCount: oversizedRecordCount,
+                    processedLineCount: processedLineCount,
+                    stoppedEarly: true,
+                    discardingOversizedRecord: skipsCurrentLine
+                        || discardsPartial
+                )
+            }
+            let count = min(
+                Self.chunkBytes,
+                remaining.map { Int(min($0, UInt64(Self.chunkBytes))) }
+                    ?? Self.chunkBytes,
+                Int(min(budgetRemaining, UInt64(Self.chunkBytes)))
+            )
+            guard count > 0,
+                  let chunk = try handle.read(upToCount: count),
+                  !chunk.isEmpty else {
+                break
+            }
+            let chunkStart = currentOffset
+            let (nextBytesRead, overflowed) = bytesRead.addingReportingOverflow(
+                UInt64(chunk.count)
+            )
+            guard !overflowed else {
+                throw RolloutTailSourceError.counterOverflow
+            }
+            bytesRead = nextBytesRead
+            var pieceStart = chunk.startIndex
+            while let newline = chunk[pieceStart...].firstIndex(of: 0x0A) {
+                let piece = chunk[pieceStart..<newline]
+                if !skipsCurrentLine {
+                    if line.count + piece.count > maximumRecordBytes {
+                        line.removeAll(keepingCapacity: false)
+                        skipsCurrentLine = true
+                        if !countedCurrentOversizedLine {
+                            oversizedRecordCount += 1
+                            countedCurrentOversizedLine = true
+                        }
+                    } else {
+                        line.append(contentsOf: piece)
+                    }
+                }
+                let distance = chunk.distance(
+                    from: chunk.startIndex,
+                    to: newline
+                ) + 1
+                let (lineEnd, offsetOverflowed) =
+                    chunkStart.addingReportingOverflow(UInt64(distance))
+                guard !offsetOverflowed else {
+                    throw RolloutTailSourceError.counterOverflow
+                }
+                let shouldContinue: Bool
+                if skipsCurrentLine {
+                    shouldContinue = true
+                } else if !line.isEmpty {
+                    shouldContinue = try onLine(line, lineStart)
+                } else {
+                    shouldContinue = true
+                }
+                let (lineBytes, lineBytesOverflowed) =
+                    lineEnd.subtractingReportingOverflow(lineStart)
+                guard !lineBytesOverflowed else {
+                    throw RolloutTailSourceError.counterOverflow
+                }
+                let (nextProcessedBytes, processedBytesOverflowed) =
+                    processedBytes.addingReportingOverflow(lineBytes)
+                guard !processedBytesOverflowed else {
+                    throw RolloutTailSourceError.counterOverflow
+                }
+                processedBytes = nextProcessedBytes
+                processedLineCount += 1
+                line.removeAll(keepingCapacity: true)
+                skipsCurrentLine = false
+                countedCurrentOversizedLine = false
+                completeByteOffset = lineEnd
+                lineStart = lineEnd
+                pieceStart = chunk.index(after: newline)
+                if !shouldContinue
+                    || processedLineCount >= lineLimit
+                    || processedBytes >= byteLimit {
+                    return BoundedJSONLReadResult(
+                        completeByteOffset: completeByteOffset,
+                        resumeByteOffset: completeByteOffset,
+                        bytesRead: bytesRead,
+                        oversizedRecordCount: oversizedRecordCount,
+                        processedLineCount: processedLineCount,
+                        stoppedEarly: true,
+                        discardingOversizedRecord: false
+                    )
+                }
+            }
+            let remainder = chunk[pieceStart...]
+            if !skipsCurrentLine {
+                if line.count + remainder.count > maximumRecordBytes {
+                    line.removeAll(keepingCapacity: false)
+                    skipsCurrentLine = true
+                    if !countedCurrentOversizedLine {
+                        oversizedRecordCount += 1
+                        countedCurrentOversizedLine = true
+                    }
+                } else {
+                    line.append(contentsOf: remainder)
+                }
+            }
+            if bytesRead >= byteLimit, skipsCurrentLine || !line.isEmpty {
+                let discardsPartial = discardsPartialRecordAtByteLimit
+                    && !line.isEmpty
+                if discardsPartial,
+                   !skipsCurrentLine,
+                   !countedCurrentOversizedLine {
+                    oversizedRecordCount += 1
+                }
+                let (resumeByteOffset, offsetOverflowed) =
+                    startOffset.addingReportingOverflow(bytesRead)
+                guard !offsetOverflowed else {
+                    throw RolloutTailSourceError.counterOverflow
+                }
+                return BoundedJSONLReadResult(
+                    completeByteOffset: completeByteOffset,
+                    resumeByteOffset: discardsPartial || skipsCurrentLine
+                        ? resumeByteOffset
+                        : completeByteOffset,
+                    bytesRead: bytesRead,
+                    oversizedRecordCount: oversizedRecordCount,
+                    processedLineCount: processedLineCount,
+                    stoppedEarly: true,
+                    discardingOversizedRecord: skipsCurrentLine
+                        || discardsPartial
+                )
+            }
+        }
+        let resumeByteOffset: UInt64
+        if skipsCurrentLine {
+            let (offset, overflowed) =
+                startOffset.addingReportingOverflow(bytesRead)
+            guard !overflowed else {
+                throw RolloutTailSourceError.counterOverflow
+            }
+            resumeByteOffset = offset
+        } else {
+            resumeByteOffset = completeByteOffset
+        }
+        return BoundedJSONLReadResult(
+            completeByteOffset: completeByteOffset,
+            resumeByteOffset: resumeByteOffset,
+            bytesRead: bytesRead,
+            oversizedRecordCount: oversizedRecordCount,
+            processedLineCount: processedLineCount,
+            stoppedEarly: false,
+            discardingOversizedRecord: skipsCurrentLine
+        )
+    }
 }
 
 struct RolloutFileIdentity: Codable, Equatable, Hashable, Sendable {
@@ -14,6 +232,7 @@ struct RolloutCheckpoint: Codable, Equatable, Sendable {
     let byteLength: UInt64
     let threadID: String?
     let fingerprint: UInt64
+    let rawSuffixFingerprint: UInt64?
 }
 
 struct RolloutCursor: Codable, Equatable, Sendable {
@@ -26,6 +245,7 @@ struct RolloutCursor: Codable, Equatable, Sendable {
     let threadID: String?
     let processedPrefixFingerprint: UInt64?
     let checkpoint: RolloutCheckpoint?
+    let discardingOversizedRecord: Bool?
 }
 
 enum LocalTokenComponent: String, Codable, CaseIterable, Sendable {
@@ -44,9 +264,10 @@ struct LocalTokenUsage: Codable, Equatable, Sendable {
     let outputTokens: Int64
     let reasoningOutputTokens: Int64
     let totalTokens: Int64
-    var observedComponents: Set<LocalTokenComponent> = Set(
-        LocalTokenComponent.allCases
-    )
+    private let observedComponentMask: UInt8
+    var observedComponents: Set<LocalTokenComponent> {
+        Set(LocalTokenComponent.allCases.filter(observes))
+    }
 
     private enum CodingKeys: String, CodingKey {
         case inputTokens
@@ -75,7 +296,25 @@ struct LocalTokenUsage: Codable, Equatable, Sendable {
         self.outputTokens = outputTokens
         self.reasoningOutputTokens = reasoningOutputTokens
         self.totalTokens = totalTokens
-        self.observedComponents = observedComponents
+        observedComponentMask = Self.mask(for: observedComponents)
+    }
+
+    init(
+        inputTokens: Int64,
+        cachedInputTokens: Int64,
+        cacheWriteInputTokens: Int64,
+        outputTokens: Int64,
+        reasoningOutputTokens: Int64,
+        totalTokens: Int64,
+        observedComponentMask: UInt8
+    ) {
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.outputTokens = outputTokens
+        self.reasoningOutputTokens = reasoningOutputTokens
+        self.totalTokens = totalTokens
+        self.observedComponentMask = observedComponentMask
     }
 
     init(from decoder: Decoder) throws {
@@ -95,10 +334,12 @@ struct LocalTokenUsage: Codable, Equatable, Sendable {
             forKey: .reasoningOutputTokens
         )
         totalTokens = try values.decode(Int64.self, forKey: .totalTokens)
-        observedComponents = try values.decodeIfPresent(
+        observedComponentMask = Self.mask(
+            for: try values.decodeIfPresent(
             [LocalTokenComponent].self,
             forKey: .observedComponents
-        ).map(Set.init) ?? [.total]
+            ).map(Set.init) ?? [.total]
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -119,6 +360,31 @@ struct LocalTokenUsage: Codable, Equatable, Sendable {
             observedComponents.sorted { $0.rawValue < $1.rawValue },
             forKey: .observedComponents
         )
+    }
+
+    func observes(_ component: LocalTokenComponent) -> Bool {
+        observedComponentMask & Self.bit(for: component) != 0
+    }
+
+    func sharedObservedComponentMask(with other: LocalTokenUsage) -> UInt8 {
+        observedComponentMask & other.observedComponentMask
+    }
+
+    private static func mask(
+        for components: Set<LocalTokenComponent>
+    ) -> UInt8 {
+        components.reduce(0) { $0 | bit(for: $1) }
+    }
+
+    private static func bit(for component: LocalTokenComponent) -> UInt8 {
+        switch component {
+        case .input: 1 << 0
+        case .cachedInput: 1 << 1
+        case .cacheWriteInput: 1 << 2
+        case .output: 1 << 3
+        case .reasoningOutput: 1 << 4
+        case .total: 1 << 5
+        }
     }
 }
 
@@ -156,17 +422,30 @@ struct RolloutTailBatch: Equatable, Sendable {
     let unsupportedRecordCount: Int
     let malformedRecordCount: Int
     let requiresRebuild: Bool
+    let continuityChanged: Bool
+    let hasMoreRecords: Bool
+    let processedLineCount: Int
 }
 
 struct IncrementalRolloutTailSource {
     private static let fingerprintOffsetBasis: UInt64 = 14_695_981_039_346_656_037
     private static let fingerprintPrime: UInt64 = 1_099_511_628_211
+    private static let payloadMarker = Data(#","payload":"#.utf8)
+    private static let compactedTypeMarker = Data(#""type":"compacted""#.utf8)
+    private static let emptyPayloadSuffix = Data(#","payload":{}}"#.utf8)
+    // ponytail: bound one batch; stream normalization if one-pass import matters.
+    static let maximumLinesPerBatch = 100_000
+    static let maximumBytesPerBatch: UInt64 = 64 * 1_024 * 1_024
 
     func read(
         fileURL: URL,
         cursor: RolloutCursor?,
-        observedAt: Date
+        observedAt: Date,
+        maximumLines: Int = Self.maximumLinesPerBatch,
+        maximumBytes: UInt64 = Self.maximumBytesPerBatch,
+        maximumRecordBytes: Int = BoundedJSONLReader.maximumRecordBytes
     ) throws -> RolloutTailBatch {
+        let byteBudget = max(maximumBytes, 1)
         let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
         guard
             let systemNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
@@ -188,62 +467,68 @@ struct IncrementalRolloutTailSource {
                 && fileSize == $0.fileSize
                 && modificationTime == $0.modificationTime
         } ?? false
-        let continuationVerification: (matches: Bool, bytesRead: Int)
+        let continuationVerification: (matches: Bool?, bytesRead: UInt64)
         if metadataUnchanged {
             continuationVerification = (true, 0)
-        } else if sameFileIdentity {
-            continuationVerification = try verifiedCheckpoint(
-                handle: handle,
-                fileSize: fileSize,
-                cursor: cursor
-            )
+        } else if sameFileIdentity,
+                  let cursor,
+                  fileSize > cursor.fileSize {
+            // Codex owns rollout files and appends to them. Verify the last
+            // complete record so live growth stays proportional to the delta.
+            continuationVerification =
+                cursor.discardingOversizedRecord == true
+                    ? (true, 0)
+                    : try verifiedCheckpoint(
+                        handle: handle,
+                        fileSize: fileSize,
+                        cursor: cursor,
+                        maximumBytes: byteBudget
+                    )
         } else {
             continuationVerification = try verifiedPrefix(
                 handle: handle,
                 fileSize: fileSize,
-                cursor: cursor
+                cursor: cursor,
+                maximumBytes: byteBudget
             )
         }
-        let continuesSource = continuationVerification.matches
+        if continuationVerification.matches == nil,
+           sameFileIdentity,
+           cursor.map({ fileSize > $0.fileSize }) == true,
+           let cursor,
+           cursor.checkpoint != nil {
+            return RolloutTailBatch(
+                records: [],
+                cursor: cursor,
+                bytesRead: 0,
+                unsupportedRecordCount: 0,
+                malformedRecordCount: 0,
+                requiresRebuild: false,
+                continuityChanged: false,
+                hasMoreRecords: true,
+                processedLineCount: 0
+            )
+        }
+        let continuesSource = continuationVerification.matches == true
         let startOffset = continuesSource ? cursor?.byteOffset ?? 0 : 0
         let requiresRebuild = cursor != nil && !continuesSource
+        let continuityChanged = cursor != nil
+            && continuationVerification.matches == false
         let sourceGeneration: UInt64
         if let cursor {
-            sourceGeneration = sameFileIdentity && continuesSource
-                ? cursor.sourceGeneration
-                : cursor.sourceGeneration + 1
+            if sameFileIdentity && continuesSource {
+                sourceGeneration = cursor.sourceGeneration
+            } else {
+                let (next, overflowed) =
+                    cursor.sourceGeneration.addingReportingOverflow(1)
+                guard !overflowed else {
+                    throw RolloutTailSourceError.counterOverflow
+                }
+                sourceGeneration = next
+            }
         } else {
             sourceGeneration = 0
         }
-
-        try handle.seek(toOffset: startOffset)
-        let data = try handle.readToEnd() ?? Data()
-        let bytesRead = UInt64(continuationVerification.bytesRead + data.count)
-
-        guard let lastNewline = data.lastIndex(of: 0x0A) else {
-            return RolloutTailBatch(
-                records: [],
-                cursor: RolloutCursor(
-                    fileIdentity: identity,
-                    sourceGeneration: sourceGeneration,
-                    byteOffset: startOffset,
-                    fileSize: fileSize,
-                    modificationTime: modificationTime,
-                    lastOrdinal: continuesSource ? cursor?.lastOrdinal : nil,
-                    threadID: continuesSource ? cursor?.threadID : nil,
-                    processedPrefixFingerprint: continuesSource
-                        ? cursor?.processedPrefixFingerprint
-                        : nil,
-                    checkpoint: continuesSource ? cursor?.checkpoint : nil
-                ),
-                bytesRead: bytesRead,
-                unsupportedRecordCount: 0,
-                malformedRecordCount: 0,
-                requiresRebuild: requiresRebuild
-            )
-        }
-
-        let completeData = data[...lastNewline]
         var threadID = continuesSource ? cursor?.threadID : nil
         var seenEventKeys = Set<String>()
         var records: [RolloutRecord] = []
@@ -258,21 +543,30 @@ struct IncrementalRolloutTailSource {
             byteOffset: UInt64,
             byteLength: UInt64,
             threadID: String?,
-            identity: String
+            fingerprint: UInt64,
+            rawSuffixFingerprint: UInt64?
         )?
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let readByteBudget = continuationVerification.bytesRead < byteBudget
+            ? byteBudget - continuationVerification.bytesRead
+            : 1
 
-        for line in completeData.split(separator: 0x0A, omittingEmptySubsequences: true) {
-            let relativeLineOffset = completeData.distance(
-                from: completeData.startIndex,
-                to: line.startIndex
-            )
-            let absoluteLineOffset = startOffset + UInt64(relativeLineOffset)
-            guard let wire = try? decoder.decode(RolloutWire.self, from: Data(line)) else {
+        let readResult = try BoundedJSONLReader.read(
+            handle: handle,
+            from: startOffset,
+            maximumLines: maximumLines,
+            maximumBytes: readByteBudget,
+            maximumRecordBytes: maximumRecordBytes,
+            startsByDiscardingOversizedRecord:
+                continuesSource
+                    && cursor?.discardingOversizedRecord == true,
+            discardsPartialRecordAtByteLimit: false
+        ) { line, absoluteLineOffset in
+            guard let wire = decodeWire(line, decoder: decoder) else {
                 unsupportedRecordCount += 1
                 malformedRecordCount += 1
-                continue
+                return true
             }
             let type = wire.type
             let payload = wire.payload
@@ -299,12 +593,19 @@ struct IncrementalRolloutTailSource {
             let contextTokenUsage = localTokenUsage(
                 payload.info?.lastTokenUsage
             )
+            if totalUsage?.totalTokens != nil, tokenUsage == nil {
+                malformedRecordCount += 1
+            }
+            if payload.info?.lastTokenUsage?.totalTokens != nil,
+               contextTokenUsage == nil {
+                malformedRecordCount += 1
+            }
             let eventKey: String
             if let ordinal {
                 eventKey = "\(threadID ?? "unknown")|ordinal|\(ordinal)"
                 let isReplay = continuesSource
                     && cursor?.lastOrdinal.map { ordinal <= $0 } == true
-                if isReplay { continue }
+                if isReplay { return true }
                 lastObservedOrdinal = max(lastObservedOrdinal ?? 0, ordinal)
             } else {
                 eventKey = [
@@ -316,25 +617,33 @@ struct IncrementalRolloutTailSource {
                     turnID ?? "none"
                 ].joined(separator: "|")
             }
-            guard seenEventKeys.insert(eventKey).inserted else { continue }
+            guard seenEventKeys.insert(eventKey).inserted else { return true }
             guard isSupported(
                 type: type,
                 eventType: eventType,
                 toolClass: payload.item?.type
             ) else {
                 unsupportedRecordCount += 1
-                continue
+                return true
             }
             if line.count <= 4_096 {
                 checkpointCandidate = (
                     byteOffset: absoluteLineOffset,
                     byteLength: UInt64(line.count),
                     threadID: threadID,
-                    identity: nonContentIdentity
+                    fingerprint: Self.fingerprint(
+                        nonContentIdentity.utf8
+                    ),
+                    rawSuffixFingerprint: nil
                 )
             } else {
-                checkpointCandidate = nil
-                checkpoint = nil
+                checkpointCandidate = (
+                    byteOffset: absoluteLineOffset,
+                    byteLength: UInt64(line.count),
+                    threadID: threadID,
+                    fingerprint: Self.fingerprint(line.prefix(2_048)),
+                    rawSuffixFingerprint: Self.fingerprint(line.suffix(2_048))
+                )
             }
             records.append(
                 RolloutRecord(
@@ -365,14 +674,29 @@ struct IncrementalRolloutTailSource {
                         : nil
                 )
             )
+            return true
         }
-        let byteOffset = startOffset + UInt64(completeData.count)
+        unsupportedRecordCount += readResult.oversizedRecordCount
+        malformedRecordCount += readResult.oversizedRecordCount
+        let (bytesRead, bytesReadOverflowed) =
+            continuationVerification.bytesRead.addingReportingOverflow(
+                readResult.bytesRead
+            )
+        guard !bytesReadOverflowed else {
+            throw RolloutTailSourceError.counterOverflow
+        }
+        let byteOffset = readResult.resumeByteOffset
+        let hasMoreRecords = readResult.stoppedEarly && byteOffset < fileSize
+        if byteOffset == startOffset, !continuesSource {
+            processedPrefixFingerprint = nil
+        }
         if let candidate = checkpointCandidate {
             checkpoint = RolloutCheckpoint(
                 byteOffset: candidate.byteOffset,
                 byteLength: candidate.byteLength,
                 threadID: candidate.threadID,
-                fingerprint: Self.fingerprint(candidate.identity.utf8)
+                fingerprint: candidate.fingerprint,
+                rawSuffixFingerprint: candidate.rawSuffixFingerprint
             )
         }
 
@@ -387,62 +711,135 @@ struct IncrementalRolloutTailSource {
                 lastOrdinal: lastObservedOrdinal,
                 threadID: threadID,
                 processedPrefixFingerprint: processedPrefixFingerprint,
-                checkpoint: checkpoint
+                checkpoint: checkpoint,
+                discardingOversizedRecord:
+                    readResult.discardingOversizedRecord ? true : nil
             ),
             bytesRead: bytesRead,
             unsupportedRecordCount: unsupportedRecordCount,
             malformedRecordCount: malformedRecordCount,
-            requiresRebuild: requiresRebuild
+            requiresRebuild: requiresRebuild,
+            continuityChanged: continuityChanged,
+            hasMoreRecords: hasMoreRecords,
+            processedLineCount: readResult.processedLineCount
         )
     }
 
     private func verifiedPrefix(
         handle: FileHandle,
         fileSize: UInt64,
-        cursor: RolloutCursor?
-    ) throws -> (matches: Bool, bytesRead: Int) {
+        cursor: RolloutCursor?,
+        maximumBytes: UInt64
+    ) throws -> (matches: Bool?, bytesRead: UInt64) {
         guard
             let cursor,
             cursor.byteOffset <= fileSize,
-            cursor.byteOffset <= UInt64(Int.max),
             let expectedFingerprint = cursor.processedPrefixFingerprint
         else {
             return (false, 0)
         }
-        try handle.seek(toOffset: 0)
-        let prefix = try handle.read(upToCount: Int(cursor.byteOffset)) ?? Data()
+        guard cursor.byteOffset <= maximumBytes else {
+            return (nil, 0)
+        }
+        var fingerprint = Self.fingerprintOffsetBasis
+        var threadID: String?
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let result = try BoundedJSONLReader.read(
+            handle: handle,
+            from: 0,
+            through: cursor.byteOffset
+        ) { line, absoluteLineOffset in
+            guard let wire = decodeWire(line, decoder: decoder) else {
+                return true
+            }
+            if wire.type == "session_meta",
+               let observedThreadID = wire.payload.id {
+                threadID = observedThreadID
+            }
+            fingerprint = Self.fingerprint(
+                replayIdentity(
+                    wire: wire,
+                    threadID: threadID,
+                    absoluteLineOffset: absoluteLineOffset
+                ).utf8,
+                seed: fingerprint
+            )
+            return true
+        }
         return (
-            prefix.count == Int(cursor.byteOffset)
-                && replayFingerprint(prefix) == expectedFingerprint,
-            prefix.count
+            result.completeByteOffset == cursor.byteOffset
+                && fingerprint == expectedFingerprint,
+            result.bytesRead
         )
     }
 
     private func verifiedCheckpoint(
         handle: FileHandle,
         fileSize: UInt64,
-        cursor: RolloutCursor?
-    ) throws -> (matches: Bool, bytesRead: Int) {
+        cursor: RolloutCursor?,
+        maximumBytes: UInt64
+    ) throws -> (matches: Bool?, bytesRead: UInt64) {
         guard let cursor else { return (true, 0) }
         guard cursor.byteOffset > 0 else { return (true, 0) }
+        let checkpointEnd = cursor.checkpoint.map {
+            $0.byteOffset.addingReportingOverflow($0.byteLength)
+        }
         guard
             let checkpoint = cursor.checkpoint,
-            checkpoint.byteLength <= 4_096,
-            checkpoint.byteOffset + checkpoint.byteLength <= fileSize
+            let checkpointEnd,
+            !checkpointEnd.overflow,
+            checkpointEnd.partialValue <= fileSize
         else {
             return (false, 0)
+        }
+        if let expectedSuffix = checkpoint.rawSuffixFingerprint {
+            guard checkpoint.byteLength <= UInt64(
+                BoundedJSONLReader.maximumRecordBytes
+            ) else {
+                return (false, 0)
+            }
+            let sliceLength = min(checkpoint.byteLength, 2_048)
+            guard sliceLength * 2 <= maximumBytes else {
+                return (nil, 0)
+            }
+            try handle.seek(toOffset: checkpoint.byteOffset)
+            let prefix = try handle.read(
+                upToCount: Int(sliceLength)
+            ) ?? Data()
+            let suffixOffset = checkpointEnd.partialValue - sliceLength
+            try handle.seek(toOffset: suffixOffset)
+            let suffix = try handle.read(
+                upToCount: Int(sliceLength)
+            ) ?? Data()
+            let bytesRead = UInt64(prefix.count + suffix.count)
+            guard prefix.count == Int(sliceLength),
+                  suffix.count == Int(sliceLength) else {
+                return (false, bytesRead)
+            }
+            return (
+                Self.fingerprint(prefix) == checkpoint.fingerprint
+                    && Self.fingerprint(suffix) == expectedSuffix,
+                bytesRead
+            )
+        }
+        guard checkpoint.byteLength <= 4_096 else {
+            return (false, 0)
+        }
+        guard checkpoint.byteLength <= maximumBytes else {
+            return (nil, 0)
         }
         try handle.seek(toOffset: checkpoint.byteOffset)
         let data = try handle.read(
             upToCount: Int(checkpoint.byteLength)
         ) ?? Data()
         guard data.count == Int(checkpoint.byteLength) else {
-            return (false, data.count)
+            return (false, UInt64(data.count))
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        guard let wire = try? decoder.decode(RolloutWire.self, from: data) else {
-            return (false, data.count)
+        guard let wire = decodeWire(data, decoder: decoder) else {
+            return (false, UInt64(data.count))
         }
         let threadID = wire.type == "session_meta"
             ? wire.payload.id
@@ -454,35 +851,8 @@ struct IncrementalRolloutTailSource {
         )
         return (
             Self.fingerprint(identity.utf8) == checkpoint.fingerprint,
-            data.count
+            UInt64(data.count)
         )
-    }
-
-    private func replayFingerprint(_ data: Data) -> UInt64 {
-        var fingerprint = Self.fingerprintOffsetBasis
-        var threadID: String?
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
-            guard let wire = try? decoder.decode(RolloutWire.self, from: Data(line)) else {
-                continue
-            }
-            if wire.type == "session_meta", let observedThreadID = wire.payload.id {
-                threadID = observedThreadID
-            }
-            let absoluteLineOffset = UInt64(
-                data.distance(from: data.startIndex, to: line.startIndex)
-            )
-            fingerprint = Self.fingerprint(
-                replayIdentity(
-                    wire: wire,
-                    threadID: threadID,
-                    absoluteLineOffset: absoluteLineOffset
-                ).utf8,
-                seed: fingerprint
-            )
-        }
-        return fingerprint
     }
 
     private func replayIdentity(
@@ -542,10 +912,38 @@ struct IncrementalRolloutTailSource {
         return components.joined(separator: "|")
     }
 
+    private func decodeWire(
+        _ data: Data,
+        decoder: JSONDecoder
+    ) -> RolloutWire? {
+        if let payload = data.range(of: Self.payloadMarker),
+           data.range(
+               of: Self.compactedTypeMarker,
+               in: data.startIndex..<payload.lowerBound
+           ) != nil {
+            var header = data.subdata(in: data.startIndex..<payload.lowerBound)
+            header.append(Self.emptyPayloadSuffix)
+            if let wire = try? decoder.decode(RolloutWire.self, from: header),
+               wire.type == "compacted" {
+                return wire
+            }
+        }
+        return try? decoder.decode(RolloutWire.self, from: data)
+    }
+
     private func localTokenUsage(
         _ usage: RolloutWire.TokenUsage?
     ) -> LocalTokenUsage? {
-        usage?.totalTokens.map {
+        usage?.totalTokens.flatMap {
+            let counters = [
+                usage?.inputTokens,
+                usage?.cachedInputTokens,
+                usage?.cacheWriteInputTokens,
+                usage?.outputTokens,
+                usage?.reasoningOutputTokens,
+                usage?.totalTokens
+            ].compactMap { $0 }
+            guard counters.allSatisfy({ $0 >= 0 }) else { return nil }
             var observed: Set<LocalTokenComponent> = [.total]
             if usage?.inputTokens != nil { observed.insert(.input) }
             if usage?.cachedInputTokens != nil {

@@ -1342,13 +1342,32 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 localActivityObservation: .continuous(
                     sourceVersion: "test",
                     observedAt: now
-                )
+                ),
+                localActivityContentRevision: 7
+            )
+        )
+        let reused = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                localActivityFacts: [],
+                localActivityObservation: .continuous(
+                    sourceVersion: "test",
+                    observedAt: now
+                ),
+                localActivityContentRevision: 7,
+                reusableLocalAggregates: reader.reusableLocalAggregates
             )
         )
 
         XCTAssertEqual(reader.evidence.coverage, .partial)
         XCTAssertEqual(reader.evidence.confidence, .medium)
         XCTAssertEqual(reader.evidence.reason, "Workload mix changed")
+        XCTAssertEqual(reused.evidence, reader.evidence)
     }
 
     func testKnownResetKeepsObservedWindowsSeparate() {
@@ -1787,6 +1806,356 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             summary.inspectionText(
                 at: now.addingTimeInterval(61)
             ).contains("Expiry dates need refresh")
+        )
+    }
+
+    func testStableRevisionReusesLocalAggregatesAcrossLaterAccountRead() throws {
+        let observedAt = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: observedAt)
+        let observation = LocalActivityObservation.continuous(
+            sourceVersion: "0.145.0",
+            observedAt: observedAt
+        )
+        let first = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: observedAt,
+                previousStatus: nil,
+                localActivityFacts: [
+                    tokenFact(
+                        tokens: 100,
+                        date: observedAt.addingTimeInterval(-30),
+                        eventID: "token-1"
+                    )
+                ],
+                localActivityObservation: observation,
+                localActivityContentRevision: 7
+            )
+        )
+        let later = observedAt.addingTimeInterval(60)
+        let laterObservation = LocalActivityObservation.continuous(
+            sourceVersion: "0.145.0",
+            observedAt: later
+        )
+        let laterAccount = UsageSnapshot(
+            mainLimit: account.mainLimit,
+            otherLimits: account.otherLimits,
+            tokenHistory: account.tokenHistory,
+            emergencyResetCount: account.emergencyResetCount,
+            bankedResetCountAvailable: account.bankedResetCountAvailable,
+            bankedResetDetails: account.bankedResetDetails,
+            fetchedAt: later,
+            accountFacts: account.accountFacts
+        )
+
+        let reused = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: laterAccount,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: later,
+                previousStatus: nil,
+                localActivityFacts: [],
+                localActivityObservation: laterObservation,
+                localActivityContentRevision: 7,
+                reusableLocalAggregates:
+                    try XCTUnwrap(first.reusableLocalAggregates)
+            )
+        )
+        let rebuilt = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: laterAccount,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: later,
+                previousStatus: nil,
+                localActivityFacts: [],
+                localActivityObservation: laterObservation,
+                localActivityContentRevision: 8,
+                reusableLocalAggregates:
+                    try XCTUnwrap(first.reusableLocalAggregates)
+            )
+        )
+
+        XCTAssertEqual(reused.localTokenActivity.tokens, 100)
+        XCTAssertEqual(reused.localTokenActivity.interval.end, later)
+        XCTAssertEqual(rebuilt.localTokenActivity.tokens, 0)
+    }
+
+    func testStableRevisionReusesHistoryIndexButAppliesNewAccountSample() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let window = try XCTUnwrap(account.mainLimit?.window)
+        let earlier = now.addingTimeInterval(-60)
+        let earlierAccount = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "codex",
+                name: "Codex",
+                window: UsageWindow(
+                    remainingPercent: 90,
+                    resetsAt: window.resetsAt,
+                    durationMinutes: window.durationMinutes
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            bankedResetDetails: nil,
+            fetchedAt: earlier
+        )
+        let startSample = UsageSample(
+            observedAt: window.startsAt,
+            remainingPercent: 100,
+            resetsAt: window.resetsAt,
+            lifetimeTokens: 1_000
+        )
+        let earlierSample = UsageSample(
+            observedAt: earlier,
+            remainingPercent: 90,
+            resetsAt: window.resetsAt,
+            lifetimeTokens: 1_500
+        )
+        let freshSample = UsageSample(
+            observedAt: now,
+            remainingPercent: 80,
+            resetsAt: window.resetsAt,
+            lifetimeTokens: 1_600
+        )
+        let fact = tokenFact(
+            tokens: 500,
+            date: earlier.addingTimeInterval(-60),
+            eventID: "token-1"
+        )
+        let compatibleSources: Set<LocalTokenDefinitionSource> = [
+            LocalTokenDefinitionSource(
+                sourceVersion: "0.145.0",
+                schemaVersion: "rollout-jsonl-v1"
+            )
+        ]
+        let first = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: earlierAccount,
+                samples: [startSample, earlierSample],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: earlier,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: [fact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: earlier
+                ),
+                localActivityContentRevision: 7,
+                compatibleTokenSources: compatibleSources
+            )
+        )
+
+        let refreshed = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [startSample, earlierSample, freshSample],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                localActivityFacts: [fact],
+                localActivityHistoryFacts: [fact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: now
+                ),
+                localActivityContentRevision: 7,
+                reusableLocalAggregates:
+                    try XCTUnwrap(first.reusableLocalAggregates),
+                compatibleTokenSources: compatibleSources
+            )
+        )
+
+        XCTAssertEqual(
+            refreshed.usagePerToken.current?.accountMovementPoints,
+            20
+        )
+        XCTAssertEqual(
+            refreshed.usagePerToken.current?.accountTokenActivity,
+            600
+        )
+        XCTAssertEqual(
+            refreshed.usagePerToken.current?.localTokenActivity,
+            500
+        )
+    }
+
+    func testStableRevisionRebuildsAfterTemporaryObservationGap() throws {
+        let observedAt = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: observedAt)
+        let fact = tokenFact(
+            tokens: 100,
+            date: observedAt.addingTimeInterval(-30),
+            eventID: "token-1"
+        )
+        let first = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: observedAt,
+                previousStatus: nil,
+                localActivityFacts: [fact],
+                localActivityObservation: .gap(
+                    sourceVersion: "0.145.0",
+                    observedAt: observedAt,
+                    reason: "Codex account identity could not be checked"
+                ),
+                localActivityContentRevision: 7
+            )
+        )
+        let recovered = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: observedAt,
+                previousStatus: nil,
+                localActivityFacts: [fact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: observedAt
+                ),
+                localActivityContentRevision: 7,
+                reusableLocalAggregates:
+                    try XCTUnwrap(first.reusableLocalAggregates)
+            )
+        )
+
+        XCTAssertEqual(first.localTokenActivity.coverage, .low)
+        XCTAssertEqual(recovered.localTokenActivity.coverage, .high)
+        XCTAssertEqual(
+            recovered.localTokenActivity.reason,
+            "Only local activity on this Mac is observed"
+        )
+    }
+
+    func testStableRevisionRebuildsWhenPreviousEndBoundaryBecomesIncluded() throws {
+        let observedAt = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: observedAt)
+        let observation = LocalActivityObservation.continuous(
+            sourceVersion: "0.145.0",
+            observedAt: observedAt
+        )
+        let boundaryFact = tokenFact(
+            tokens: 250,
+            date: observedAt,
+            eventID: "boundary-token"
+        )
+        let first = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: observedAt,
+                previousStatus: nil,
+                localActivityFacts: [boundaryFact],
+                localActivityObservation: observation,
+                localActivityContentRevision: 7
+            )
+        )
+        let later = observedAt.addingTimeInterval(60)
+        let laterAccount = UsageSnapshot(
+            mainLimit: account.mainLimit,
+            otherLimits: account.otherLimits,
+            tokenHistory: account.tokenHistory,
+            emergencyResetCount: account.emergencyResetCount,
+            bankedResetCountAvailable: account.bankedResetCountAvailable,
+            bankedResetDetails: account.bankedResetDetails,
+            fetchedAt: later,
+            accountFacts: account.accountFacts
+        )
+
+        let refreshed = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: laterAccount,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: later,
+                previousStatus: nil,
+                localActivityFacts: [boundaryFact],
+                localActivityObservation: .continuous(
+                    sourceVersion: "0.145.0",
+                    observedAt: later
+                ),
+                localActivityContentRevision: 7,
+                reusableLocalAggregates:
+                    try XCTUnwrap(first.reusableLocalAggregates)
+            )
+        )
+
+        XCTAssertEqual(first.localTokenActivity.tokens, 0)
+        XCTAssertEqual(refreshed.localTokenActivity.tokens, 250)
+    }
+
+    func testDisplayDownsamplingKeepsTheFirstAndLastPoint() {
+        let points = Array(0 ..< 10_000)
+
+        let rendered = downsampledForDisplay(points, limit: 100)
+
+        XCTAssertEqual(rendered.count, 100)
+        XCTAssertEqual(rendered.first, 0)
+        XCTAssertEqual(rendered.last, 9_999)
+    }
+
+    func testNearestDisplayPointUsesChronologicalNeighbors() {
+        let points = (0 ..< 100_000).map {
+            LocalTokenActivityPoint(
+                date: Date(timeIntervalSince1970: TimeInterval($0 * 10)),
+                tokens: Int64($0)
+            )
+        }
+
+        XCTAssertEqual(
+            nearestPoint(
+                in: points,
+                to: Date(timeIntervalSince1970: 123_456),
+                date: \.date
+            )?.tokens,
+            12_346
+        )
+        XCTAssertEqual(
+            nearestPoint(
+                in: points,
+                to: Date(timeIntervalSince1970: -1),
+                date: \.date
+            )?.tokens,
+            0
+        )
+    }
+
+    func testNearestDisplayPointIncludesTheRangeEnd() {
+        let start = Date(timeIntervalSince1970: 100)
+        let end = Date(timeIntervalSince1970: 200)
+        let points = [
+            LocalTokenActivityPoint(date: start, tokens: 1),
+            LocalTokenActivityPoint(date: end, tokens: 2)
+        ]
+
+        XCTAssertEqual(
+            nearestPoint(
+                in: points,
+                to: end,
+                date: \.date,
+                within: DateInterval(start: start, end: end)
+            )?.tokens,
+            2
         )
     }
 

@@ -1,22 +1,29 @@
 import CryptoKit
 import Foundation
 
+private func nextRevision(after revision: UInt64) -> UInt64 {
+    revision == .max ? 1 : revision + 1
+}
+
 struct LocalActivityCollection: Equatable, Sendable {
     let facts: [LocalActivityFact]
     let projections: [ThreadProjection]
     let observation: LocalActivityObservation
     let bytesRead: UInt64
+    let contentRevision: UInt64
 
     static func unavailable(
         _ reason: String,
         facts: [LocalActivityFact] = [],
-        projections: [ThreadProjection] = []
+        projections: [ThreadProjection] = [],
+        contentRevision: UInt64 = 0
     ) -> LocalActivityCollection {
         LocalActivityCollection(
             facts: facts,
             projections: projections,
             observation: .unavailable(reason),
-            bytesRead: 0
+            bytesRead: 0,
+            contentRevision: contentRevision
         )
     }
 
@@ -32,7 +39,8 @@ struct LocalActivityCollection: Equatable, Sendable {
                     observedAt: observedAt,
                     reason: reason
                 ),
-                bytesRead: bytesRead
+                bytesRead: bytesRead,
+                contentRevision: contentRevision
             )
         case .unavailable:
             return self
@@ -41,6 +49,17 @@ struct LocalActivityCollection: Equatable, Sendable {
 }
 
 actor LocalActivityCollector {
+    private static let maximumMetadataBytes = 1_048_576
+    private static let maximumRefreshLines = 10_000
+    private static let maximumRefreshBytes: UInt64 = 8 * 1_024 * 1_024
+    private static let maximumRolloutRecordBytes = 7 * 1_024 * 1_024
+
+    private struct ObservationSignature: Equatable {
+        let sourceVersion: String?
+        let reason: String?
+        let coverage: CoverageLevel
+    }
+
     private struct FileState {
         var cursor: RolloutCursor
         var normalization: LocalActivityNormalizationState
@@ -53,6 +72,20 @@ actor LocalActivityCollector {
         var storageFingerprint: String?
         var factsLoaded: Bool
         var requiresContextRebuild: Bool
+        var factRestoreOffset: UInt64
+        var factRestoreFileSize: UInt64?
+        var restoredFactIdentities: Set<FactIdentity>
+    }
+
+    private struct FactIdentity: Hashable {
+        let eventID: String
+        let key: String
+    }
+
+    private enum FactLoadOutcome {
+        case ready(linesRead: Int, bytesRead: UInt64)
+        case partial(linesRead: Int, bytesRead: UInt64)
+        case invalid
     }
 
     private struct PersistedFile: Codable {
@@ -92,6 +125,7 @@ actor LocalActivityCollector {
     private let installedCLIVersion: (@Sendable () async -> String?)?
     private let tail = IncrementalRolloutTailSource()
     private let normalizer = LocalActivityNormalizer()
+    private let timestampParser = LocalEventTimestampParser()
     private var files: [String: FileState] = [:]
     private var restoredFilesByFingerprint: [String: FileState] = [:]
     private var restoredFingerprintByIdentity: [RolloutFileIdentity: String] = [:]
@@ -102,11 +136,25 @@ actor LocalActivityCollector {
     private var nextProjectionListCursor: String?
     private var hasStartedProjectionList = false
     private var hasCompleteProjectionList = false
+    private var lastProjectionListSucceeded: Bool?
+    private var attemptedProjectionTaskIDs = Set<String>()
     private var stateGeneration: UInt64 = 0
     private var historyCutoff: Date?
     private var historyDeletionPending = false
     private var deletionMarkerInvalid = false
     private var restoreWarning: String?
+    private var cachedFacts: [LocalActivityFact]?
+    private var cachedFactPaths = Set<String>()
+    private var cachedFactsIntervalStart: Date?
+    private var lastPublishedProjectionIdentities: [ProjectionIdentity]?
+    private var lastObservationSignature: ObservationSignature?
+    private var contentRevision: UInt64 = 0
+    private var importContinuationPending = false
+    private var pendingFactRestorePaths = Set<String>()
+    private var publishedFactPaths = Set<String>()
+    private var refreshGeneration: UInt64 = 0
+    private var didReadInstalledCLIVersion = false
+    private var cachedInstalledCLIVersion: String?
 
     init(
         rootDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -144,7 +192,7 @@ actor LocalActivityCollector {
 
     func selectPartition(_ id: String) {
         guard partitionID != id else { return }
-        stateGeneration &+= 1
+        stateGeneration = nextRevision(after: stateGeneration)
         persist()
         partitionID = id
         files.removeAll()
@@ -157,14 +205,18 @@ actor LocalActivityCollector {
         hasStartedProjectionList = false
         hasCompleteProjectionList = false
         restoreWarning = nil
+        clearPublishedContent()
         restore()
     }
 
     func refresh(
         interval: DateInterval,
-        observedAt: Date = Date()
+        observedAt: Date = Date(),
+        refreshMetadata: Bool = true
     ) async -> LocalActivityCollection {
-        let refreshGeneration = stateGeneration
+        refreshGeneration = nextRevision(after: refreshGeneration)
+        let currentRefreshGeneration = refreshGeneration
+        let currentStateGeneration = stateGeneration
         if historyDeletionPending {
             return .unavailable(
                 deletionMarkerInvalid
@@ -175,48 +227,165 @@ actor LocalActivityCollector {
         guard FileManager.default.fileExists(atPath: rootDirectory.path) else {
             return .unavailable(
                 "Codex local records are unavailable",
-                facts: files.values.flatMap(\.facts)
+                facts: cachedFacts ?? files.values.flatMap(\.facts)
             )
         }
 
         let projectionsBeforeRefresh = projections
-        let listSucceeded = await refreshProjectionList(
-            generation: refreshGeneration
-        )
-        guard refreshGeneration == stateGeneration else {
+        let listSucceeded: Bool?
+        if refreshMetadata {
+            listSucceeded = await refreshProjectionList(
+                generation: currentStateGeneration,
+                refreshGeneration: currentRefreshGeneration
+            )
+        } else {
+            listSucceeded = lastProjectionListSucceeded
+        }
+        guard !Task.isCancelled else {
+            return .unavailable("Local activity read was cancelled")
+        }
+        guard currentStateGeneration == stateGeneration,
+              currentRefreshGeneration == refreshGeneration else {
             return .unavailable("Account changed during local activity read")
         }
-        let calendarFiles = rolloutFiles(in: interval)
+        if refreshMetadata {
+            lastProjectionListSucceeded = listSucceeded
+        }
         let currentProjections = activeProjections(in: interval)
-        let projectedFiles = Set(
-            currentProjections.compactMap(validProjectionFile)
-        )
-        let trackedFiles = Set(files.compactMap { path, state in
-            stateHasActivity(state, in: interval) ? fileURL(path) : nil
-        })
-        let candidatePaths = Set(
-            calendarFiles
-            .union(projectedFiles)
-            .union(trackedFiles)
-            .compactMap(fileKey)
-        )
+        let candidatePaths: Set<String>
+        if !refreshMetadata,
+           cachedFactsIntervalStart == interval.start,
+           !cachedFactPaths.isEmpty {
+            candidatePaths = cachedFactPaths
+        } else {
+            let calendarFiles = rolloutFiles(in: interval)
+            let projectedFiles = Set(
+                currentProjections.compactMap(validProjectionFile)
+            )
+            let trackedFiles = Set(files.compactMap { path, state in
+                stateHasActivity(state, in: interval) ? fileURL(path) : nil
+            })
+            candidatePaths = Set(
+                calendarFiles
+                    .union(projectedFiles)
+                    .union(trackedFiles)
+                    .compactMap(fileKey)
+            )
+        }
+        for path in candidatePaths {
+            bindRestoredStateIfNeeded(to: path)
+        }
+        if cachedFactsIntervalStart != interval.start {
+            restartPartialFactRestores()
+        }
+        let reusesPublishedFacts = cachedFacts != nil
+            && cachedFactsIntervalStart == interval.start
+            && cachedFactPaths.isSubset(of: candidatePaths)
+        if !reusesPublishedFacts {
+            pendingFactRestorePaths = Set(candidatePaths.filter {
+                files[$0]?.factsLoaded == false
+            })
+            publishedFactPaths.removeAll()
+        } else {
+            pendingFactRestorePaths.formIntersection(candidatePaths)
+            for path in candidatePaths.subtracting(cachedFactPaths)
+            where files[path]?.factsLoaded == false {
+                pendingFactRestorePaths.insert(path)
+            }
+        }
         var bytesRead: UInt64 = 0
+        var factsChanged = false
+        var rewroteFacts = false
+        var appendedFacts: [LocalActivityFact] = []
+        var remainingLineBudget = Self.maximumRefreshLines
+        var remainingByteBudget = Self.maximumRefreshBytes
+        var importStillInProgress = false
         var gapReason = restoreWarning ?? (listSucceeded == false
             ? "Local task discovery is incomplete"
             : currentProjections.contains {
             validProjectionFile($0) == nil
         } ? "Local rollout path is unavailable" : nil)
 
-        for path in candidatePaths.sorted() {
-            bindRestoredStateIfNeeded(to: path)
+        for path in candidatePaths.sorted(by: >) {
+            guard !Task.isCancelled else {
+                return .unavailable("Local activity read was cancelled")
+            }
+            if remainingLineBudget == 0 || remainingByteBudget == 0 {
+                importStillInProgress = true
+                gapReason = gapReason
+                    ?? "Local task import is still in progress"
+                break
+            }
             let file = fileURL(path)
-            loadFactsIfNeeded(for: path)
+            let pathWasPublished = publishedFactPaths.contains(path)
+            if !reusesPublishedFacts
+                || pendingFactRestorePaths.contains(path) {
+                let factsBeforeRestore = files[path]?.facts.count ?? 0
+                let factLoad = loadFactsIfNeeded(
+                    for: path,
+                    interval: interval,
+                    maximumLines: remainingLineBudget,
+                    maximumBytes: remainingByteBudget
+                )
+                switch factLoad {
+                case let .ready(linesRead, factBytesRead):
+                    pendingFactRestorePaths.remove(path)
+                    remainingLineBudget = max(
+                        remainingLineBudget - linesRead,
+                        0
+                    )
+                    remainingByteBudget = factBytesRead
+                        >= remainingByteBudget
+                        ? 0
+                        : remainingByteBudget - factBytesRead
+                case let .partial(linesRead, factBytesRead):
+                    importStillInProgress = true
+                    remainingLineBudget = max(
+                        remainingLineBudget - linesRead,
+                        0
+                    )
+                    remainingByteBudget = factBytesRead
+                        >= remainingByteBudget
+                        ? 0
+                        : remainingByteBudget - factBytesRead
+                    gapReason = gapReason
+                        ?? "Local task import is still in progress"
+                    if reusesPublishedFacts,
+                       let facts = files[path]?.facts,
+                       facts.count > factsBeforeRestore {
+                        appendedFacts.append(
+                            contentsOf: facts[factsBeforeRestore...]
+                        )
+                    }
+                    publishedFactPaths.insert(path)
+                    continue
+                case .invalid:
+                    pendingFactRestorePaths.remove(path)
+                    break
+                }
+                if reusesPublishedFacts,
+                   let facts = files[path]?.facts,
+                   facts.count > factsBeforeRestore {
+                    appendedFacts.append(
+                        contentsOf: facts[factsBeforeRestore...]
+                    )
+                }
+                if files[path] != nil {
+                    publishedFactPaths.insert(path)
+                }
+                if remainingLineBudget == 0 || remainingByteBudget == 0 {
+                    importStillInProgress = true
+                    gapReason = gapReason
+                        ?? "Local task import is still in progress"
+                    continue
+                }
+            }
             guard FileManager.default.fileExists(atPath: file.path) else {
                 gapReason = gapReason ?? "Local task records are missing"
                 continue
             }
+            var previous = files.removeValue(forKey: path)
             do {
-                let previous = files[path]
                 if previous?.hasMalformedRecords == true {
                     gapReason = gapReason
                         ?? "Some local diagnostic records could not be read"
@@ -228,14 +397,38 @@ actor LocalActivityCollector {
                     cursor: requiresContextRebuild
                         ? nil
                         : previous?.cursor,
-                    observedAt: observedAt
+                    observedAt: observedAt,
+                    maximumLines: remainingLineBudget,
+                    maximumBytes: remainingByteBudget,
+                    maximumRecordBytes: Self.maximumRolloutRecordBytes
                 )
-                bytesRead += batch.bytesRead
+                remainingLineBudget = max(
+                    remainingLineBudget - batch.processedLineCount,
+                    0
+                )
+                remainingByteBudget = batch.bytesRead
+                    >= remainingByteBudget
+                    ? 0
+                    : remainingByteBudget - batch.bytesRead
+                let (totalBytesRead, bytesOverflowed) =
+                    bytesRead.addingReportingOverflow(batch.bytesRead)
+                if bytesOverflowed {
+                    bytesRead = .max
+                    gapReason = gapReason
+                        ?? "Local task record size is invalid"
+                } else {
+                    bytesRead = totalBytesRead
+                }
                 if batch.malformedRecordCount > 0 {
                     gapReason = gapReason
                         ?? "Some local diagnostic records could not be read"
                 }
-                if batch.requiresRebuild, previous != nil {
+                if batch.hasMoreRecords {
+                    importStillInProgress = true
+                    gapReason = gapReason
+                        ?? "Local task import is still in progress"
+                }
+                if batch.continuityChanged, previous != nil {
                     gapReason = gapReason
                         ?? "Local task record continuity changed"
                 }
@@ -244,14 +437,15 @@ actor LocalActivityCollector {
                    previous != nil,
                    !requiresContextRebuild {
                     if batch.malformedRecordCount > 0 {
-                        files[path]?.hasMalformedRecords = true
+                        previous?.hasMalformedRecords = true
                     }
                     if previous?.cursor != batch.cursor {
-                        files[path]?.cursor = batch.cursor
+                        previous?.cursor = batch.cursor
                         changedPaths.insert(path)
                     } else if batch.malformedRecordCount > 0 {
                         changedPaths.insert(path)
                     }
+                    files[path] = previous
                     continue
                 }
                 let normalized = normalizer.normalize(
@@ -266,6 +460,8 @@ actor LocalActivityCollector {
                 let rewritesFacts = batch.requiresRebuild
                     || requiresContextRebuild
                     || previous == nil
+                let rewritesPublishedFacts = rewritesFacts
+                    && pathWasPublished
                 let newFacts: [LocalActivityFact]
                 if rewritesFacts {
                     newFacts = factsAfterHistoryCutoff(normalized.facts)
@@ -278,31 +474,67 @@ actor LocalActivityCollector {
                         return !existingEventIDs.contains(eventID)
                     }
                 }
-                let combinedFacts = rewritesFacts
-                    ? newFacts
-                    : (previous?.facts ?? []) + newFacts
-                let activityBounds = tokenActivityBounds(combinedFacts)
-                let discontinuityAt = batch.requiresRebuild
+                let discontinuityAt = batch.continuityChanged
                     && previous != nil
                     && !requiresContextRebuild
                     ? observedAt
                     : previous?.discontinuityAt
-                files[path] = FileState(
-                    cursor: batch.cursor,
-                    normalization: normalized.state,
-                    facts: combinedFacts,
-                    eventIDs: Set(combinedFacts.compactMap(\.eventID)),
-                    activityStart: activityBounds?.start,
-                    activityEnd: activityBounds?.end,
-                    discontinuityAt: discontinuityAt,
-                    hasMalformedRecords: batch.requiresRebuild
-                        ? batch.malformedRecordCount > 0
-                        : previous?.hasMalformedRecords == true
-                            || batch.malformedRecordCount > 0,
-                    storageFingerprint: previous?.storageFingerprint,
-                    factsLoaded: true,
-                    requiresContextRebuild: false
-                )
+                let hasMalformedRecords = batch.requiresRebuild
+                    ? batch.malformedRecordCount > 0
+                    : previous?.hasMalformedRecords == true
+                        || batch.malformedRecordCount > 0
+                if rewritesFacts {
+                    let activityBounds = tokenActivityBounds(newFacts)
+                    previous = FileState(
+                        cursor: batch.cursor,
+                        normalization: normalized.state,
+                        facts: newFacts,
+                        eventIDs: Set(newFacts.compactMap(\.eventID)),
+                        activityStart: activityBounds?.start,
+                        activityEnd: activityBounds?.end,
+                        discontinuityAt: discontinuityAt,
+                        hasMalformedRecords: hasMalformedRecords,
+                        storageFingerprint: previous?.storageFingerprint,
+                        factsLoaded: true,
+                        requiresContextRebuild: false,
+                        factRestoreOffset: 0,
+                        factRestoreFileSize: nil,
+                        restoredFactIdentities: []
+                    )
+                } else {
+                    let hadAllFacts = previous?.factsLoaded == true
+                    previous?.cursor = batch.cursor
+                    previous?.normalization = normalized.state
+                    if hadAllFacts {
+                        previous?.facts.append(contentsOf: newFacts)
+                    }
+                    previous?.eventIDs.formUnion(
+                        newFacts.compactMap(\.eventID)
+                    )
+                    if let bounds = tokenActivityBounds(newFacts) {
+                        let activityStart = previous?.activityStart
+                        let activityEnd = previous?.activityEnd
+                        previous?.activityStart = activityStart
+                            .map { min($0, bounds.start) }
+                            ?? bounds.start
+                        previous?.activityEnd = activityEnd
+                            .map { max($0, bounds.end) }
+                            ?? bounds.end
+                    }
+                    previous?.discontinuityAt = discontinuityAt
+                    previous?.hasMalformedRecords = hasMalformedRecords
+                    previous?.factsLoaded = hadAllFacts
+                    previous?.requiresContextRebuild = false
+                }
+                files[path] = previous
+                publishedFactPaths.insert(path)
+                factsChanged = factsChanged
+                    || rewritesFacts
+                    || !newFacts.isEmpty
+                rewroteFacts = rewroteFacts || rewritesPublishedFacts
+                if !rewritesPublishedFacts {
+                    appendedFacts.append(contentsOf: newFacts)
+                }
                 changedPaths.insert(path)
                 scheduleFactWrite(
                     path: path,
@@ -310,6 +542,7 @@ actor LocalActivityCollector {
                     rewritesFile: rewritesFacts
                 )
             } catch {
+                files[path] = previous
                 gapReason = gapReason ?? "Local task records are missing"
             }
         }
@@ -322,7 +555,7 @@ actor LocalActivityCollector {
             return discontinuityAt >= interval.start
                 && discontinuityAt <= interval.end
         }) {
-            gapReason = gapReason ?? "Local task record continuity changed"
+            gapReason = "Local task record continuity changed"
         }
         let activeTaskIDs = taskIDs(in: activeStates)
         let projectionChainsBefore = projectionChainIdentities(
@@ -331,24 +564,27 @@ actor LocalActivityCollector {
         )
         if await completeProjections(
             for: activeTaskIDs,
-            listSucceeded: listSucceeded,
-            generation: refreshGeneration
+            listSucceeded: refreshMetadata ? listSucceeded : true,
+            generation: currentStateGeneration,
+            refreshGeneration: currentRefreshGeneration,
+            retriesMissingProjections: refreshMetadata
         ) == false {
             gapReason = gapReason ?? "Local task metadata is incomplete"
+        }
+        guard !Task.isCancelled else {
+            return .unavailable("Local activity read was cancelled")
         }
         if projectionChainsBefore != projectionChainIdentities(
             for: activeTaskIDs
         ) {
             markFilesChanged(for: activeTaskIDs)
         }
-        guard refreshGeneration == stateGeneration else {
+        guard currentStateGeneration == stateGeneration,
+              currentRefreshGeneration == refreshGeneration else {
             return .unavailable("Account changed during local activity read")
         }
-        if activeStates.contains(where: { state in
-            state.facts.contains { $0.key == .token }
-                && !state.facts.contains {
-                    $0.key == .task && $0.availability == .available
-                }
+        if activeStates.contains(where: {
+            $0.activityStart != nil && taskID(in: $0) == nil
         }) {
             gapReason = gapReason ?? "Local task identity is missing"
         }
@@ -357,12 +593,27 @@ actor LocalActivityCollector {
                 .map(\.normalization.sourceVersion)
                 .filter { $0 != "unknown" }
         )
-        let hasTokenFacts = activeStates.contains {
-            $0.facts.contains { $0.key == .token }
-        }
+        let hasTokenFacts = activeStates.contains { $0.activityStart != nil }
         if hasTokenFacts {
-            let installedVersion = await installedCLIVersion?()
-            guard refreshGeneration == stateGeneration else {
+            let installedVersion: String?
+            if refreshMetadata || !didReadInstalledCLIVersion {
+                installedVersion = await installedCLIVersion?()
+                guard !Task.isCancelled else {
+                    return .unavailable("Local activity read was cancelled")
+                }
+                guard currentStateGeneration == stateGeneration,
+                      currentRefreshGeneration == refreshGeneration else {
+                    return .unavailable(
+                        "Account changed during local activity read"
+                    )
+                }
+                cachedInstalledCLIVersion = installedVersion
+                didReadInstalledCLIVersion = true
+            } else {
+                installedVersion = cachedInstalledCLIVersion
+            }
+            guard currentStateGeneration == stateGeneration,
+                  currentRefreshGeneration == refreshGeneration else {
                 return .unavailable("Account changed during local activity read")
             }
             if versions.isEmpty {
@@ -403,24 +654,181 @@ actor LocalActivityCollector {
         }.sorted {
             $0.taskID < $1.taskID
         }.map(\.withoutRolloutFileURL)
-        if !persist() {
+        let activeProjectionIdentities = activeProjections.map {
+            ProjectionIdentity(
+                taskID: $0.taskID,
+                parentTaskID: $0.parentTaskID,
+                projectLabel: $0.projectLabel,
+                createdAt: $0.createdAt,
+                updatedAt: $0.updatedAt
+            )
+        }
+        guard currentStateGeneration == stateGeneration,
+              currentRefreshGeneration == refreshGeneration else {
+            return .unavailable("Account changed during local activity read")
+        }
+        guard !Task.isCancelled else {
+            return .unavailable("Local activity read was cancelled")
+        }
+        let persisted = persist()
+        projections = projections.filter {
+            activeProjectionIDs.contains($0.key)
+        }
+        attemptedProjectionTaskIDs.formIntersection(activeProjectionIDs)
+        if !persisted {
             gapReason = gapReason ?? "Local activity could not be saved"
         }
-        return LocalActivityCollection(
-            facts: activeStates.flatMap(\.facts),
-            projections: activeProjections,
-            observation: gapReason.map {
-                .gap(
-                    sourceVersion: version,
-                    observedAt: observedAt,
-                    reason: $0
+        let factsWereRebuilt: Bool
+        let mergedFacts: [LocalActivityFact]
+        if reusesPublishedFacts, !rewroteFacts {
+            var currentFacts = cachedFacts ?? []
+            cachedFacts = nil
+            if !appendedFacts.isEmpty {
+                currentFacts.append(
+                    contentsOf: factsForActiveInterval(
+                        appendedFacts,
+                        interval: interval
+                    )
                 )
-            } ?? .continuous(
+            }
+            cachedFacts = currentFacts
+            mergedFacts = currentFacts
+            factsWereRebuilt = false
+        } else {
+            if rewroteFacts {
+                pendingFactRestorePaths.formUnion(
+                    candidatePaths.filter {
+                        files[$0]?.factsLoaded == false
+                    }
+                )
+                for path in candidatePaths.sorted(by: >)
+                where files[path]?.factsLoaded == false {
+                    guard !Task.isCancelled else {
+                        return .unavailable(
+                            "Local activity read was cancelled"
+                        )
+                    }
+                    guard remainingLineBudget > 0,
+                          remainingByteBudget > 0 else {
+                        importStillInProgress = true
+                        gapReason = gapReason
+                            ?? "Local task import is still in progress"
+                        continue
+                    }
+                    let outcome = loadFactsIfNeeded(
+                        for: path,
+                        interval: interval,
+                        maximumLines: remainingLineBudget,
+                        maximumBytes: remainingByteBudget
+                    )
+                    let read: (Int, UInt64)
+                    switch outcome {
+                    case let .ready(linesRead, factBytesRead),
+                         let .partial(linesRead, factBytesRead):
+                        read = (linesRead, factBytesRead)
+                    case .invalid:
+                        pendingFactRestorePaths.remove(path)
+                        gapReason = gapReason
+                            ?? "Saved local activity could not be read"
+                        continue
+                    }
+                    remainingLineBudget = max(
+                        remainingLineBudget - read.0,
+                        0
+                    )
+                    remainingByteBudget = read.1 >= remainingByteBudget
+                        ? 0
+                        : remainingByteBudget - read.1
+                    if case .partial = outcome {
+                        importStillInProgress = true
+                        gapReason = gapReason
+                            ?? "Local task import is still in progress"
+                    } else {
+                        pendingFactRestorePaths.remove(path)
+                    }
+                }
+            }
+            var rebuiltFacts: [LocalActivityFact] = []
+            for path in candidatePaths.sorted() {
+                guard let facts = files[path]?.facts else { continue }
+                rebuiltFacts.append(
+                    contentsOf: facts.lazy.filter {
+                        self.isFactActive($0, in: interval)
+                    }
+                )
+            }
+            mergedFacts = rebuiltFacts
+            cachedFacts = mergedFacts
+            publishedFactPaths = Set(candidatePaths.filter {
+                guard let state = files[$0] else { return false }
+                return state.factsLoaded || state.factRestoreOffset > 0
+            })
+            cachedFactPaths = candidatePaths
+            cachedFactsIntervalStart = interval.start
+            factsWereRebuilt = true
+        }
+        if reusesPublishedFacts, !rewroteFacts {
+            cachedFactPaths = candidatePaths
+            cachedFactsIntervalStart = interval.start
+        }
+        let observation: LocalActivityObservation = gapReason.map {
+            .gap(
                 sourceVersion: version,
-                observedAt: observedAt
-            ),
-            bytesRead: bytesRead
+                observedAt: observedAt,
+                reason: $0
+            )
+        } ?? .continuous(
+            sourceVersion: version,
+            observedAt: observedAt
         )
+        let observationSignature = ObservationSignature(
+            sourceVersion: version == "unknown" ? nil : version,
+            reason: observation.reason,
+            coverage: observation.coverage
+        )
+        if factsWereRebuilt
+            || factsChanged
+            || !appendedFacts.isEmpty
+            || lastPublishedProjectionIdentities != activeProjectionIdentities
+            || lastObservationSignature != observationSignature {
+            advanceContentRevision()
+        }
+        lastPublishedProjectionIdentities = activeProjectionIdentities
+        lastObservationSignature = observationSignature
+        if persisted {
+            unloadPersistedFacts(activePaths: candidatePaths)
+        }
+        importContinuationPending = importStillInProgress
+        return LocalActivityCollection(
+            facts: mergedFacts,
+            projections: activeProjections,
+            observation: observation,
+            bytesRead: bytesRead,
+            contentRevision: contentRevision
+        )
+    }
+
+    private func advanceContentRevision() {
+        contentRevision = nextRevision(after: contentRevision)
+    }
+
+    func hasPendingImport() -> Bool {
+        importContinuationPending
+    }
+
+    func releaseCachedFacts() {
+        refreshGeneration = nextRevision(after: refreshGeneration)
+        guard stateURL != nil else { return }
+        if !changedPaths.isEmpty, !persist() {
+            return
+        }
+        guard changedPaths.isEmpty,
+              pendingFactWrites.isEmpty else {
+            return
+        }
+        restartPartialFactRestores()
+        clearPublishedContent()
+        unloadPersistedFacts(activePaths: [])
     }
 
     func deleteHistory(at deletedAt: Date = Date()) throws {
@@ -434,7 +842,7 @@ actor LocalActivityCollector {
                 for: stateDirectory
             )
         }
-        stateGeneration &+= 1
+        stateGeneration = nextRevision(after: stateGeneration)
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
         restoredFingerprintByIdentity.removeAll()
@@ -445,6 +853,7 @@ actor LocalActivityCollector {
         hasStartedProjectionList = false
         hasCompleteProjectionList = false
         restoreWarning = nil
+        clearPublishedContent()
         guard let stateDirectory else { return }
         if FileManager.default.fileExists(atPath: stateDirectory.path) {
             try FileManager.default.removeItem(at: stateDirectory)
@@ -478,7 +887,7 @@ actor LocalActivityCollector {
         )
         historyCutoff = cutoff
         deletionMarkerInvalid = false
-        stateGeneration &+= 1
+        stateGeneration = nextRevision(after: stateGeneration)
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
         restoredFingerprintByIdentity.removeAll()
@@ -489,6 +898,7 @@ actor LocalActivityCollector {
         hasStartedProjectionList = false
         hasCompleteProjectionList = false
         restoreWarning = nil
+        clearPublishedContent()
         if FileManager.default.fileExists(atPath: stateDirectory.path) {
             try FileManager.default.removeItem(at: stateDirectory)
         }
@@ -514,7 +924,7 @@ actor LocalActivityCollector {
                 try FileManager.default.removeItem(at: markerURL)
             }
         }
-        stateGeneration &+= 1
+        stateGeneration = nextRevision(after: stateGeneration)
         files.removeAll()
         restoredFilesByFingerprint.removeAll()
         restoredFingerprintByIdentity.removeAll()
@@ -525,6 +935,7 @@ actor LocalActivityCollector {
         hasStartedProjectionList = false
         hasCompleteProjectionList = false
         restoreWarning = nil
+        clearPublishedContent()
         historyCutoff = nil
         historyDeletionPending = false
         deletionMarkerInvalid = false
@@ -576,7 +987,10 @@ actor LocalActivityCollector {
         Set(states.compactMap(taskID(in:)))
     }
 
-    private func refreshProjectionList(generation: UInt64) async -> Bool? {
+    private func refreshProjectionList(
+        generation: UInt64,
+        refreshGeneration: UInt64
+    ) async -> Bool? {
         guard let projectionSource else { return nil }
         let hadStarted = hasStartedProjectionList
         do {
@@ -584,7 +998,10 @@ actor LocalActivityCollector {
                 cursor: nil,
                 limit: 100
             )
-            guard generation == stateGeneration else { return nil }
+            guard generation == stateGeneration,
+                  refreshGeneration == self.refreshGeneration else {
+                return nil
+            }
             for projection in newestPage.tasks {
                 projections[projection.taskID] = projection
             }
@@ -611,7 +1028,10 @@ actor LocalActivityCollector {
                     cursor: cursor,
                     limit: 100
                 )
-                guard generation == stateGeneration else { return nil }
+                guard generation == stateGeneration,
+                      refreshGeneration == self.refreshGeneration else {
+                    return nil
+                }
                 for projection in page.tasks {
                     projections[projection.taskID] = projection
                 }
@@ -631,7 +1051,9 @@ actor LocalActivityCollector {
     private func completeProjections(
         for taskIDs: Set<String>,
         listSucceeded: Bool?,
-        generation: UInt64
+        generation: UInt64,
+        refreshGeneration: UInt64,
+        retriesMissingProjections: Bool
     ) async -> Bool {
         guard let projectionSource else { return true }
         guard !taskIDs.isEmpty else { return true }
@@ -642,19 +1064,30 @@ actor LocalActivityCollector {
         while let taskID = pending.first {
             pending.removeFirst()
             guard inspected.insert(taskID).inserted else { continue }
-            let mustRead = projections[taskID] == nil
-                || (taskIDs.contains(taskID) && listSucceeded != true)
+            let mustRead = (
+                projections[taskID] == nil
+                    && (
+                        retriesMissingProjections
+                            || !attemptedProjectionTaskIDs.contains(taskID)
+                    )
+            ) || (
+                retriesMissingProjections
+                    && taskIDs.contains(taskID)
+                    && listSucceeded != true
+            )
             if mustRead {
                 guard reads < 20 else {
                     failed = true
                     break
                 }
                 reads += 1
+                attemptedProjectionTaskIDs.insert(taskID)
                 do {
                     if let projection = try await projectionSource.read(
                         threadID: taskID
                     ) {
-                        guard generation == stateGeneration else {
+                        guard generation == stateGeneration,
+                              refreshGeneration == self.refreshGeneration else {
                             return false
                         }
                         projections[taskID] = projection
@@ -756,7 +1189,7 @@ actor LocalActivityCollector {
     }
 
     private func taskID(in state: FileState) -> String? {
-        state.facts.compactMap { fact in
+        state.normalization.context?.taskID ?? state.facts.compactMap { fact in
             guard fact.key == .task,
                   fact.availability == .available,
                   case let .identifier(taskID) = fact.value else {
@@ -802,7 +1235,65 @@ actor LocalActivityCollector {
     }
 
     private func parseTimestamp(_ value: String) -> Date? {
-        LocalEventTimestampParser().date(from: value)
+        timestampParser.date(from: value)
+    }
+
+    private func clearPublishedContent() {
+        cachedFacts = nil
+        cachedFactPaths.removeAll()
+        cachedFactsIntervalStart = nil
+        pendingFactRestorePaths.removeAll()
+        publishedFactPaths.removeAll()
+        lastProjectionListSucceeded = nil
+        attemptedProjectionTaskIDs.removeAll()
+        lastPublishedProjectionIdentities = nil
+        lastObservationSignature = nil
+        importContinuationPending = false
+    }
+
+    private func restartPartialFactRestores() {
+        for path in Array(files.keys) {
+            guard var state = files[path],
+                  state.factRestoreFileSize != nil else {
+                continue
+            }
+            state.facts.removeAll(keepingCapacity: false)
+            state.eventIDs.removeAll(keepingCapacity: false)
+            state.factsLoaded = false
+            state.factRestoreOffset = 0
+            state.factRestoreFileSize = nil
+            state.restoredFactIdentities.removeAll(keepingCapacity: false)
+            files[path] = state
+        }
+    }
+
+    private func unloadPersistedFacts(activePaths: Set<String>) {
+        guard let directory = stateURL else { return }
+        for path in Array(files.keys) {
+            guard var state = files[path],
+                  !changedPaths.contains(path),
+                  pendingFactWrites[path] == nil,
+                  state.factsLoaded || !activePaths.contains(path) else {
+                continue
+            }
+            let file = factsURL(
+                forFingerprint: state.storageFingerprint
+                    ?? stateFileName(for: path),
+                in: directory
+            )
+            guard FileManager.default.fileExists(atPath: file.path) else {
+                continue
+            }
+            state.facts.removeAll(keepingCapacity: false)
+            if !activePaths.contains(path) {
+                state.eventIDs.removeAll(keepingCapacity: false)
+            }
+            state.factsLoaded = false
+            state.factRestoreOffset = 0
+            state.factRestoreFileSize = nil
+            state.restoredFactIdentities.removeAll(keepingCapacity: false)
+            files[path] = state
+        }
     }
 
     @discardableResult
@@ -829,7 +1320,7 @@ actor LocalActivityCollector {
                 }
                 let data = try JSONEncoder().encode(
                     PersistedFile(
-                        version: 6,
+                        version: 7,
                         path: nil,
                         pathFingerprint: storageFingerprint,
                         cursor: state.cursor,
@@ -886,12 +1377,12 @@ actor LocalActivityCollector {
             : nil
         var legacyPaths = Set<String>()
         for entry in entries where entry.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: entry),
+            guard let data = Self.readMetadata(at: entry),
                   let file = try? JSONDecoder().decode(
                       PersistedFile.self,
                       from: data
                   ),
-                  [4, 5, 6].contains(file.version) else {
+                  [4, 5, 6, 7].contains(file.version) else {
                 restoreWarning = "Saved local activity could not be read"
                 continue
             }
@@ -907,9 +1398,12 @@ actor LocalActivityCollector {
                 storageFingerprint: entry.deletingPathExtension()
                     .lastPathComponent,
                 factsLoaded: false,
-                requiresContextRebuild: file.version == 4
+                requiresContextRebuild: file.version == 4,
+                factRestoreOffset: 0,
+                factRestoreFileSize: nil,
+                restoredFactIdentities: []
             )
-            if file.version == 6 {
+            if file.version >= 6 {
                 let fingerprint = entry.deletingPathExtension()
                     .lastPathComponent
                 guard file.path == nil,
@@ -1045,68 +1539,226 @@ actor LocalActivityCollector {
     }
 
     private func persistFacts(_ write: FactWrite, to file: URL) throws {
-        let data = try write.facts.reduce(into: Data()) { result, fact in
-            result.append(try JSONEncoder().encode(fact))
-            result.append(0x0A)
-        }
         if write.rewritesFile {
-            try data.write(to: file, options: .atomic)
+            let temporary = file.deletingLastPathComponent()
+                .appendingPathComponent(".\(UUID().uuidString).tmp")
+            guard FileManager.default.createFile(
+                atPath: temporary.path,
+                contents: nil
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            do {
+                try writeFacts(write.facts, to: temporary, appending: false)
+                if FileManager.default.fileExists(atPath: file.path) {
+                    _ = try FileManager.default.replaceItemAt(
+                        file,
+                        withItemAt: temporary
+                    )
+                } else {
+                    try FileManager.default.moveItem(
+                        at: temporary,
+                        to: file
+                    )
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: temporary)
+                throw error
+            }
             return
         }
         if !FileManager.default.fileExists(atPath: file.path) {
-            try Data().write(to: file, options: .atomic)
+            guard FileManager.default.createFile(
+                atPath: file.path,
+                contents: nil
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
         }
+        try writeFacts(write.facts, to: file, appending: true)
+    }
+
+    private func writeFacts(
+        _ facts: [LocalActivityFact],
+        to file: URL,
+        appending: Bool
+    ) throws {
         let handle = try FileHandle(forWritingTo: file)
         defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: data)
-    }
-
-    private func restoreFacts(from file: URL) -> [LocalActivityFact]? {
-        guard let data = try? Data(contentsOf: file) else { return nil }
-        let decoder = JSONDecoder()
-        var facts: [LocalActivityFact] = []
-        var seenFacts = Set<String>()
-        for line in data.split(separator: 0x0A) {
-            guard let fact = try? decoder.decode(
-                LocalActivityFact.self,
-                from: Data(line)
-            ) else {
-                return nil
-            }
-            if let eventID = fact.eventID {
-                let identity = "\(eventID)|\(fact.key.rawValue)"
-                guard seenFacts.insert(identity).inserted else { continue }
-            }
-            facts.append(fact)
+        if appending {
+            try handle.seekToEnd()
         }
-        return facts
+        let encoder = JSONEncoder()
+        var buffer = Data()
+        buffer.reserveCapacity(262_144)
+        for fact in facts {
+            var data = try encoder.encode(fact)
+            data.append(0x0A)
+            if !buffer.isEmpty, buffer.count + data.count > 262_144 {
+                try handle.write(contentsOf: buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+            if data.count > 262_144 {
+                try handle.write(contentsOf: data)
+            } else {
+                buffer.append(data)
+            }
+        }
+        if !buffer.isEmpty {
+            try handle.write(contentsOf: buffer)
+        }
     }
 
-    private func loadFactsIfNeeded(for path: String) {
+    private func restoreFacts(
+        from file: URL,
+        state: inout FileState,
+        interval: DateInterval,
+        maximumLines: Int,
+        maximumBytes: UInt64
+    ) -> FactLoadOutcome {
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: file.path
+        ),
+        let fileSize = (attributes[.size] as? NSNumber)?.uint64Value,
+        let handle = try? FileHandle(forReadingFrom: file) else {
+            return .invalid
+        }
+        defer { try? handle.close() }
+        if state.factRestoreFileSize != fileSize
+            || state.factRestoreOffset > fileSize {
+            state.facts.removeAll(keepingCapacity: false)
+            state.eventIDs.removeAll(keepingCapacity: false)
+            state.restoredFactIdentities.removeAll(keepingCapacity: false)
+            state.factRestoreOffset = 0
+            state.factRestoreFileSize = fileSize
+        }
+        let decoder = JSONDecoder()
+        var isValid = true
+        guard let result = try? BoundedJSONLReader.read(
+            handle: handle,
+            from: state.factRestoreOffset,
+            maximumLines: maximumLines,
+            maximumBytes: maximumBytes,
+            maximumRecordBytes: Self.maximumMetadataBytes,
+            discardsPartialRecordAtByteLimit: false,
+            onLine: { line, _ in
+                guard isValid else { return false }
+                guard let fact = try? decoder.decode(
+                    LocalActivityFact.self,
+                    from: line
+                ) else {
+                    isValid = false
+                    return false
+                }
+                guard factPassesHistoryCutoff(fact) else {
+                    return true
+                }
+                let isActive = isFactActive(fact, in: interval)
+                if let eventID = fact.eventID {
+                    guard isActive else {
+                        return true
+                    }
+                    state.eventIDs.insert(eventID)
+                    let identity = FactIdentity(
+                        eventID: eventID,
+                        key: fact.key.rawValue
+                    )
+                    guard state.restoredFactIdentities.insert(
+                        identity
+                    ).inserted else {
+                        return true
+                    }
+                }
+                if isActive {
+                    appendRestoredFact(fact, to: &state.facts)
+                }
+                return true
+            }
+        ),
+        isValid,
+        result.oversizedRecordCount == 0 else {
+            return .invalid
+        }
+        state.factRestoreOffset = result.resumeByteOffset
+        if result.completeByteOffset == fileSize {
+            state.factRestoreOffset = 0
+            state.factRestoreFileSize = nil
+            state.restoredFactIdentities.removeAll(keepingCapacity: false)
+            return .ready(
+                linesRead: result.processedLineCount,
+                bytesRead: result.bytesRead
+            )
+        }
+        guard result.stoppedEarly else { return .invalid }
+        return .partial(
+            linesRead: result.processedLineCount,
+            bytesRead: result.bytesRead
+        )
+    }
+
+    private func appendRestoredFact(
+        _ fact: LocalActivityFact,
+        to facts: inout [LocalActivityFact]
+    ) {
+        guard fact.key == .context,
+              case let .tokens(usage) = fact.value,
+              let eventID = fact.eventID,
+              let lastIndex = facts.indices.last,
+              facts[lastIndex].key == .token,
+              facts[lastIndex].eventID == eventID,
+              facts[lastIndex].eventTimestamp == fact.eventTimestamp,
+              facts[lastIndex].source == fact.source,
+              facts[lastIndex].context == fact.context else {
+            facts.append(fact)
+            return
+        }
+        facts[lastIndex].contextUsage = usage
+    }
+
+    private func loadFactsIfNeeded(
+        for path: String,
+        interval: DateInterval,
+        maximumLines: Int,
+        maximumBytes: UInt64
+    ) -> FactLoadOutcome {
         guard var state = files[path],
               !state.factsLoaded,
               let directory = stateURL else {
-            return
+            return .ready(linesRead: 0, bytesRead: 0)
         }
-        guard let restoredFacts = restoreFacts(
+        let outcome = restoreFacts(
             from: factsURL(
                 forFingerprint: state.storageFingerprint
                     ?? stateFileName(for: path),
                 in: directory
-            )
-        ) else {
-            files[path] = nil
-            return
+            ),
+            state: &state,
+            interval: interval,
+            maximumLines: maximumLines,
+            maximumBytes: maximumBytes
+        )
+        guard case .invalid = outcome else {
+            if case .ready = outcome {
+                if let pending = pendingFactWrites[path],
+                   !pending.rewritesFile {
+                    for fact in pending.facts {
+                        if let eventID = fact.eventID {
+                            guard state.eventIDs.insert(eventID).inserted
+                            else { continue }
+                        }
+                        if factPassesHistoryCutoff(fact),
+                           isFactActive(fact, in: interval) {
+                            state.facts.append(fact)
+                        }
+                    }
+                }
+                state.factsLoaded = true
+            }
+            files[path] = state
+            return outcome
         }
-        let facts = factsAfterHistoryCutoff(restoredFacts)
-        state.facts = facts
-        state.eventIDs = Set(facts.compactMap(\.eventID))
-        let activityBounds = tokenActivityBounds(facts)
-        state.activityStart = activityBounds?.start
-        state.activityEnd = activityBounds?.end
-        state.factsLoaded = true
-        files[path] = state
+        files[path] = nil
+        return .invalid
     }
 
     private func recordsAfterHistoryCutoff(
@@ -1128,27 +1780,68 @@ actor LocalActivityCollector {
     private func factsAfterHistoryCutoff(
         _ facts: [LocalActivityFact]
     ) -> [LocalActivityFact] {
-        guard let historyCutoff else { return facts }
-        return facts.filter { fact in
-            guard let timestamp = fact.eventTimestamp,
-                  let date = parseTimestamp(timestamp) else {
-                return fact.eventID == nil
-            }
-            return date >= historyCutoff
+        facts.filter(factPassesHistoryCutoff)
+    }
+
+    private func factPassesHistoryCutoff(
+        _ fact: LocalActivityFact
+    ) -> Bool {
+        guard let historyCutoff else { return true }
+        guard let timestamp = fact.eventTimestamp,
+              let date = parseTimestamp(timestamp) else {
+            return fact.eventID == nil
         }
+        return date >= historyCutoff
+    }
+
+    private func isFactActive(
+        _ fact: LocalActivityFact,
+        in interval: DateInterval
+    ) -> Bool {
+        switch fact.key {
+        case .task, .parent, .root, .agent:
+            return true
+        default:
+            break
+        }
+        if case let .duration(duration) = fact.value {
+            return duration.completedAt > interval.start
+        }
+        if case let .turnTiming(timing) = fact.value {
+            if let completedAt = timing.completedAt {
+                return completedAt > interval.start
+            }
+            return timing.startedAt.map { $0 >= interval.start } ?? false
+        }
+        guard let timestamp = fact.eventTimestamp,
+              let date = parseTimestamp(timestamp) else {
+            return fact.eventID == nil
+        }
+        return date >= interval.start
+    }
+
+    private func factsForActiveInterval(
+        _ facts: [LocalActivityFact],
+        interval: DateInterval
+    ) -> [LocalActivityFact] {
+        facts.filter { isFactActive($0, in: interval) }
     }
 
     private func tokenActivityBounds(
         _ facts: [LocalActivityFact]
     ) -> DateInterval? {
-        let dates = facts.compactMap { fact -> Date? in
+        var start: Date?
+        var end: Date?
+        for fact in facts {
             guard fact.key == .token,
-                  let timestamp = fact.eventTimestamp else {
-                return nil
+                  let timestamp = fact.eventTimestamp,
+                  let date = parseTimestamp(timestamp) else {
+                continue
             }
-            return parseTimestamp(timestamp)
+            start = start.map { min($0, date) } ?? date
+            end = end.map { max($0, date) } ?? date
         }
-        guard let start = dates.min(), let end = dates.max() else { return nil }
+        guard let start, let end else { return nil }
         return DateInterval(start: start, end: end)
     }
 
@@ -1159,7 +1852,7 @@ actor LocalActivityCollector {
               FileManager.default.fileExists(atPath: file.path) else {
             return .missing
         }
-        guard let data = try? Data(contentsOf: file),
+        guard let data = readMetadata(at: file),
               let marker = try? JSONDecoder().decode(
                   DeletionMarker.self,
                   from: data
@@ -1176,8 +1869,33 @@ actor LocalActivityCollector {
         let file = stateDirectory.appendingPathComponent(
             "deletion-cutoff.json"
         )
-        guard let data = try? Data(contentsOf: file) else { return nil }
+        guard let data = readMetadata(at: file) else { return nil }
         return try? JSONDecoder().decode(Date.self, from: data)
+    }
+
+    private static func readMetadata(at file: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        var data = Data()
+        while data.count <= maximumMetadataBytes {
+            let remaining = maximumMetadataBytes + 1 - data.count
+            let chunk: Data
+            do {
+                guard let value = try handle.read(
+                    upToCount: min(65_536, remaining)
+                ) else {
+                    return data
+                }
+                chunk = value
+            } catch {
+                return nil
+            }
+            guard !chunk.isEmpty else { return data }
+            data.append(chunk)
+        }
+        return nil
     }
 
     private static func deletionMarkerURL(

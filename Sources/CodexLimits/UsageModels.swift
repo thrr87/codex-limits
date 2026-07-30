@@ -1,12 +1,64 @@
 import Foundation
 
+extension Date {
+    var isSupportedUsageDate: Bool {
+        timeIntervalSinceReferenceDate.isFinite
+            && self >= .distantPast
+            && self <= .distantFuture
+    }
+}
+
 struct UsageWindow: Codable, Equatable, Sendable {
     let remainingPercent: Double
     let resetsAt: Date
     let durationMinutes: Int
 
+    var isValid: Bool {
+        let duration = Double(durationMinutes) * 60
+        return remainingPercent.isFinite
+            && (0 ... 100).contains(remainingPercent)
+            && resetsAt.isSupportedUsageDate
+            && durationMinutes > 0
+            && duration.isFinite
+            && resetsAt.addingTimeInterval(-duration).isSupportedUsageDate
+    }
+
     var startsAt: Date {
         resetsAt.addingTimeInterval(-Double(durationMinutes) * 60)
+    }
+}
+
+extension UsageWindow {
+    private enum CodingKeys: String, CodingKey {
+        case remainingPercent
+        case resetsAt
+        case durationMinutes
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let remainingPercent = try container.decode(
+            Double.self,
+            forKey: .remainingPercent
+        )
+        let resetsAt = try container.decode(Date.self, forKey: .resetsAt)
+        let durationMinutes = try container.decode(
+            Int.self,
+            forKey: .durationMinutes
+        )
+        self.init(
+            remainingPercent: remainingPercent,
+            resetsAt: resetsAt,
+            durationMinutes: durationMinutes
+        )
+        guard isValid else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Invalid usage window."
+                )
+            )
+        }
     }
 }
 
@@ -16,6 +68,15 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     let resetsAt: Date
     let lifetimeTokens: Int64?
     let comparisonBreak: Bool
+
+    var isValid: Bool {
+        observedAt.isSupportedUsageDate
+            && resetsAt.isSupportedUsageDate
+            && observedAt <= resetsAt
+            && remainingPercent.isFinite
+            && (0 ... 100).contains(remainingPercent)
+            && (lifetimeTokens.map { $0 >= 0 } ?? true)
+    }
 
     private enum CodingKeys: String, CodingKey {
         case observedAt
@@ -161,6 +222,12 @@ struct AccountSpendControlFacts: Codable, Equatable, Sendable {
     let resetsAt: Date
     let reached: Bool?
 
+    var isValid: Bool {
+        remainingPercent.isFinite
+            && (0 ... 100).contains(remainingPercent)
+            && resetsAt.isSupportedUsageDate
+    }
+
     func fillingMissingValues(
         from previous: AccountSpendControlFacts
     ) -> AccountSpendControlFacts {
@@ -171,6 +238,41 @@ struct AccountSpendControlFacts: Codable, Equatable, Sendable {
             resetsAt: resetsAt,
             reached: reached ?? previous.reached
         )
+    }
+}
+
+extension AccountSpendControlFacts {
+    private enum CodingKeys: String, CodingKey {
+        case limit
+        case used
+        case remainingPercent
+        case resetsAt
+        case reached
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            limit: try container.decode(String.self, forKey: .limit),
+            used: try container.decode(String.self, forKey: .used),
+            remainingPercent: try container.decode(
+                Double.self,
+                forKey: .remainingPercent
+            ),
+            resetsAt: try container.decode(Date.self, forKey: .resetsAt),
+            reached: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .reached
+            )
+        )
+        guard isValid else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Invalid spend control."
+                )
+            )
+        }
     }
 }
 
@@ -236,6 +338,28 @@ struct AccountFacts: Codable, Equatable, Sendable {
             && longestStreakDays == nil
             && credits == nil
             && spendControl == nil
+    }
+
+    var isValid: Bool {
+        [
+            lifetimeTokens,
+            peakDailyTokens,
+            longestRunningTurnSeconds,
+            currentStreakDays,
+            longestStreakDays
+        ].compactMap { $0 }.allSatisfy { $0 >= 0 }
+            && [
+                lifetimeTokensObservedAt,
+                peakDailyTokensObservedAt,
+                longestRunningTurnObservedAt,
+                currentStreakObservedAt,
+                longestStreakObservedAt,
+                creditsObservedAt,
+                creditBalanceObservedAt,
+                spendControlObservedAt,
+                spendControlReachedObservedAt
+            ].compactMap { $0 }.allSatisfy(\.isSupportedUsageDate)
+            && (spendControl?.isValid ?? true)
     }
 
     func fillingMissingValues(from previous: AccountFacts) -> AccountFacts {
@@ -313,6 +437,21 @@ struct UsageSnapshot: Codable, Equatable, Sendable {
         self.bankedResetDetails = bankedResetDetails
         self.fetchedAt = fetchedAt
         self.accountFacts = accountFacts
+    }
+
+    var isValid: Bool {
+        fetchedAt.isSupportedUsageDate
+            && emergencyResetCount >= 0
+            && (mainLimit?.window.isValid ?? true)
+            && otherLimits.allSatisfy(\.window.isValid)
+            && tokenHistory.allSatisfy {
+                $0.date.isSupportedUsageDate && $0.tokens >= 0
+            }
+            && (bankedResetDetails ?? []).allSatisfy {
+                $0.expiresAt.isSupportedUsageDate
+                    && ($0.grantedAt?.isSupportedUsageDate ?? true)
+            }
+            && (accountFacts?.isValid ?? true)
     }
 }
 

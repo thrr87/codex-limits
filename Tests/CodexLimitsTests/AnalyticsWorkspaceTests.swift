@@ -27,7 +27,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         let first = AnalyticsWorkspaceStore(defaults: defaults)
         first.selectSection(.facts)
-        first.selectGraph(.concurrency)
+        first.selectGraph(.tokenActivity)
         first.selectTimeRange(.threeDays)
         first.updateFilters(
             WorkspaceFilters(
@@ -51,7 +51,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         let restored = AnalyticsWorkspaceStore(defaults: defaults)
 
         XCTAssertEqual(restored.state.section, .facts)
-        XCTAssertEqual(restored.state.graph, .concurrency)
+        XCTAssertEqual(restored.state.graph, .tokenActivity)
         XCTAssertEqual(restored.state.timeRange, .selected)
         XCTAssertEqual(restored.state.filters.projectID, "codex-limits")
         XCTAssertEqual(restored.state.filters.taskTreeID, "task-42")
@@ -112,8 +112,73 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
     func testUsagePerTokenKeepsAccountScope() {
         XCTAssertTrue(AnalyticsGraph.usagePerToken.usesAccountScope)
-        XCTAssertFalse(AnalyticsGraph.tokenActivity.usesAccountScope)
+        XCTAssertTrue(AnalyticsGraph.tokenActivity.usesAccountScope)
         XCTAssertFalse(AnalyticsGraph.concurrency.usesAccountScope)
+    }
+
+    func testLightweightCoreOffersOnlyAccountGraphs() {
+        XCTAssertEqual(
+            AnalyticsGraph.coreCases,
+            [.usageRemaining, .tokenActivity]
+        )
+    }
+
+    func testAccountTokenRangeSumsOnlyCompleteFullDays() throws {
+        let formatter = ISO8601DateFormatter()
+        let interval = DateInterval(
+            start: try XCTUnwrap(
+                formatter.date(from: "2026-07-01T12:00:00Z")
+            ),
+            end: try XCTUnwrap(
+                formatter.date(from: "2026-07-04T12:00:00Z")
+            )
+        )
+        let days = try [
+            ("2026-07-01T00:00:00Z", 100, TokenDayCompleteness.complete),
+            ("2026-07-02T00:00:00Z", 200, .complete),
+            ("2026-07-03T00:00:00Z", 300, .complete),
+            ("2026-07-04T00:00:00Z", 400, .partial)
+        ].map {
+            TokenDay(
+                date: try XCTUnwrap(formatter.date(from: $0.0)),
+                tokens: Int64($0.1),
+                completeness: $0.2
+            )
+        }
+
+        let range = AccountTokenActivityRange(
+            days: days,
+            interval: interval
+        )
+
+        XCTAssertEqual(range.days.count, 4)
+        XCTAssertEqual(range.completeDayCount, 2)
+        XCTAssertEqual(range.completeTokens, 500)
+
+        let missingDay = AccountTokenActivityRange(
+            days: days.filter { $0.date != days[2].date },
+            interval: interval
+        )
+        XCTAssertNil(missingDay.completeTokens)
+    }
+
+    func testRestoredLocalGraphFallsBackToUsageRemaining() throws {
+        let defaults = try XCTUnwrap(
+            UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )
+        )
+        var state = AnalyticsExplorationState.initial
+        state.graph = .concurrency
+        defaults.set(
+            try JSONEncoder().encode(state),
+            forKey: AnalyticsWorkspaceStore.persistenceKey
+        )
+
+        XCTAssertEqual(
+            AnalyticsWorkspaceStore.restoredState(from: defaults).graph,
+            .usageRemaining
+        )
     }
 
     func testChangingGraphKeepsRangeAndFilters() {
@@ -146,7 +211,70 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
     func testUsageRemainingAlwaysUsesAccountScope() {
         XCTAssertTrue(AnalyticsGraph.usageRemaining.usesAccountScope)
-        XCTAssertFalse(AnalyticsGraph.tokenActivity.usesAccountScope)
+        XCTAssertTrue(AnalyticsGraph.tokenActivity.usesAccountScope)
+    }
+
+    func testTokenActivityRendersAccountDailyBucketsWithoutLocalFacts() {
+        let fetchedAt = Date(timeIntervalSince1970: 10 * 86_400)
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "weekly",
+                name: "Weekly",
+                window: UsageWindow(
+                    remainingPercent: 75,
+                    resetsAt: fetchedAt.addingTimeInterval(3 * 86_400),
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [
+                TokenDay(
+                    date: fetchedAt.addingTimeInterval(-2 * 86_400),
+                    tokens: 1_000,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: fetchedAt.addingTimeInterval(-86_400),
+                    tokens: 2_000,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: fetchedAt,
+                    tokens: 500,
+                    completeness: .partial
+                )
+            ],
+            emergencyResetCount: 0,
+            fetchedAt: fetchedAt
+        )
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: fetchedAt,
+                previousStatus: nil
+            )
+        )
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        store.selectGraph(.tokenActivity)
+
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore()
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+        XCTAssertNil(reader.localTokenActivity.tokens)
     }
 
     func testPresetRangeEndsAtLatestObservedTimeAndIsClampedToWindow() {

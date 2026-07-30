@@ -69,15 +69,19 @@ enum CodexClientError: LocalizedError {
 }
 
 final class CodexAppServerConnection: @unchecked Sendable {
+    private static let defaultMaximumLineBytes = 16 * 1_024 * 1_024
+
     let input: FileHandle
     let isRunning: () -> Bool
     let stop: () -> Void
     private let outputDescriptor: Int32
+    private let maximumLineBytes: Int
     private var bufferedOutput = Data()
 
     init(
         input: FileHandle,
         output: FileHandle,
+        maximumLineBytes: Int = defaultMaximumLineBytes,
         isRunning: @escaping () -> Bool,
         stop: @escaping () -> Void
     ) {
@@ -85,6 +89,7 @@ final class CodexAppServerConnection: @unchecked Sendable {
         self.isRunning = isRunning
         self.stop = stop
         outputDescriptor = Darwin.dup(output.fileDescriptor)
+        self.maximumLineBytes = max(maximumLineBytes, 1)
     }
 
     deinit {
@@ -94,11 +99,25 @@ final class CodexAppServerConnection: @unchecked Sendable {
     }
 
     func readLine() async -> Data? {
+        var searchedByteCount = 0
         while true {
-            if let newline = bufferedOutput.firstIndex(of: 0x0A) {
+            let searchStart = bufferedOutput.index(
+                bufferedOutput.startIndex,
+                offsetBy: min(searchedByteCount, bufferedOutput.count)
+            )
+            if let newline = bufferedOutput[searchStart...].firstIndex(
+                of: 0x0A
+            ) {
+                guard newline <= maximumLineBytes else {
+                    return closeOversizedLine()
+                }
                 let line = bufferedOutput[..<newline]
                 bufferedOutput.removeSubrange(...newline)
                 return Data(line)
+            }
+            searchedByteCount = bufferedOutput.count
+            if bufferedOutput.count > maximumLineBytes {
+                return closeOversizedLine()
             }
             let chunk = await Task.detached {
                 [outputDescriptor] () -> Data? in
@@ -121,6 +140,12 @@ final class CodexAppServerConnection: @unchecked Sendable {
             }
             bufferedOutput.append(chunk)
         }
+    }
+
+    private func closeOversizedLine() -> Data? {
+        bufferedOutput = Data()
+        stop()
+        return nil
     }
 }
 
@@ -329,6 +354,7 @@ actor CodexClient {
     ) async throws -> T {
         await protocolGate.enter()
         do {
+            try Task.checkCancellation()
             let result = try await operation()
             await protocolGate.leave()
             return result
@@ -740,7 +766,7 @@ actor CodexClient {
             let snapshots = result.rateLimitsByLimitId
                 ?? ["codex": result.rateLimits]
             let mainSnapshot = snapshots["codex"] ?? result.rateLimits
-            return windows(from: mainSnapshot)
+            return try windows(from: mainSnapshot)
                 .first(where: {
                     $0.durationMinutes == weeklyWindowDurationMinutes
                 })
@@ -777,7 +803,7 @@ actor CodexClient {
 
         let snapshots = rateResult.rateLimitsByLimitId ?? ["codex": rateResult.rateLimits]
         let mainSnapshot = snapshots["codex"] ?? rateResult.rateLimits
-        let mainWindows = windows(from: mainSnapshot)
+        let mainWindows = try windows(from: mainSnapshot)
         let mainWindow = mainWindows.first(where: {
             $0.durationMinutes == weeklyWindowDurationMinutes
         })
@@ -787,10 +813,10 @@ actor CodexClient {
             .map {
                 LimitReading(limitId: "codex", name: windowName($0.durationMinutes), window: $0)
             }
-        let otherLimits = snapshots
+        let otherLimits = try snapshots
             .filter { $0.key != "codex" }
             .compactMap { id, snapshot -> LimitReading? in
-                guard let window = windows(from: snapshot).min(by: {
+                guard let window = try windows(from: snapshot).min(by: {
                     $0.remainingPercent < $1.remainingPercent
                 }) else { return nil }
                 return LimitReading(
@@ -847,6 +873,9 @@ actor CodexClient {
                 reached: mainSnapshot.spendControlReached
             )
         }
+        guard spendControl?.isValid != false else {
+            throw CodexClientError.invalidResponse
+        }
         let facts = AccountFacts(
             lifetimeTokens: summary?.lifetimeTokens,
             peakDailyTokens: summary?.peakDailyTokens,
@@ -900,7 +929,7 @@ actor CodexClient {
             )
         }
 
-        return UsageSnapshot(
+        let snapshot = UsageSnapshot(
             mainLimit: mainWindow.map {
                 LimitReading(limitId: "codex", name: "Codex", window: $0)
             },
@@ -912,6 +941,10 @@ actor CodexClient {
             fetchedAt: fetchedAt,
             accountFacts: facts.isEmpty ? nil : facts
         )
+        guard snapshot.isValid else {
+            throw CodexClientError.invalidResponse
+        }
+        return snapshot
     }
 
     static func decodeAccount(_ response: Data) throws -> CodexAccountObservation {
@@ -988,11 +1021,18 @@ actor CodexClient {
         )
     }
 
-    private static func windows(from snapshot: RateLimitSnapshot) -> [UsageWindow] {
-        [snapshot.primary, snapshot.secondary].compactMap { window in
-            guard let window,
-                  let resetsAt = window.resetsAt,
-                  let duration = window.windowDurationMins else { return nil }
+    private static func windows(
+        from snapshot: RateLimitSnapshot
+    ) throws -> [UsageWindow] {
+        try [snapshot.primary, snapshot.secondary].compactMap { window in
+            guard let window else { return nil }
+            guard let resetsAt = window.resetsAt,
+                  let duration = window.windowDurationMins else {
+                return nil
+            }
+            guard window.usedPercent.isFinite, duration > 0 else {
+                throw CodexClientError.invalidResponse
+            }
             return UsageWindow(
                 remainingPercent: min(max(100 - window.usedPercent, 0), 100),
                 resetsAt: Date(timeIntervalSince1970: TimeInterval(resetsAt)),

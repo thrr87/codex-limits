@@ -397,6 +397,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
     let localActivityHistoryFacts: [LocalActivityFact]
     let localActivityObservation: LocalActivityObservation
     let localTaskProjections: [ThreadProjection]
+    let localActivityContentRevision: UInt64?
+    let reusableLocalAggregates: LocalAggregateCache?
     let compatibleTokenSources: Set<LocalTokenDefinitionSource>
     let analyticsExploration: AnalyticsExplorationState
     let insightDispositions: [String: InsightDisposition]
@@ -416,6 +418,8 @@ struct UsageIntelligenceInput: Equatable, Sendable {
             "Codex local records are unavailable"
         ),
         localTaskProjections: [ThreadProjection] = [],
+        localActivityContentRevision: UInt64? = nil,
+        reusableLocalAggregates: LocalAggregateCache? = nil,
         compatibleTokenSources: Set<LocalTokenDefinitionSource> = [],
         analyticsExploration: AnalyticsExplorationState = .initial,
         insightDispositions: [String: InsightDisposition] = [:]
@@ -433,9 +437,112 @@ struct UsageIntelligenceInput: Equatable, Sendable {
             localActivityHistoryFacts ?? localActivityFacts
         self.localActivityObservation = localActivityObservation
         self.localTaskProjections = localTaskProjections
+        self.localActivityContentRevision = localActivityContentRevision
+        self.reusableLocalAggregates = reusableLocalAggregates
         self.compatibleTokenSources = compatibleTokenSources
         self.analyticsExploration = analyticsExploration
         self.insightDispositions = insightDispositions
+    }
+}
+
+struct LocalAggregateCache: Equatable, Sendable {
+    let contentRevision: UInt64
+    let observation: LocalActivityObservation
+    let workloadMixChanged: Bool
+    let localTokenActivity: LocalTokenActivitySnapshot
+    let usageReceipts: UsageReceiptSnapshot
+    let activityTimeline: ActivityTimelineSnapshot
+    fileprivate let localHistory: LocalHistoryAggregateCache?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.contentRevision == rhs.contentRevision
+            && lhs.observation == rhs.observation
+            && lhs.workloadMixChanged == rhs.workloadMixChanged
+            && lhs.localTokenActivity == rhs.localTokenActivity
+            && lhs.usageReceipts == rhs.usageReceipts
+            && lhs.activityTimeline == rhs.activityTimeline
+    }
+}
+
+private final class LocalHistoryAggregateCache: @unchecked Sendable {
+    let factIndex: LocalActivityFactIndex
+    let samples: [UsageSample]
+    let observation: LocalActivityObservation
+    let accountPartitionID: String
+    let limitID: String
+    let currentReset: Date
+    let compatibleTokenSources: Set<LocalTokenDefinitionSource>
+    let weeklyEvidence: WeeklyUsageEvidenceSet
+    let activeTimeHistory: ActiveTimeHistorySelection
+
+    init(
+        factIndex: LocalActivityFactIndex,
+        samples: [UsageSample],
+        observation: LocalActivityObservation,
+        accountPartitionID: String,
+        limitID: String,
+        currentReset: Date,
+        compatibleTokenSources: Set<LocalTokenDefinitionSource>,
+        weeklyEvidence: WeeklyUsageEvidenceSet,
+        activeTimeHistory: ActiveTimeHistorySelection
+    ) {
+        self.factIndex = factIndex
+        self.samples = samples
+        self.observation = observation
+        self.accountPartitionID = accountPartitionID
+        self.limitID = limitID
+        self.currentReset = currentReset
+        self.compatibleTokenSources = compatibleTokenSources
+        self.weeklyEvidence = weeklyEvidence
+        self.activeTimeHistory = activeTimeHistory
+    }
+
+    func matches(
+        samples: [UsageSample],
+        observation: LocalActivityObservation,
+        accountPartitionID: String,
+        limitID: String,
+        currentReset: Date,
+        compatibleTokenSources: Set<LocalTokenDefinitionSource>
+    ) -> Bool {
+        self.accountPartitionID == accountPartitionID
+            && self.limitID == limitID
+            && self.currentReset == currentReset
+            && self.compatibleTokenSources == compatibleTokenSources
+            && observationsHaveSameHistoryEffect(
+                self.observation,
+                observation
+            )
+            && samplesMatchExactly(self.samples, samples)
+    }
+
+    private func observationsHaveSameHistoryEffect(
+        _ lhs: LocalActivityObservation,
+        _ rhs: LocalActivityObservation
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case let (
+            .continuous(lhsVersion, _),
+            .continuous(rhsVersion, _)
+        ):
+            lhsVersion == rhsVersion
+        default:
+            lhs == rhs
+        }
+    }
+
+    private func samplesMatchExactly(
+        _ lhs: [UsageSample],
+        _ rhs: [UsageSample]
+    ) -> Bool {
+        lhs.count == rhs.count
+            && zip(lhs, rhs).allSatisfy {
+                $0.observedAt == $1.observedAt
+                    && $0.remainingPercent == $1.remainingPercent
+                    && $0.resetsAt == $1.resetsAt
+                    && $0.lifetimeTokens == $1.lifetimeTokens
+                    && $0.comparisonBreak == $1.comparisonBreak
+            }
     }
 }
 
@@ -458,6 +565,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let activeTimeAvailability: ActiveTimeAvailabilitySnapshot
     let localTaskProjections: [ThreadProjection]
     let accountPartitionID: String?
+    let reusableLocalAggregates: LocalAggregateCache?
     var insights: DeterministicInsightsSnapshot
 
     var fetchedAt: Date? { account?.fetchedAt }
@@ -491,12 +599,17 @@ struct UsageReaderSnapshot: Equatable, Sendable {
 
     func updatedText(at now: Date) -> String {
         guard let fetchedAt = account?.fetchedAt else { return "Not updated" }
-        let seconds = max(now.timeIntervalSince(fetchedAt), 0)
+        let rawSeconds = now.timeIntervalSince(fetchedAt)
+        guard rawSeconds.isFinite else { return "Updated a long time ago" }
+        let seconds = max(rawSeconds, 0)
         if seconds < 60 { return "Updated just now" }
         if seconds < 3_600 { return "Updated \(Int(seconds / 60)) min ago" }
         if seconds < 86_400 {
             let hours = Int(seconds / 3_600)
             return "Updated \(hours) \(hours == 1 ? "hr" : "hrs") ago"
+        }
+        guard seconds / 86_400 <= Double(Int.max) else {
+            return "Updated a long time ago"
         }
         let days = Int(seconds / 86_400)
         return "Updated \(days) \(days == 1 ? "day" : "days") ago"
@@ -534,12 +647,26 @@ enum UsageIntelligenceEngine {
                 .sorted { $0.observedAt < $1.observedAt }
             }
         } ?? []
+        let reusableLocalAggregates = input.reusableLocalAggregates.flatMap {
+            cache -> LocalAggregateCache? in
+            guard let revision = input.localActivityContentRevision,
+                  revision != 0,
+                  cache.contentRevision == revision,
+                  canReuseLocalAggregates(
+                      from: cache.observation,
+                      to: input.localActivityObservation
+                  ) else {
+                return nil
+            }
+            return cache
+        }
         let workloadMixChanged = input.account?.mainLimit.map {
-            LocalWorkloadMixAnalyzer.detectsChange(
-                facts: input.localActivityFacts,
-                observation: input.localActivityObservation,
-                window: $0.window
-            )
+            reusableLocalAggregates?.workloadMixChanged
+                ?? LocalWorkloadMixAnalyzer.detectsChange(
+                    facts: input.localActivityFacts,
+                    observation: input.localActivityObservation,
+                    window: $0.window
+                )
         } ?? false
         let evidence = evidence(
             account: input.account,
@@ -617,47 +744,109 @@ enum UsageIntelligenceEngine {
             accountActivity: accountTokenActivity,
             accountEpochStartedAt: input.accountEpochStartedAt
         ) {
-            localTokenActivity = LocalTokenActivityAggregator.evaluate(
-                facts: input.localActivityFacts,
-                interval: interval,
-                observation: input.localActivityObservation
-            )
+            if let cached = reusableLocalAggregates?.localTokenActivity,
+               cached.interval.start == interval.start,
+               !tokenFactsAffectIntervalChange(
+                   input.localActivityFacts,
+                   from: cached.interval,
+                   to: interval
+               ) {
+                localTokenActivity = cached.updating(
+                    interval: interval,
+                    observation: input.localActivityObservation
+                )
+            } else {
+                localTokenActivity = LocalTokenActivityAggregator.evaluate(
+                    facts: input.localActivityFacts,
+                    interval: interval,
+                    observation: input.localActivityObservation
+                )
+            }
         } else {
             localTokenActivity = .unavailable(
                 "Weekly token interval is unavailable",
                 interval: DateInterval(start: input.now, end: input.now)
             )
         }
-        let usageReceipts = UsageReceiptAggregator.evaluate(
-            facts: input.localActivityFacts,
-            projections: input.localTaskProjections,
-            interval: localTokenActivity.interval,
-            observation: input.localActivityObservation
-        )
-        let activityTimeline = ActivityTimelineAggregator.evaluate(
-            facts: input.localActivityFacts,
-            projections: input.localTaskProjections,
-            interval: localTokenActivity.interval,
-            observation: input.localActivityObservation
-        )
+        let usageReceipts = reusableLocalAggregates.flatMap {
+            $0.usageReceipts.interval.start
+                == localTokenActivity.interval.start
+                ? $0.usageReceipts.updating(
+                        interval: localTokenActivity.interval,
+                        observation: input.localActivityObservation
+                    )
+                : nil
+        }
+            ?? UsageReceiptAggregator.evaluate(
+                facts: input.localActivityFacts,
+                projections: input.localTaskProjections,
+                interval: localTokenActivity.interval,
+                observation: input.localActivityObservation
+            )
+        let activityTimeline = reusableLocalAggregates.flatMap {
+            $0.activityTimeline.interval.start
+                == localTokenActivity.interval.start
+                ? $0.activityTimeline.updating(
+                        interval: localTokenActivity.interval,
+                        observation: input.localActivityObservation
+                    )
+                : nil
+        }
+            ?? ActivityTimelineAggregator.evaluate(
+                facts: input.localActivityFacts,
+                projections: input.localTaskProjections,
+                interval: localTokenActivity.interval,
+                observation: input.localActivityObservation
+            )
+        let reusableLocalHistory = reusableLocalAggregates?.localHistory
+        let localHistoryFactIndex: LocalActivityFactIndex?
+        if input.accountPartitionID != nil,
+           input.account?.mainLimit != nil {
+            localHistoryFactIndex = reusableLocalHistory?.factIndex
+                ?? LocalActivityFactIndex(input.localActivityHistoryFacts)
+        } else {
+            localHistoryFactIndex = nil
+        }
+        let weeklyEvidence: WeeklyUsageEvidenceSet?
+        let reusedWeeklyEvidence: Bool
         let sourceUsagePerToken: UsagePerTokenSnapshot
         if let partitionID = input.accountPartitionID,
-           let weekly = input.account?.mainLimit {
-            let evidence = WeeklyUsageEvidenceBuilder.build(
-                samples: input.samples,
-                localFacts: input.localActivityHistoryFacts,
-                localObservation: input.localActivityObservation,
-                accountPartitionID: partitionID,
-                limitID: weekly.limitId,
-                currentReset: weekly.window.resetsAt,
-                compatibleTokenSources: input.compatibleTokenSources
-            )
+           let weekly = input.account?.mainLimit,
+           let localHistoryFactIndex {
+            let evidence: WeeklyUsageEvidenceSet
+            if let reusableLocalHistory,
+               reusableLocalHistory.matches(
+                   samples: input.samples,
+                   observation: input.localActivityObservation,
+                   accountPartitionID: partitionID,
+                   limitID: weekly.limitId,
+                   currentReset: weekly.window.resetsAt,
+                   compatibleTokenSources: input.compatibleTokenSources
+               ) {
+                evidence = reusableLocalHistory.weeklyEvidence
+                reusedWeeklyEvidence = true
+            } else {
+                evidence = WeeklyUsageEvidenceBuilder.build(
+                    samples: input.samples,
+                    localFacts: input.localActivityHistoryFacts,
+                    localObservation: input.localActivityObservation,
+                    accountPartitionID: partitionID,
+                    limitID: weekly.limitId,
+                    currentReset: weekly.window.resetsAt,
+                    compatibleTokenSources: input.compatibleTokenSources,
+                    factIndex: localHistoryFactIndex
+                )
+                reusedWeeklyEvidence = false
+            }
+            weeklyEvidence = evidence
             sourceUsagePerToken = UsagePerTokenEngine.evaluate(
                 current: evidence.current,
                 history: evidence.history,
                 pinnedBaselineID: nil
             )
         } else {
+            weeklyEvidence = nil
+            reusedWeeklyEvidence = false
             sourceUsagePerToken = UsagePerTokenEngine.evaluate(
                 current: nil,
                 history: [],
@@ -679,16 +868,27 @@ enum UsageIntelligenceEngine {
             in: activityTimeline.interval,
             filters: .all
         )
-        let activeTimeHistory = ActiveTimeWeekEvidenceBuilder.build(
-            currentUsage: usagePerToken.current,
-            usage: usagePerToken.history,
-            facts: input.localActivityHistoryFacts,
-            projections: input.localTaskProjections,
-            observation: input.localActivityObservation
-        )
+        let activeTimeHistory: ActiveTimeHistorySelection
+        if reusedWeeklyEvidence, let reusableLocalHistory {
+            activeTimeHistory = reusableLocalHistory.activeTimeHistory
+        } else {
+            activeTimeHistory = ActiveTimeWeekEvidenceBuilder.build(
+                currentUsage: usagePerToken.current,
+                usage: usagePerToken.history,
+                facts: input.localActivityHistoryFacts,
+                projections: input.localTaskProjections,
+                observation: input.localActivityObservation,
+                factIndex: localHistoryFactIndex
+            )
+        }
         let activeTimeAvailability = ActiveTimeAvailabilityEngine.evaluate(
             currentUsage: usagePerToken.current,
             activeTimeThisWeek: activeTimeSlice.activeTime,
+            maximumConcurrency: activeTimeSlice.maximumConcurrency,
+            waitingTime: activeTimeSlice.waitingTime,
+            pollingTime: activeTimeSlice.pollingTime,
+            activityBreakdownReason:
+                activeTimeSlice.activityBreakdownReason,
             activeTimeCoverage: activeTimeSlice.coverage,
             activeTimeReason: activeTimeSlice.reason,
             history: activeTimeHistory.evidence,
@@ -696,6 +896,40 @@ enum UsageIntelligenceEngine {
             usageRemainingPercent:
                 input.account?.mainLimit?.window.remainingPercent ?? .nan
         )
+        let localHistoryCache: LocalHistoryAggregateCache?
+        if reusedWeeklyEvidence, let reusableLocalHistory {
+            localHistoryCache = reusableLocalHistory
+        } else if let localHistoryFactIndex,
+                  let weeklyEvidence,
+                  let partitionID = input.accountPartitionID,
+                  let weekly = input.account?.mainLimit {
+            localHistoryCache = LocalHistoryAggregateCache(
+                factIndex: localHistoryFactIndex,
+                samples: input.samples,
+                observation: input.localActivityObservation,
+                accountPartitionID: partitionID,
+                limitID: weekly.limitId,
+                currentReset: weekly.window.resetsAt,
+                compatibleTokenSources: input.compatibleTokenSources,
+                weeklyEvidence: weeklyEvidence,
+                activeTimeHistory: activeTimeHistory
+            )
+        } else {
+            localHistoryCache = nil
+        }
+        let localAggregateCache: LocalAggregateCache? =
+            input.localActivityContentRevision.flatMap { revision in
+                guard revision != 0 else { return nil }
+                return LocalAggregateCache(
+                    contentRevision: revision,
+                    observation: input.localActivityObservation,
+                    workloadMixChanged: workloadMixChanged,
+                    localTokenActivity: localTokenActivity,
+                    usageReceipts: usageReceipts,
+                    activityTimeline: activityTimeline,
+                    localHistory: localHistoryCache
+                )
+            }
         let observedInterval = input.account.flatMap { account in
             account.mainLimit.map {
                 UsageObservedInterval(
@@ -752,8 +986,44 @@ enum UsageIntelligenceEngine {
             activeTimeAvailability: activeTimeAvailability,
             localTaskProjections: input.localTaskProjections,
             accountPartitionID: input.accountPartitionID,
+            reusableLocalAggregates: localAggregateCache,
             insights: insights
         )
+    }
+
+    private static func tokenFactsAffectIntervalChange(
+        _ facts: [LocalActivityFact],
+        from previous: DateInterval,
+        to current: DateInterval
+    ) -> Bool {
+        guard previous != current else { return false }
+        let parser = LocalEventTimestampParser()
+        return facts.contains { fact in
+            guard fact.key == .token,
+                  fact.availability == .available,
+                  let timestamp = fact.eventTimestamp,
+                  let date = parser.date(from: timestamp) else {
+                return false
+            }
+            let wasIncluded = date >= previous.start && date < previous.end
+            let isIncluded = date >= current.start && date < current.end
+            return wasIncluded != isIncluded
+        }
+    }
+
+    private static func canReuseLocalAggregates(
+        from previous: LocalActivityObservation,
+        to current: LocalActivityObservation
+    ) -> Bool {
+        switch (previous, current) {
+        case (.continuous, .continuous),
+             (.continuous, .gap),
+             (.gap, .gap),
+             (.unavailable, .unavailable):
+            true
+        default:
+            false
+        }
     }
 
     private static func bankedResetSummary(

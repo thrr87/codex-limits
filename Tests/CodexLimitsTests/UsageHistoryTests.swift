@@ -128,6 +128,47 @@ final class UsageHistoryTests: XCTestCase {
         XCTAssertTrue(state.samples.isEmpty)
     }
 
+    func testDailyFileRestoreKeepsValidSamplesBesideAnInvalidSample() async throws {
+        let root = temporaryDirectory()
+        let valid = UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_000),
+            remainingPercent: 80,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+        _ = await history.record(valid)
+        let file = try XCTUnwrap(
+            jsonFiles(for: "writer-a", in: root).first
+        )
+        var dailyFile = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: file)
+            ) as? [String: Any]
+        )
+        var samples = try XCTUnwrap(
+            dailyFile["samples"] as? [[String: Any]]
+        )
+        samples.append([
+            "observedAt": 1_900_001,
+            "remainingPercent": -1,
+            "resetsAt": 2_000_000
+        ])
+        dailyFile["samples"] = samples
+        try JSONSerialization.data(withJSONObject: dailyFile).write(to: file)
+
+        let restored = await UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        ).load()
+
+        XCTAssertEqual(restored.samples, [valid])
+        XCTAssertNil(restored.errorMessage)
+    }
+
     func testSharedFolderAcceptsTheSameAccountAndRejectsAnotherAccount() async throws {
         let root = temporaryDirectory()
         let shared = root.appendingPathComponent("shared", isDirectory: true)
@@ -280,6 +321,50 @@ final class UsageHistoryTests: XCTestCase {
         XCTAssertEqual(sample.observedAt, Date(timeIntervalSinceReferenceDate: 0))
         XCTAssertEqual(sample.remainingPercent, 80)
         XCTAssertEqual(sample.resetsAt, Date(timeIntervalSinceReferenceDate: 86_400))
+    }
+
+    func testUsageSampleDecodingLeavesValidationToTheRestoreBoundary() throws {
+        let invalid = [
+            #"{"observedAt":0,"remainingPercent":1e308,"resetsAt":86400}"#,
+            #"{"observedAt":0,"remainingPercent":-1,"resetsAt":86400}"#,
+            #"{"observedAt":86401,"remainingPercent":80,"resetsAt":86400}"#,
+            #"{"observedAt":0,"remainingPercent":80,"resetsAt":86400,"lifetimeTokens":-1}"#
+        ]
+
+        for json in invalid {
+            let sample = try JSONDecoder().decode(
+                UsageSample.self,
+                from: Data(json.utf8)
+            )
+            XCTAssertFalse(sample.isValid)
+        }
+
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        let sample = try decoder.decode(
+            UsageSample.self,
+            from: Data(
+                #"{"observedAt":0,"remainingPercent":"NaN","resetsAt":86400}"#
+                    .utf8
+            )
+        )
+        XCTAssertFalse(sample.isValid)
+    }
+
+    func testSpendControlDecodingRejectsInvalidRemainingPercent() throws {
+        let decoder = JSONDecoder()
+        let data = Data(
+            #"{"limit":"50","used":"10","remainingPercent":1e308,"resetsAt":86400}"#
+                .utf8
+        )
+
+        XCTAssertThrowsError(
+            try decoder.decode(AccountSpendControlFacts.self, from: data)
+        )
     }
 
     func testVersionOneHistoryMigratesIntoTheActiveAccountPartition() async throws {
@@ -1104,6 +1189,49 @@ final class UsageHistoryTests: XCTestCase {
 
         XCTAssertEqual(state.samples, [sample])
         XCTAssertNil(state.errorMessage)
+    }
+
+    func testAutomaticSyncIsThrottledButExplicitSyncStillRuns() async throws {
+        let root = temporaryDirectory()
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shared,
+            withIntermediateDirectories: true
+        )
+        let first = UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_000),
+            remainingPercent: 80,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+        let second = UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_060),
+            remainingPercent: 79,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+        let reader = UsageHistory(
+            localDirectory: root.appendingPathComponent("reader"),
+            installationID: "reader"
+        )
+        _ = await reader.load()
+        _ = await reader.connect(to: shared)
+        _ = await reader.record(first)
+        let writer = UsageHistory(
+            localDirectory: root.appendingPathComponent("writer"),
+            installationID: "writer"
+        )
+        _ = await writer.load()
+        _ = await writer.connect(to: shared)
+        _ = await writer.record(second)
+
+        let throttled = await reader.synchronizeIfDue()
+        let afterClockRollback = await reader.synchronizeIfDue(
+            at: Date(timeIntervalSince1970: 0)
+        )
+        let explicit = await reader.synchronize()
+
+        XCTAssertEqual(throttled.samples, [first])
+        XCTAssertEqual(afterClockRollback.samples, [first, second])
+        XCTAssertEqual(explicit.samples, [first, second])
     }
 
     func testUnsupportedFolderVersionIsNotModified() async throws {

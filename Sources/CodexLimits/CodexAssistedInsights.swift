@@ -204,15 +204,9 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
         if exploration.filters.isEmpty {
             local = reader.localTokenActivity.slice(in: localRange)
         } else {
-            let receiptSlice = reader.usageReceipts.slice(
+            local = reader.usageReceipts.localTokenSlice(
                 in: localRange,
                 filters: exploration.filters
-            )
-            local = LocalTokenActivitySlice(
-                tokens: receiptSlice.totalTokens,
-                points: receiptSlice.points,
-                coverage: receiptSlice.coverage,
-                reason: receiptSlice.reason
             )
         }
         let activity = reader.activityTimeline.slice(

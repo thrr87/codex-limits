@@ -18,8 +18,19 @@ enum AnalyticsGraph: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    static let coreCases: [AnalyticsGraph] = [
+        .usageRemaining,
+        .tokenActivity
+    ]
+
     var usesAccountScope: Bool {
-        self == .usageRemaining || self == .usagePerToken
+        self == .usageRemaining
+            || self == .tokenActivity
+            || self == .usagePerToken
+    }
+
+    var usesLocalAnalytics: Bool {
+        self == .usagePerToken || self == .concurrency
     }
 }
 
@@ -62,6 +73,57 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
     }
 }
 
+struct AccountTokenActivityRange: Equatable, Sendable {
+    let days: [TokenDay]
+    let completeDayCount: Int
+    let completeTokens: Int64?
+
+    init(days: [TokenDay], interval: DateInterval) {
+        let day: TimeInterval = 86_400
+        self.days = days
+            .filter {
+                $0.date < interval.end
+                    && $0.date.addingTimeInterval(day) > interval.start
+            }
+            .sorted { $0.date < $1.date }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)
+            ?? calendar.timeZone
+        let startOfDay = calendar.startOfDay(for: interval.start)
+        var expected = startOfDay < interval.start
+            ? startOfDay.addingTimeInterval(day)
+            : startOfDay
+        var expectedDates: [Date] = []
+        while expected.addingTimeInterval(day) <= interval.end {
+            expectedDates.append(expected)
+            expected = expected.addingTimeInterval(day)
+        }
+        completeDayCount = expectedDates.count
+
+        guard !expectedDates.isEmpty else {
+            completeTokens = nil
+            return
+        }
+        var total: Int64 = 0
+        for date in expectedDates {
+            guard let bucket = self.days.first(where: { $0.date == date }),
+                  bucket.completeness == .complete,
+                  bucket.tokens >= 0 else {
+                completeTokens = nil
+                return
+            }
+            let result = total.addingReportingOverflow(bucket.tokens)
+            guard !result.overflow else {
+                completeTokens = nil
+                return
+            }
+            total = result.partialValue
+        }
+        completeTokens = total
+    }
+}
+
 struct WorkspaceFilters: Codable, Equatable, Sendable {
     var projectID: String?
     var taskTreeID: String?
@@ -101,6 +163,10 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
         pinnedUsageBaselineID: nil,
         pinnedUsageBaselineAccountPartitionID: nil
     )
+
+    var usesLocalAnalytics: Bool {
+        section == .graphs && graph.usesLocalAnalytics
+    }
 }
 
 @MainActor
@@ -132,6 +198,12 @@ final class AnalyticsWorkspaceStore: ObservableObject {
                 from: data
               ) else {
             return .initial
+        }
+        guard AnalyticsGraph.coreCases.contains(restored.graph) else {
+            var core = restored
+            core.graph = .usageRemaining
+            core.filters = .all
+            return core
         }
         return restored
     }
@@ -353,10 +425,48 @@ struct UsageChartSelection: Equatable, Sendable {
         in chart: UsageChartSnapshot,
         within visibleRange: DateInterval? = nil
     ) -> UsageChartSelection? {
-        candidates(in: chart)
-            .filter {
-                visibleRange?.contains($0.point.date) ?? true
-            }.min {
+        [
+            nearestCandidate(
+                in: chart.allObserved,
+                series: .observed,
+                priority: 0,
+                source: .account,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.currentProjection,
+                series: .currentEstimate,
+                priority: 1,
+                source: .derivedEstimate,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.historicalProjection,
+                series: .pastEstimate,
+                priority: 2,
+                source: .accountHistory,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.estimatedBackfill,
+                series: .estimatedBackfill,
+                priority: 3,
+                source: .tokenEstimate,
+                to: date,
+                within: visibleRange
+            ),
+            nearestCandidate(
+                in: chart.target,
+                series: .target,
+                priority: 4,
+                source: .weeklyTarget,
+                to: date,
+                within: visibleRange
+            )
+        ].compactMap { $0 }.min {
                 let leftDistance = abs($0.point.date.timeIntervalSince(date))
                 let rightDistance = abs($1.point.date.timeIntervalSince(date))
                 if leftDistance == rightDistance {
@@ -371,6 +481,30 @@ struct UsageChartSelection: Equatable, Sendable {
                     source: $0.source
                 )
             }
+    }
+
+    private static func nearestCandidate(
+        in points: [UsageChartPoint],
+        series: UsageChartSeries,
+        priority: Int,
+        source: UsageChartPointSource,
+        to date: Date,
+        within visibleRange: DateInterval?
+    ) -> Candidate? {
+        guard let point = nearestPoint(
+            in: points,
+            to: date,
+            date: \.date,
+            within: visibleRange
+        ) else {
+            return nil
+        }
+        return Candidate(
+            series: series,
+            point: point,
+            priority: priority,
+            source: source
+        )
     }
 
     private static func candidates(

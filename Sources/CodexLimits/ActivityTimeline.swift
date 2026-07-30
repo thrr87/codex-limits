@@ -59,6 +59,18 @@ struct ActivityTimelineSnapshot: Equatable, Sendable {
     fileprivate let observation: LocalActivityObservation
     let interval: DateInterval
 
+    func updating(
+        interval: DateInterval,
+        observation: LocalActivityObservation
+    ) -> ActivityTimelineSnapshot {
+        ActivityTimelineSnapshot(
+            turns: turns,
+            boundaryIssues: boundaryIssues,
+            observation: observation,
+            interval: interval
+        )
+    }
+
     func slice(
         in selectedInterval: DateInterval,
         filters: WorkspaceFilters
@@ -304,27 +316,31 @@ enum ActivityTimelineAggregator {
                         start: start,
                         end: end
                     )
-                    pendingIssues.append(
-                        (
-                            turnKey,
-                            ActivityTimelineSnapshot.BoundaryIssue(
-                                date: issueDate,
-                                affectedStart: affectedBounds.start,
-                                affectedEnd: affectedBounds.end,
-                                reason: root == nil && taskID != nil
-                                    ? "Task Tree metadata is missing"
-                                    : "Some Active Turn boundaries are missing or invalid",
-                                rootTaskID: root,
-                                projectLabel: root.flatMap {
-                                    projectionsByTask[$0]?.projectLabel
-                                },
-                                context: context
-                            )
-                        )
+                    let issue = ActivityTimelineSnapshot.BoundaryIssue(
+                        date: issueDate,
+                        affectedStart: affectedBounds.start,
+                        affectedEnd: affectedBounds.end,
+                        reason: root == nil && taskID != nil
+                            ? "Task Tree metadata is missing"
+                            : "Some Active Turn boundaries are missing or invalid",
+                        rootTaskID: root,
+                        projectLabel: root.flatMap {
+                            projectionsByTask[$0]?.projectLabel
+                        },
+                        context: context
                     )
+                    if issue.affects(
+                        DateInterval(
+                            start: interval.start,
+                            end: .distantFuture
+                        )
+                    ) {
+                        pendingIssues.append((turnKey, issue))
+                    }
                 }
                 continue
             }
+            guard end > interval.start else { continue }
             turns.append(
                 ActivityTimelineSnapshot.TurnInterval(
                     start: start,

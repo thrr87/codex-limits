@@ -238,10 +238,11 @@ enum WeeklyUsageEvidenceBuilder {
         accountPartitionID: String,
         limitID: String,
         currentReset: Date,
-        compatibleTokenSources: Set<LocalTokenDefinitionSource>
+        compatibleTokenSources: Set<LocalTokenDefinitionSource>,
+        factIndex: LocalActivityFactIndex? = nil
     ) -> WeeklyUsageEvidenceSet {
         let grouped = Dictionary(grouping: samples, by: \.resetsAt)
-        let localFactIndex = LocalActivityFactIndex(localFacts)
+        let localFactIndex = factIndex ?? LocalActivityFactIndex(localFacts)
         let latestComparisonBreak = samples
             .lazy
             .filter(\.comparisonBreak)
@@ -251,6 +252,7 @@ enum WeeklyUsageEvidenceBuilder {
             buildInterval(
                 samples: samples,
                 localFactIndex: localFactIndex,
+                localFacts: localFacts,
                 localObservation: localObservation,
                 accountPartitionID: accountPartitionID,
                 limitID: limitID,
@@ -274,6 +276,7 @@ enum WeeklyUsageEvidenceBuilder {
     private static func buildInterval(
         samples: [UsageSample],
         localFactIndex: LocalActivityFactIndex,
+        localFacts: [LocalActivityFact],
         localObservation: LocalActivityObservation,
         accountPartitionID: String,
         limitID: String,
@@ -380,11 +383,15 @@ enum WeeklyUsageEvidenceBuilder {
             boundedTokenReadings,
             boundedTokenReadings.dropFirst()
         ).contains { $0.1.1 < $0.0.1 }
-        let tokenDifference = endTokens.subtractingReportingOverflow(
-            startTokens
+        let (accountTokens, tokenDifferenceOverflowed) =
+            endTokens.subtractingReportingOverflow(
+                startTokens
+            )
+        guard !tokenDifferenceOverflowed else { return nil }
+        let intervalFacts = localFactIndex.facts(
+            in: interval,
+            from: localFacts
         )
-        guard !tokenDifference.overflow else { return nil }
-        let intervalFacts = localFactIndex.facts(in: interval)
         let workload = workload(
             facts: intervalFacts,
             interval: interval
@@ -394,7 +401,6 @@ enum WeeklyUsageEvidenceBuilder {
             interval: interval,
             intervalBreakReason: workload.sourceBreakReason
         )
-        let accountTokens = tokenDifference.partialValue
         let tokenDefinitionsAlign = tokenDefinitionsAlign(
             facts: intervalFacts,
             compatibleSources: compatibleTokenSources
@@ -582,8 +588,8 @@ enum WeeklyUsageEvidenceBuilder {
                 reasoning[level] = reasoningTokens
             }
             guard let tokenDelta,
-                  tokenDelta.observedComponents.contains(.input),
-                  tokenDelta.observedComponents.contains(.cachedInput) else {
+                  tokenDelta.observes(.input),
+                  tokenDelta.observes(.cachedInput) else {
                 hasCacheEvidence = false
                 continue
             }

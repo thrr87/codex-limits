@@ -75,21 +75,52 @@ final class LocalActivityNormalizerTests: XCTestCase {
             )
         )
         XCTAssertEqual(
-            second.facts(.context).last?.value,
-            .tokens(
-                LocalTokenUsage(
-                    inputTokens: 800,
-                    cachedInputTokens: 300,
-                    cacheWriteInputTokens: 15,
-                    outputTokens: 140,
-                    reasoningOutputTokens: 60,
-                    totalTokens: 940
-                )
+            second.facts(.token).last?.contextUsage,
+            LocalTokenUsage(
+                inputTokens: 800,
+                cachedInputTokens: 300,
+                cacheWriteInputTokens: 15,
+                outputTokens: 140,
+                reasoningOutputTokens: 60,
+                totalTokens: 940
             )
         )
         XCTAssertEqual(
-            second.facts(.context).last?.context?.modelContextWindow,
+            second.facts(.token).last?.context?.modelContextWindow,
             272_000
+        )
+        XCTAssertFalse(
+            second.facts(.context).contains {
+                $0.availability == .available
+            }
+        )
+    }
+
+    func testContextSampleWithoutTokenCounterRemainsStandalone() {
+        let usage = LocalTokenUsage(
+            inputTokens: 800,
+            cachedInputTokens: 300,
+            cacheWriteInputTokens: 15,
+            outputTokens: 140,
+            reasoningOutputTokens: 60,
+            totalTokens: 940
+        )
+        let result = LocalActivityNormalizer().normalize(
+            records: [
+                record(
+                    id: "context-only",
+                    type: "event_msg",
+                    threadID: "task-root",
+                    contextTokenUsage: usage
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_200)
+        )
+
+        XCTAssertEqual(
+            result.facts(.context).last?.value,
+            .tokens(usage)
         )
     }
 
@@ -333,6 +364,93 @@ final class LocalActivityNormalizerTests: XCTestCase {
 
         XCTAssertEqual(result.fact(.time)?.availability, .partial)
         XCTAssertEqual(result.fact(.time)?.reason, "turn-start-not-observed")
+    }
+
+    func testExtremeRestoredTokenStateDoesNotOverflow() {
+        let previous = LocalActivityNormalizationState(
+            sourceGeneration: 0,
+            sourceVersion: "0.145.0",
+            historyMode: "paginated",
+            lastTotalTokens: .min,
+            tokenSegment: .max
+        )
+
+        let result = LocalActivityNormalizer().normalize(
+            records: [
+                record(
+                    id: "extreme",
+                    type: "event_msg",
+                    threadID: "task-root",
+                    tokens: .max
+                )
+            ],
+            sourceGeneration: 0,
+            observedAt: Date(timeIntervalSince1970: 1_200),
+            previousState: previous
+        )
+
+        XCTAssertNil(result.facts(.token).last?.numericDelta)
+        XCTAssertEqual(
+            result.facts(.token).last?.reason,
+            "cumulative-counter-decreased"
+        )
+        XCTAssertEqual(result.state.tokenSegment, .max)
+    }
+
+    func testChunkedNormalizationMatchesOnePassFacts() {
+        let observedAt = Date(timeIntervalSince1970: 1_200)
+        let records = [
+            record(
+                id: "session",
+                type: "session_meta",
+                threadID: "task-root"
+            ),
+            record(
+                id: "baseline",
+                type: "event_msg",
+                threadID: "task-root",
+                turnID: "turn-1",
+                model: "gpt-5.6-sol",
+                reasoning: "high",
+                tokens: 100
+            ),
+            record(
+                id: "delta",
+                type: "event_msg",
+                threadID: "task-root",
+                tokens: 600
+            )
+        ]
+        let normalizer = LocalActivityNormalizer()
+        let onePass = normalizer.normalize(
+            records: records,
+            sourceGeneration: 0,
+            observedAt: observedAt
+        )
+        let first = normalizer.normalize(
+            records: Array(records.prefix(2)),
+            sourceGeneration: 0,
+            observedAt: observedAt
+        )
+        let second = normalizer.normalize(
+            records: Array(records.dropFirst(2)),
+            sourceGeneration: 0,
+            observedAt: observedAt,
+            previousState: first.state
+        )
+        let chunkedFacts = (first.facts + second.facts).filter {
+            $0.eventID != nil
+        }
+
+        XCTAssertEqual(
+            chunkedFacts,
+            onePass.facts.filter { $0.eventID != nil }
+        )
+        XCTAssertEqual(
+            chunkedFacts.filter { $0.key == .token }
+                .compactMap(\.numericDelta),
+            [500]
+        )
     }
 
     private func record(

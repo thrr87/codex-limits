@@ -69,6 +69,26 @@ final class RolloutTailSourceTests: XCTestCase {
         )
     }
 
+    func testNegativeTokenCountersAreNotAccepted() throws {
+        let fixture = try TemporaryRollout()
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":-1}}}}"#
+                + "\n"
+                + #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-1,"total_tokens":100}}}}"#
+                + "\n"
+        )
+
+        let batch = try IncrementalRolloutTailSource().read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+
+        XCTAssertEqual(batch.records.count, 2)
+        XCTAssertTrue(batch.records.allSatisfy { $0.tokenUsage == nil })
+        XCTAssertEqual(batch.malformedRecordCount, 2)
+    }
+
     func testLegacyPersistedTokenUsageDoesNotInventComponentPresence() throws {
         let data = Data(
             #"{"inputTokens":0,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":500}"#.utf8
@@ -102,6 +122,7 @@ final class RolloutTailSourceTests: XCTestCase {
 
         XCTAssertEqual(batch.records.map(\.ordinal), [0])
         XCTAssertEqual(batch.cursor.byteOffset, UInt64(completeLine.utf8.count))
+        XCTAssertFalse(batch.hasMoreRecords)
         XCTAssertEqual(
             batch.cursor.fileSize,
             UInt64((completeLine + partialLine).utf8.count)
@@ -136,6 +157,101 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertEqual(replacementBatch.cursor.sourceGeneration, 1)
         XCTAssertEqual(replacementBatch.cursor.lastOrdinal, 0)
         XCTAssertTrue(replacementBatch.requiresRebuild)
+    }
+
+    func testReplacementRebuildsWithoutClaimingContinuityChangedWhenPrefixExceedsBudget()
+        throws
+    {
+        let original = try TemporaryRollout()
+        let padding = String(repeating: "x", count: 5_000)
+        let record =
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task","padding":"\#(padding)"}}"#
+            + "\n"
+        try original.append(record)
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: original.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let replacement = try TemporaryRollout()
+        try replacement.append(record)
+        let withoutCheckpoint = RolloutCursor(
+            fileIdentity: first.cursor.fileIdentity,
+            sourceGeneration: first.cursor.sourceGeneration,
+            byteOffset: first.cursor.byteOffset,
+            fileSize: first.cursor.fileSize,
+            modificationTime: first.cursor.modificationTime,
+            lastOrdinal: first.cursor.lastOrdinal,
+            threadID: first.cursor.threadID,
+            processedPrefixFingerprint:
+                first.cursor.processedPrefixFingerprint,
+            checkpoint: nil,
+            discardingOversizedRecord:
+                first.cursor.discardingOversizedRecord
+        )
+
+        let rebuilt = try source.read(
+            fileURL: replacement.url,
+            cursor: withoutCheckpoint,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumBytes: 1
+        )
+
+        XCTAssertTrue(rebuilt.requiresRebuild)
+        XCTAssertFalse(rebuilt.continuityChanged)
+        XCTAssertTrue(rebuilt.hasMoreRecords)
+        XCTAssertEqual(rebuilt.cursor.byteOffset, 0)
+        XCTAssertLessThanOrEqual(rebuilt.bytesRead, 1)
+
+        let completed = try source.read(
+            fileURL: replacement.url,
+            cursor: rebuilt.cursor,
+            observedAt: Date(timeIntervalSince1970: 300)
+        )
+        XCTAssertEqual(completed.records.map(\.ordinal), [0])
+    }
+
+    func testGenerationOverflowFailsWithoutTrapping() throws {
+        let original = try TemporaryRollout()
+        let record =
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task","cli_version":"0.145.0"}}"#
+            + "\n"
+        try original.append(record)
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: original.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let exhausted = RolloutCursor(
+            fileIdentity: first.cursor.fileIdentity,
+            sourceGeneration: .max,
+            byteOffset: first.cursor.byteOffset,
+            fileSize: first.cursor.fileSize,
+            modificationTime: first.cursor.modificationTime,
+            lastOrdinal: first.cursor.lastOrdinal,
+            threadID: first.cursor.threadID,
+            processedPrefixFingerprint:
+                first.cursor.processedPrefixFingerprint,
+            checkpoint: first.cursor.checkpoint,
+            discardingOversizedRecord: nil
+        )
+        let replacement = try TemporaryRollout()
+        try replacement.append(record)
+
+        XCTAssertThrowsError(
+            try source.read(
+                fileURL: replacement.url,
+                cursor: exhausted,
+                observedAt: Date(timeIntervalSince1970: 200)
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? RolloutTailSourceError,
+                .counterOverflow
+            )
+        }
     }
 
     func testTailDoesNotEmitReplayedOrdinalsFromReplacementCopy() throws {
@@ -257,6 +373,89 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertTrue(rebuilt.requiresRebuild)
         XCTAssertEqual(rebuilt.records.map(\.ordinal), [0, 1])
         XCTAssertEqual(rebuilt.records.last?.totalTokens, 200)
+    }
+
+    func testChangedMiddleRecordCannotHideBehindAnUnchangedCheckpoint() throws {
+        let firstLine =
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task-root","cli_version":"0.145.0"}}"#
+            + "\n"
+        let middle =
+            #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#
+            + "\n"
+        let last =
+            #"{"timestamp":"2026-07-27T10:02:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":300}}}}"#
+            + "\n"
+        let original = try TemporaryRollout()
+        try original.append(firstLine + middle + last)
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: original.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let replacement = try TemporaryRollout()
+        try replacement.append(
+            firstLine
+                + middle.replacingOccurrences(
+                    of: #""total_tokens":100"#,
+                    with: #""total_tokens":200"#
+                )
+                + last
+        )
+
+        let rebuilt = try source.read(
+            fileURL: replacement.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200)
+        )
+
+        XCTAssertTrue(rebuilt.requiresRebuild)
+        XCTAssertEqual(
+            rebuilt.records.compactMap(\.totalTokens),
+            [200, 300]
+        )
+    }
+
+    func testSameSizeRewriteChecksMoreThanTheLastRecord() throws {
+        let firstLine =
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"task-root","cli_version":"0.145.0"}}"#
+            + "\n"
+        let middle =
+            #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100}}}}"#
+            + "\n"
+        let last =
+            #"{"timestamp":"2026-07-27T10:02:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":300}}}}"#
+            + "\n"
+        let fixture = try TemporaryRollout()
+        let original = firstLine + middle + last
+        try fixture.append(original)
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let changed = original.replacingOccurrences(
+            of: #""total_tokens":100"#,
+            with: #""total_tokens":200"#
+        )
+        try fixture.replace(with: changed)
+        try FileManager.default.setAttributes(
+            [.modificationDate: first.cursor.modificationTime.addingTimeInterval(1)],
+            ofItemAtPath: fixture.url.path
+        )
+
+        let rebuilt = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200)
+        )
+
+        XCTAssertTrue(rebuilt.requiresRebuild)
+        XCTAssertEqual(
+            rebuilt.records.compactMap(\.totalTokens),
+            [200, 300]
+        )
     }
 
     func testChangedReplacementDoesNotReusePreviousTaskIdentity() throws {
@@ -381,7 +580,7 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertEqual(rebuilt.records.last?.totalTokens, 200)
     }
 
-    func testOversizedAcceptedRecordClearsOlderCheckpoint() throws {
+    func testLargeAcceptedRecordUsesABoundedRawCheckpoint() throws {
         let fixture = try TemporaryRollout()
         let padding = String(repeating: "x", count: 5_000)
         let session =
@@ -398,7 +597,10 @@ final class RolloutTailSourceTests: XCTestCase {
             observedAt: Date(timeIntervalSince1970: 100)
         )
 
-        XCTAssertNil(first.cursor.checkpoint)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(first.cursor.checkpoint).byteLength,
+            4_096
+        )
         let changedContext = originalContext.replacingOccurrences(
             of: #""model":"gpt-5.6""#,
             with: #""model":"gpt-5.5""#
@@ -412,6 +614,38 @@ final class RolloutTailSourceTests: XCTestCase {
 
         XCTAssertTrue(rebuilt.requiresRebuild)
         XCTAssertEqual(rebuilt.records.last?.model, "gpt-5.5")
+    }
+
+    func testAppendAfterLargeAcceptedRecordDoesNotRebuildTheFile() throws {
+        let fixture = try TemporaryRollout()
+        let padding = String(repeating: "x", count: 5_000)
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6","effort":"high","padding":"\#(padding)"}}"#
+                + "\n"
+        )
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let appended =
+            #"{"timestamp":"2026-07-27T10:02:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200}}}}"#
+            + "\n"
+        try fixture.append(appended)
+
+        let incremental = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200)
+        )
+
+        XCTAssertFalse(incremental.requiresRebuild)
+        XCTAssertEqual(incremental.records.map(\.ordinal), [2])
+        XCTAssertLessThanOrEqual(
+            incremental.bytesRead,
+            UInt64(appended.utf8.count + 4_096)
+        )
     }
 
     func testReplacementContinuesAfterLargePreOrdinalPrefixWithoutReplay() throws {
@@ -557,6 +791,27 @@ final class RolloutTailSourceTests: XCTestCase {
         XCTAssertGreaterThan(batch.cursor.byteOffset, 0)
     }
 
+    func testCompactedRecordSkipsItsUnusedLargePayload() throws {
+        let fixture = try TemporaryRollout()
+        let sourceContent = String(repeating: "x", count: 1_000_000)
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","type":"compacted","payload":{"info":"not-a-token-object","replacement_history":"\#(sourceContent)"}}"#
+                + "\n"
+        )
+
+        let batch = try IncrementalRolloutTailSource().read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let record = try XCTUnwrap(batch.records.first)
+
+        XCTAssertEqual(record.type, "compacted")
+        XCTAssertEqual(record.timestamp, "2026-07-27T10:00:00.000Z")
+        XCTAssertNil(record.tokenUsage)
+        XCTAssertEqual(batch.malformedRecordCount, 0)
+    }
+
     func testCompleteMalformedLineIsSkippedWithoutLosingValidRecords() throws {
         let fixture = try TemporaryRollout()
         try fixture.append(
@@ -567,16 +822,204 @@ final class RolloutTailSourceTests: XCTestCase {
                 + "\n"
         )
 
-        let batch = try IncrementalRolloutTailSource().read(
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
             fileURL: fixture.url,
             cursor: nil,
-            observedAt: Date(timeIntervalSince1970: 100)
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumLines: 2
+        )
+        let second = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumLines: 2
         )
 
-        XCTAssertEqual(batch.records.map(\.ordinal), [0, 1])
-        XCTAssertEqual(batch.unsupportedRecordCount, 1)
-        XCTAssertEqual(batch.records.last?.totalTokens, 100)
-        XCTAssertEqual(batch.cursor.lastOrdinal, 1)
+        XCTAssertEqual(first.records.map(\.ordinal), [0])
+        XCTAssertEqual(first.unsupportedRecordCount, 1)
+        XCTAssertTrue(first.hasMoreRecords)
+        XCTAssertEqual(second.records.map(\.ordinal), [1])
+        XCTAssertEqual(second.records.last?.totalTokens, 100)
+        XCTAssertEqual(second.cursor.lastOrdinal, 1)
+    }
+
+    func testOversizedRecordIsSkippedWithoutLosingTheNextRecord() throws {
+        let fixture = try TemporaryRollout()
+        let padding = String(
+            repeating: "x",
+            count: BoundedJSONLReader.maximumRecordBytes
+        )
+        try fixture.append(
+            #"{"timestamp":"2026-07-27T10:00:00.000Z","ordinal":1,"type":"event_msg","payload":{"type":"token_count","padding":"\#(padding)","info":{"total_token_usage":{"total_tokens":100}}}}"#
+                + "\n"
+                + #"{"timestamp":"2026-07-27T10:01:00.000Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200}}}}"#
+                + "\n"
+        )
+
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumLines: 1
+        )
+        let second = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumLines: 1
+        )
+
+        XCTAssertTrue(first.records.isEmpty)
+        XCTAssertEqual(first.malformedRecordCount, 1)
+        XCTAssertTrue(first.hasMoreRecords)
+        XCTAssertEqual(second.records.map(\.ordinal), [2])
+        XCTAssertFalse(second.hasMoreRecords)
+        XCTAssertEqual(second.cursor.byteOffset, second.cursor.fileSize)
+    }
+
+    func testOversizedUnterminatedRecordResumesWithoutRescanning() throws {
+        let fixture = try TemporaryRollout()
+        try fixture.append(String(repeating: "x", count: 100_000))
+        let source = IncrementalRolloutTailSource()
+
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumBytes: 32_768,
+            maximumRecordBytes: 16
+        )
+        var cursor = first.cursor
+        var readCount = 1
+        while cursor.byteOffset < cursor.fileSize {
+            let next = try source.read(
+                fileURL: fixture.url,
+                cursor: cursor,
+                observedAt: Date(
+                    timeIntervalSince1970: 100 + Double(readCount)
+                ),
+                maximumBytes: 32_768,
+                maximumRecordBytes: 16
+            )
+            XCTAssertLessThanOrEqual(next.bytesRead, 32_768)
+            XCTAssertGreaterThan(next.cursor.byteOffset, cursor.byteOffset)
+            cursor = next.cursor
+            readCount += 1
+            XCTAssertLessThan(readCount, 10)
+        }
+        let idle = try source.read(
+            fileURL: fixture.url,
+            cursor: cursor,
+            observedAt: Date(timeIntervalSince1970: 300),
+            maximumBytes: 32_768,
+            maximumRecordBytes: 16
+        )
+
+        XCTAssertTrue(first.hasMoreRecords)
+        XCTAssertTrue(first.cursor.discardingOversizedRecord == true)
+        XCTAssertGreaterThan(first.cursor.byteOffset, 0)
+        XCTAssertEqual(cursor.byteOffset, cursor.fileSize)
+        XCTAssertTrue(cursor.discardingOversizedRecord == true)
+        XCTAssertEqual(idle.bytesRead, 0)
+    }
+
+    func testGrowingOversizedUnterminatedRecordContinuesFromItsCursor()
+        throws
+    {
+        let fixture = try TemporaryRollout()
+        try fixture.append(String(repeating: "x", count: 40_000))
+        let source = IncrementalRolloutTailSource()
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumBytes: 16_384,
+            maximumRecordBytes: 16
+        )
+        try fixture.append(String(repeating: "x", count: 40_000))
+
+        let second = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumBytes: 16_384,
+            maximumRecordBytes: 16
+        )
+
+        XCTAssertLessThanOrEqual(second.bytesRead, 16_384)
+        XCTAssertGreaterThan(second.cursor.byteOffset, first.cursor.byteOffset)
+        XCTAssertFalse(second.requiresRebuild)
+    }
+
+    func testByteBudgetDefersAValidPartialRecordWithoutReadingPastBudget()
+        throws
+    {
+        let fixture = try TemporaryRollout()
+        let padding = String(repeating: "x", count: 100_000)
+        try fixture.append(
+            #"{"ordinal":1,"type":"session_meta","payload":{"id":"task","padding":"\#(padding)"}}"#
+                + "\n"
+        )
+        let source = IncrementalRolloutTailSource()
+
+        let batch = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumBytes: 32_768,
+            maximumRecordBytes: 1_048_576
+        )
+        let completed = try source.read(
+            fileURL: fixture.url,
+            cursor: batch.cursor,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumBytes: 200_000,
+            maximumRecordBytes: 1_048_576
+        )
+
+        XCTAssertEqual(batch.bytesRead, 32_768)
+        XCTAssertTrue(batch.hasMoreRecords)
+        XCTAssertNil(batch.cursor.discardingOversizedRecord)
+        XCTAssertEqual(batch.cursor.byteOffset, 0)
+        XCTAssertEqual(batch.malformedRecordCount, 0)
+        XCTAssertEqual(completed.records.map(\.ordinal), [1])
+    }
+
+    func testLineLimitReturnsAResumableBatch() throws {
+        let fixture = try TemporaryRollout()
+        let firstRecord =
+            #"{"ordinal":0,"type":"session_meta","payload":{"id":"task"}}"#
+            + "\n"
+        let secondRecord =
+            #"{"ordinal":1,"type":"event_msg","payload":{"type":"turn_started"}}"#
+            + "\n"
+        let thirdRecord =
+            #"{"ordinal":2,"type":"event_msg","payload":{"type":"turn_started"}}"#
+            + "\n"
+        try fixture.append(firstRecord + secondRecord + thirdRecord)
+        let source = IncrementalRolloutTailSource()
+
+        let first = try source.read(
+            fileURL: fixture.url,
+            cursor: nil,
+            observedAt: Date(timeIntervalSince1970: 100),
+            maximumLines: 2
+        )
+        let second = try source.read(
+            fileURL: fixture.url,
+            cursor: first.cursor,
+            observedAt: Date(timeIntervalSince1970: 200),
+            maximumLines: 2
+        )
+
+        XCTAssertEqual(first.records.map(\.ordinal), [0, 1])
+        XCTAssertTrue(first.hasMoreRecords)
+        XCTAssertLessThan(first.cursor.byteOffset, first.cursor.fileSize)
+        XCTAssertEqual(second.records.map(\.ordinal), [2])
+        XCTAssertFalse(second.hasMoreRecords)
+        XCTAssertEqual(second.cursor.byteOffset, second.cursor.fileSize)
     }
 
     func testPartialLineIsEmittedOnceAfterItBecomesComplete() throws {

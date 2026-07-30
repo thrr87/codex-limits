@@ -4,6 +4,166 @@ import XCTest
 
 @MainActor
 final class UsageMonitorHistoryTests: XCTestCase {
+    func testSafetyBufferPolicyNormalizesInvalidValues() {
+        XCTAssertEqual(SafetyBufferPolicy.normalized(nil), 3)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(.nan), 3)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(-.infinity), 3)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(0), 1)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(1), 1)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(10), 10)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(11), 10)
+        XCTAssertEqual(SafetyBufferPolicy.normalized(.infinity), 3)
+    }
+
+    func testMonitorRepairsInvalidStoredSafetyBuffer() throws {
+        for (raw, expected) in [(Double.nan, 3.0), (1e308, 10.0)] {
+            let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.set(raw, forKey: UsageMonitor.safetyBufferKey)
+            let monitor = UsageMonitor(
+                defaults: defaults,
+                historyDirectory: temporaryDirectory(),
+                startsAutomatically: false
+            )
+
+            XCTAssertEqual(
+                defaults.double(forKey: UsageMonitor.safetyBufferKey),
+                expected
+            )
+            monitor.updateSafetyBuffer(.infinity)
+            XCTAssertEqual(
+                defaults.double(forKey: UsageMonitor.safetyBufferKey),
+                3
+            )
+        }
+    }
+
+    func testStoredStateRestoreDropsOnlyInvalidSamples() throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let valid = UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_000),
+            remainingPercent: 80,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+        let invalid = UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_001),
+            remainingPercent: -1,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        )
+        defaults.set(
+            try JSONEncoder().encode(
+                StoredStateFixture(
+                    snapshot: nil,
+                    samples: [valid, invalid],
+                    previousStatus: nil
+                )
+            ),
+            forKey: "usageState"
+        )
+
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false
+        )
+
+        XCTAssertEqual(monitor.samples, [valid])
+    }
+
+    func testStoredAccountEvaluationDoesNotBlockMainActor() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fetchedAt = Date(timeIntervalSince1970: 1_900_000)
+        defaults.set(
+            try JSONEncoder().encode(
+                StoredStateFixture(
+                    snapshot: UsageSnapshot(
+                        mainLimit: LimitReading(
+                            limitId: "codex",
+                            name: "Codex",
+                            window: UsageWindow(
+                                remainingPercent: 64,
+                                resetsAt: fetchedAt.addingTimeInterval(86_400),
+                                durationMinutes: 10_080
+                            )
+                        ),
+                        otherLimits: [],
+                        tokenHistory: [],
+                        emergencyResetCount: 0,
+                        fetchedAt: fetchedAt
+                    ),
+                    samples: [],
+                    previousStatus: nil
+                )
+            ),
+            forKey: "usageState"
+        )
+        let evaluationStarted = expectation(
+            description: "stored account evaluation started"
+        )
+        let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            evaluateUsage: { evaluator.evaluate($0) }
+        )
+
+        await fulfillment(of: [evaluationStarted], timeout: 2)
+        let mainActorResponded = expectation(
+            description: "main actor stayed responsive"
+        )
+        Task { @MainActor in
+            mainActorResponded.fulfill()
+        }
+        await fulfillment(of: [mainActorResponded], timeout: 2)
+        evaluator.release()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while monitor.readerSnapshot.menuBarText != "64%",
+              ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "64%")
+    }
+
+    func testStoredStateRestoreDropsSnapshotWithAnUnboundedDate() throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fetchedAt = Date(
+            timeIntervalSinceReferenceDate: -Double.greatestFiniteMagnitude
+        )
+        defaults.set(
+            try JSONEncoder().encode(
+                StoredStateFixture(
+                    snapshot: UsageSnapshot(
+                        mainLimit: nil,
+                        otherLimits: [],
+                        tokenHistory: [],
+                        emergencyResetCount: 0,
+                        fetchedAt: fetchedAt
+                    ),
+                    samples: [],
+                    previousStatus: nil
+                )
+            ),
+            forKey: "usageState"
+        )
+
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false
+        )
+
+        XCTAssertNil(monitor.readerSnapshot.account)
+    }
+
     func testDeleteAnalyticsHistoryPreservesPreferencesAndDoesNotRestoreLegacySamples() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -427,6 +587,139 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
+    func testTokenActivityRefreshesOnlyWhenAccountDataIsStale() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fetchedAt = Date(timeIntervalSince1970: 1_700_000)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt.addingTimeInterval(600),
+                remaining: 89
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.refresh()
+        await monitor.refreshAccountIfStale(
+            now: fetchedAt.addingTimeInterval(599)
+        )
+        var callCount = await source.callCount
+        XCTAssertEqual(callCount, 1)
+
+        await monitor.refreshAccountIfStale(
+            now: fetchedAt.addingTimeInterval(600)
+        )
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 2)
+    }
+
+    func testBlockedEvaluationDoesNotFreezeMainActorOrPublishAStaleSnapshot() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let evaluationStarted = expectation(
+            description: "first account evaluation started"
+        )
+        let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 80
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() },
+            evaluateUsage: { evaluator.evaluate($0) }
+        )
+
+        let refresh = Task { await monitor.refresh() }
+        await fulfillment(of: [evaluationStarted], timeout: 2)
+
+        let mainActorResponded = expectation(
+            description: "main actor stayed responsive"
+        )
+        Task { @MainActor in
+            mainActorResponded.fulfill()
+        }
+        await fulfillment(of: [mainActorResponded], timeout: 2)
+        monitor.updateSafetyBuffer(7)
+
+        evaluator.release()
+        await refresh.value
+        let deadline = ContinuousClock.now + .seconds(2)
+        while monitor.readerSnapshot.chart.target.last?.remaining != 7,
+              ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            monitor.readerSnapshot.chart.target.last?.remaining,
+            7
+        )
+    }
+
+    func testPreferenceChangeSupersedesAPendingEvaluation() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let evaluationStarted = expectation(
+            description: "account evaluation started"
+        )
+        let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 80
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() },
+            evaluateUsage: { evaluator.evaluate($0) }
+        )
+        let refresh = Task { await monitor.refresh() }
+        await fulfillment(of: [evaluationStarted], timeout: 2)
+        var exploration = AnalyticsExplorationState.initial
+        exploration.section = .insights
+        exploration.timeRange = .threeDays
+
+        monitor.analyticsPreferencesDidChange(
+            exploration: exploration,
+            dispositions: [:]
+        )
+        evaluator.release()
+        await refresh.value
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (
+            evaluator.callCount < 2
+                || monitor.readerSnapshot.menuBarText != "80%"
+        ), ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(evaluator.lastExploration, exploration)
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "80%")
+    }
+
     func testFailedRefreshRetainsTheLastReaderSnapshot() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -547,6 +840,10 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
         await firstMonitor.refresh()
         await firstMonitor.refresh()
+        XCTAssertNil(firstMonitor.readerSnapshot.localTokenActivity.tokens)
+
+        await firstMonitor.setLocalAnalyticsVisible(true)
+
         XCTAssertEqual(
             firstMonitor.readerSnapshot.localTokenActivity.tokens,
             400
@@ -563,6 +860,9 @@ final class UsageMonitorHistoryTests: XCTestCase {
             fetchUsage: { throw CodexClientError.invalidResponse }
         )
         await restarted.refresh()
+        XCTAssertNil(restarted.readerSnapshot.localTokenActivity.tokens)
+
+        await restarted.setLocalAnalyticsVisible(true)
 
         XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.tokens, 400)
         XCTAssertEqual(restarted.readerSnapshot.localTokenActivity.coverage, .low)
@@ -570,6 +870,225 @@ final class UsageMonitorHistoryTests: XCTestCase {
             restarted.readerSnapshot.localTokenActivity.reason,
             "Codex account identity could not be checked"
         )
+    }
+
+    func testLocalCollectorReadsOnlyForVisibleAnalyticsAndManualRefresh()
+        async throws
+    {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let localRoot = root.appendingPathComponent(
+            "rollouts",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: localRoot,
+            withIntermediateDirectories: true
+        )
+        let requests = RequestCounter()
+        let fetches = DelayedFetchSource(
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_700_000),
+                remaining: 90
+            )
+        )
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: LocalActivityCollector(
+                rootDirectory: localRoot,
+                stateDirectory: root.appendingPathComponent("local-state"),
+                projectionSource: ReadOnlyThreadProjectionSource { _ in
+                    await requests.record()
+                    return Data(
+                        #"{"result":{"data":[],"nextCursor":null}}"#.utf8
+                    )
+                }
+            ),
+            fetchUsage: { try await fetches.next() }
+        )
+
+        await monitor.start()
+        var requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        await monitor.refresh()
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        for graph in AnalyticsGraph.coreCases {
+            var state = AnalyticsExplorationState.initial
+            state.graph = graph
+            await monitor.setLocalAnalyticsVisible(
+                state.usesLocalAnalytics
+            )
+        }
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        let automatic = Task { @MainActor in
+            await monitor.automaticRefresh()
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        await monitor.setLocalAnalyticsVisible(true)
+        await automatic.value
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 1)
+        await monitor.setLocalAnalyticsVisible(true)
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 1)
+
+        await monitor.automaticRefresh()
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 1)
+        await monitor.refresh()
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 2)
+
+        await monitor.setLocalAnalyticsVisible(false)
+        await monitor.refresh()
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testHidingAnalyticsDiscardsAnInFlightLocalRead() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let localRoot = root.appendingPathComponent(
+            "rollouts",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: localRoot,
+            withIntermediateDirectories: true
+        )
+        let gate = ProjectionGate()
+        let fetchResult = makeFetchResult(
+            identity: "user@example.com",
+            fetchedAt: Date(timeIntervalSince1970: 1_700_000),
+            remaining: 90
+        )
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: LocalActivityCollector(
+                rootDirectory: localRoot,
+                stateDirectory: root.appendingPathComponent("local-state"),
+                projectionSource: ReadOnlyThreadProjectionSource { _ in
+                    await gate.response()
+                }
+            ),
+            fetchUsage: { fetchResult }
+        )
+        await monitor.refresh()
+
+        let load = Task { @MainActor in
+            await monitor.setLocalAnalyticsVisible(true)
+        }
+        await gate.waitUntilStarted()
+        let hide = Task { @MainActor in
+            await monitor.setLocalAnalyticsVisible(false)
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        await gate.release()
+        await load.value
+        await hide.value
+
+        XCTAssertNil(monitor.readerSnapshot.localTokenActivity.tokens)
+    }
+
+    func testMonitorFinishesABoundedLocalImportAcrossAutomaticRefresh()
+        async throws
+    {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let rolloutDirectory = root.appendingPathComponent(
+            "rollouts/1970/01/22",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: rolloutDirectory,
+            withIntermediateDirectories: true
+        )
+        let fetchedAt = Date(timeIntervalSince1970: 1_850_000)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds
+        ]
+        let eventTimestamp = formatter.string(
+            from: fetchedAt.addingTimeInterval(-1)
+        )
+        var rollout =
+            #"{"timestamp":"\#(eventTimestamp)","ordinal":0,"type":"session_meta","payload":{"id":"task","cli_version":"0.145.0"}}"#
+            + "\n"
+        for ordinal in 1 ... 10_100 {
+            rollout +=
+                #"{"timestamp":"\#(eventTimestamp)","ordinal":\#(ordinal),"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":\#(ordinal * 100)}}}}"#
+                + "\n"
+        }
+        let rolloutURL = rolloutDirectory.appendingPathComponent(
+            "rollout-test.jsonl"
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: root.appendingPathComponent("rollouts"),
+            stateDirectory: root.appendingPathComponent("collector-state")
+        )
+        let fetches = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_700_000),
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 80
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt.addingTimeInterval(60),
+                remaining: 79
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root.appendingPathComponent("history"),
+            startsAutomatically: false,
+            localActivityCollector: collector,
+            fetchUsage: { try await fetches.next() }
+        )
+
+        await monitor.setLocalAnalyticsVisible(true)
+        await monitor.refresh()
+        try Data(rollout.utf8).write(to: rolloutURL)
+        await monitor.refresh()
+        await monitor.automaticRefresh()
+        for _ in 0 ..< 100 {
+            if await collector.hasPendingImport() == false,
+               monitor.readerSnapshot.localTokenActivity.tokens == 1_009_900 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        let pendingAfterContinuation = await collector.hasPendingImport()
+        XCTAssertFalse(pendingAfterContinuation)
+        XCTAssertEqual(
+            monitor.readerSnapshot.localTokenActivity.tokens,
+            1_009_900
+        )
+        let accountReadCount = await fetches.callCount
+        XCTAssertEqual(accountReadCount, 3)
     }
 
     func testMissingWeeklyRefreshClearsWeeklyOutputsAndKeepsOtherLimits() async throws {
@@ -973,6 +1492,71 @@ final class UsageMonitorHistoryTests: XCTestCase {
         await restarted.refresh()
 
         XCTAssertEqual(restarted.samples.map(\.remainingPercent), [79, 78])
+    }
+
+    func testManualRefreshRunsSyncInsideTheAutomaticThrottleWindow()
+        async throws
+    {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let local = root.appendingPathComponent("local", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shared,
+            withIntermediateDirectories: true
+        )
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 80
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_060),
+                remaining: 79
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: local,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+        await monitor.connectHistoryFolder(shared)
+        XCTAssertNil(monitor.syncErrorMessage, monitor.syncErrorMessage ?? "")
+        XCTAssertEqual(monitor.syncFolderName, "shared")
+        let partition = try JSONDecoder().decode(
+            AccountHistoryPartition.self,
+            from: XCTUnwrap(defaults.data(forKey: "historyAccountPartition"))
+        )
+        let remoteWriter = UsageHistory(
+            localDirectory: root.appendingPathComponent(
+                "remote",
+                isDirectory: true
+            ),
+            installationID: "remote",
+            partition: partition
+        )
+        _ = await remoteWriter.load()
+        let connected = await remoteWriter.connect(
+            to: shared,
+            accountIdentity: "user@example.com"
+        )
+        XCTAssertNil(connected.errorMessage, connected.errorMessage ?? "")
+        XCTAssertEqual(connected.folderName, "shared")
+        let recorded = await remoteWriter.record(UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_900_030),
+            remainingPercent: 78,
+            resetsAt: Date(timeIntervalSince1970: 2_000_000)
+        ))
+        XCTAssertEqual(recorded.samples.map(\.remainingPercent), [78])
+
+        await monitor.refresh()
+
+        XCTAssertEqual(monitor.samples.map(\.remainingPercent), [78, 79])
     }
 
     func testLegacySamplesMigrateAfterTheAccountIsObserved() async throws {
@@ -1444,16 +2028,57 @@ final class UsageMonitorHistoryTests: XCTestCase {
 
 private actor FetchSequence {
     private var results: [CodexFetchResult]
+    private var calls = 0
 
     init(_ results: [CodexFetchResult]) {
         self.results = results
     }
 
     func next() throws -> CodexFetchResult {
+        calls += 1
         guard !results.isEmpty else {
             throw CodexClientError.invalidResponse
         }
         return results.removeFirst()
+    }
+
+    var callCount: Int { calls }
+}
+
+private actor RequestCounter {
+    private var requests = 0
+
+    func record() {
+        requests += 1
+    }
+
+    var count: Int { requests }
+}
+
+private actor ProjectionGate {
+    private var started = false
+    private var continuation: CheckedContinuation<Data, Never>?
+
+    func response() async -> Data {
+        started = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func waitUntilStarted() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        continuation?.resume(
+            returning: Data(
+                #"{"result":{"data":[],"nextCursor":null}}"#.utf8
+            )
+        )
+        continuation = nil
     }
 }
 
@@ -1471,6 +2096,53 @@ private actor DelayedFetchSource {
         calls += 1
         try await Task.sleep(nanoseconds: 50_000_000)
         return result
+    }
+}
+
+private final class BlockingUsageEvaluator: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let started: XCTestExpectation
+    private var blockedFirstAccountEvaluation = false
+    private var inputs: [UsageIntelligenceInput] = []
+
+    init(started: XCTestExpectation) {
+        self.started = started
+    }
+
+    func evaluate(
+        _ input: UsageIntelligenceInput
+    ) -> UsageReaderSnapshot {
+        lock.lock()
+        inputs.append(input)
+        let shouldBlock = input.account != nil
+            && !blockedFirstAccountEvaluation
+        if shouldBlock {
+            blockedFirstAccountEvaluation = true
+        }
+        lock.unlock()
+
+        if shouldBlock {
+            started.fulfill()
+            gate.wait()
+        }
+        return UsageIntelligenceEngine.evaluate(input)
+    }
+
+    func release() {
+        gate.signal()
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputs.count
+    }
+
+    var lastExploration: AnalyticsExplorationState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputs.last?.analyticsExploration
     }
 }
 

@@ -75,7 +75,16 @@ struct MenuContentView: View {
                 .padding(.vertical, 12)
         }
         .frame(width: layout.width, height: layout.height)
-        .task { await monitor.refresh() }
+        .task(id: workspace.state) {
+            let state = workspace.state
+            await monitor.setLocalAnalyticsVisible(
+                state.usesLocalAnalytics
+            )
+            if state.section == .graphs,
+               state.graph == .tokenActivity {
+                await monitor.refreshAccountIfStale()
+            }
+        }
         .environment(\.locale, Locale(identifier: "en_US"))
     }
 
@@ -486,7 +495,7 @@ private struct GraphsWorkspace: View {
                 set: store.selectGraph
             )
         ) {
-            ForEach(AnalyticsGraph.allCases) { graph in
+            ForEach(AnalyticsGraph.coreCases) { graph in
                 Text(graph.rawValue).tag(graph)
             }
         }
@@ -518,9 +527,7 @@ private struct GraphsWorkspace: View {
             Label("Account", systemImage: "person.crop.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help(
-                    "Project, Task Tree, model, and reasoning filters do not change \(store.state.graph.rawValue)."
-                )
+                .help("Data from your Codex account.")
                 .accessibilityLabel("Account scope")
         } else {
             WorkspaceFilterMenu(reader: reader, store: store)
@@ -1173,6 +1180,10 @@ private struct ConcurrencyWorkspace: View {
     }
 
     var body: some View {
+        content(slice)
+    }
+
+    private func content(_ slice: ActivityTimelineSlice) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Concurrency")
@@ -1211,8 +1222,8 @@ private struct ConcurrencyWorkspace: View {
                 }
                 .frame(minHeight: 190)
             } else {
-                chart
-                selectedPointDetail
+                chart(slice)
+                selectedPointDetail(slice)
                 zoomControls
             }
 
@@ -1260,7 +1271,7 @@ private struct ConcurrencyWorkspace: View {
         .foregroundStyle(.tertiary)
     }
 
-    private var chart: some View {
+    private func chart(_ slice: ActivityTimelineSlice) -> some View {
         Chart {
             ForEach(slice.points) { point in
                 LineMark(
@@ -1309,7 +1320,8 @@ private struct ConcurrencyWorkspace: View {
                             selectNearestPoint(
                                 at: location,
                                 proxy: proxy,
-                                geometry: geometry
+                                geometry: geometry,
+                                points: slice.points
                             )
                         case .ended:
                             selectedPoint = nil
@@ -1320,15 +1332,15 @@ private struct ConcurrencyWorkspace: View {
         .frame(height: 260)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Concurrency")
-        .accessibilityValue(accessibilityValue)
+        .accessibilityValue(accessibilityValue(slice))
         .accessibilityHint(
             "Use Previous point and Next point for exact values."
         )
     }
 
-    private var accessibilityValue: String {
+    private func accessibilityValue(_ slice: ActivityTimelineSlice) -> String {
         if let selectedPoint {
-            return pointSummary(selectedPoint)
+            return pointSummary(selectedPoint, coverage: slice.coverage)
         }
         let trees = slice.maximumConcurrency == 1
             ? "Active Task Tree"
@@ -1336,7 +1348,9 @@ private struct ConcurrencyWorkspace: View {
         return "\(duration(slice.activeTime)) Active Time, peak \(slice.maximumConcurrency) \(trees), \(slice.coverage.displayName) coverage"
     }
 
-    private var selectedPointDetail: some View {
+    private func selectedPointDetail(
+        _ slice: ActivityTimelineSlice
+    ) -> some View {
         HStack(spacing: 10) {
             if let selectedPoint {
                 let taskTrees = taskTreeLabels(selectedPoint)
@@ -1371,13 +1385,13 @@ private struct ConcurrencyWorkspace: View {
             }
             Spacer()
             Button {
-                moveSelection(by: -1)
+                moveSelection(in: slice.points, by: -1)
             } label: {
                 Image(systemName: "chevron.left")
             }
             .accessibilityLabel("Previous point")
             Button {
-                moveSelection(by: 1)
+                moveSelection(in: slice.points, by: 1)
             } label: {
                 Image(systemName: "chevron.right")
             }
@@ -1433,18 +1447,24 @@ private struct ConcurrencyWorkspace: View {
         }
     }
 
-    private func pointSummary(_ point: ConcurrencyPoint) -> String {
+    private func pointSummary(
+        _ point: ConcurrencyPoint,
+        coverage: CoverageLevel
+    ) -> String {
         let trees = taskTreeLabels(point).joined(separator: ", ")
         let countLabel = point.count == 1
             ? "Active Task Tree"
             : "Active Task Trees"
         let treeDetail = trees.isEmpty ? "No Active Task Trees" : trees
-        return "\(point.count) \(countLabel) at \(point.date.formatted(date: .abbreviated, time: .shortened)). \(treeDetail). Codex local records. \(slice.coverage.displayName) coverage."
+        return "\(point.count) \(countLabel) at \(point.date.formatted(date: .abbreviated, time: .shortened)). \(treeDetail). Codex local records. \(coverage.displayName) coverage."
     }
 
-    private func moveSelection(by offset: Int) {
+    private func moveSelection(
+        in points: [ConcurrencyPoint],
+        by offset: Int
+    ) {
         selectedPoint = steppedPoint(
-            in: slice.points,
+            in: points,
             from: selectedPoint,
             by: offset
         )
@@ -1453,7 +1473,8 @@ private struct ConcurrencyWorkspace: View {
     private func selectNearestPoint(
         at location: CGPoint,
         proxy: ChartProxy,
-        geometry: GeometryProxy
+        geometry: GeometryProxy,
+        points: [ConcurrencyPoint]
     ) {
         guard let date = chartDate(
             at: location,
@@ -1461,7 +1482,7 @@ private struct ConcurrencyWorkspace: View {
             geometry: geometry
         ) else { return }
         selectedPoint = nearestPoint(
-            in: slice.points,
+            in: points,
             to: date,
             date: \.date
         )
@@ -1497,68 +1518,72 @@ private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
 
-    @State private var selectedPoint: LocalTokenActivityPoint?
+    @State private var selectedDay: TokenDay?
+    private let day: TimeInterval = 86_400
+
+    private var accountDays: [TokenDay] {
+        (reader.account?.tokenHistory ?? []).sorted { $0.date < $1.date }
+    }
+
+    private var currentWindowBounds: DateInterval? {
+        reader.weeklyUsageRemaining.map {
+            DateInterval(
+                start: $0.window.startsAt,
+                end: $0.window.resetsAt
+            )
+        }
+    }
 
     private var bounds: DateInterval {
-        reader.localTokenActivity.interval
+        let fallback = reader.fetchedAt ?? Date()
+        let first = accountDays.first?.date
+            ?? currentWindowBounds?.start
+            ?? fallback.addingTimeInterval(-day)
+        let last = accountDays.last?.date.addingTimeInterval(day)
+            ?? currentWindowBounds?.end
+            ?? fallback
+        return DateInterval(
+            start: min(first, currentWindowBounds?.start ?? first),
+            end: max(last, currentWindowBounds?.end ?? last)
+        )
     }
 
     private var visibleRange: DateInterval {
-        store.effectiveRange(
+        if store.state.timeRange == .currentWindow,
+           let currentWindowBounds {
+            return currentWindowBounds
+        }
+        return store.effectiveRange(
             within: bounds,
             endingAt: min(
-                reader.localTokenActivity.observedAt ?? bounds.end,
+                reader.fetchedAt ?? bounds.end,
                 bounds.end
             )
         )
     }
 
-    private var localSlice: LocalTokenActivitySlice {
-        guard !store.state.filters.isEmpty else {
-            return reader.localTokenActivity.slice(in: visibleRange)
-        }
-        let receipts = reader.usageReceipts.slice(
-            in: visibleRange,
-            filters: store.state.filters
+    private var accountRange: AccountTokenActivityRange {
+        AccountTokenActivityRange(
+            days: accountDays,
+            interval: visibleRange
         )
-        return LocalTokenActivitySlice(
-            tokens: receipts.totalTokens,
-            points: receipts.points,
-            coverage: receipts.coverage,
-            reason: receipts.reason
-        )
-    }
-
-    private var accountCoversVisibleRange: Bool {
-        guard let interval = reader.accountTokenActivity.interval else {
-            return false
-        }
-        return abs(interval.start.timeIntervalSince(visibleRange.start)) < 1
-            && abs(interval.end.timeIntervalSince(visibleRange.end)) < 1
     }
 
     var body: some View {
+        content(accountRange)
+    }
+
+    private func content(_ range: AccountTokenActivityRange) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Token activity")
                     .font(.title3.weight(.semibold))
-                Text(
-                    "Account and local token counts may differ, so we show them separately."
-                )
+                Text("Daily token totals from your Codex account.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
 
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 12) {
-                    accountCard
-                    localCard
-                }
-                VStack(spacing: 12) {
-                    accountCard
-                    localCard
-                }
-            }
+            accountCard(range)
 
             VStack(alignment: .leading, spacing: 10) {
                 ViewThatFits(in: .horizontal) {
@@ -1573,33 +1598,35 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
-                if localSlice.points.isEmpty {
+                if range.days.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
-                        title: "No local token activity",
-                        message: localEmptyMessage
+                        title: "No account token activity",
+                        message: "Codex did not return daily totals for this range."
                     ) {
                         EmptyView()
                     }
                     .frame(minHeight: 170)
                 } else {
-                    localChart
+                    accountChart(range)
                 }
 
-                selectedPointDetail
+                selectedPointDetail(range)
             }
         }
         .onChange(of: visibleRange) { _, range in
-            if let selectedPoint, !range.contains(selectedPoint.date) {
-                self.selectedPoint = nil
+            if let selectedDay,
+               selectedDay.date >= range.end
+                || selectedDay.date.addingTimeInterval(day) <= range.start {
+                self.selectedDay = nil
             }
         }
     }
 
     private var chartSourceLabel: some View {
         ChartLegendItem(
-            label: "Local Codex records",
-            color: .purple
+            label: "Daily totals · Account",
+            color: .blue
         )
     }
 
@@ -1609,40 +1636,22 @@ private struct TokenActivityWorkspace: View {
             .foregroundStyle(.tertiary)
     }
 
-    private var accountCard: some View {
+    private func accountCard(
+        _ range: AccountTokenActivityRange
+    ) -> some View {
         TokenSourceCard(
             title: "Account",
-            source: accountSource,
-            value: accountValue,
-            detail: accountDetail,
-            coverage: accountCoverage,
-            freshness: reader.accountTokenActivity.interval?.end,
-            freshnessLabel: "Through",
+            source: store.state.timeRange == .currentWindow
+                ? accountSource
+                : "Codex daily token totals",
+            value: summaryTokens(in: range).map(compactTokenCount)
+                ?? "Not available",
+            detail: summaryDetail(in: range),
+            coverage: summaryCoverage(in: range),
+            freshness: reader.fetchedAt,
+            freshnessLabel: "Updated",
             color: .blue
         )
-    }
-
-    private var localCard: some View {
-        TokenSourceCard(
-            title: "Local",
-            source: "Local Codex records",
-            value: reader.localTokenActivity.tokens == nil
-                ? "Not available"
-                : compactTokenCount(localSlice.tokens),
-            detail: localDetail,
-            coverage: coverageName(localSlice.coverage),
-            freshness: reader.localTokenActivity.observedAt,
-            freshnessLabel: "Updated",
-            color: .purple
-        )
-    }
-
-    private var accountValue: String {
-        guard accountCoversVisibleRange,
-              let tokens = reader.accountTokenActivity.tokens else {
-            return "Not available"
-        }
-        return compactTokenCount(tokens)
     }
 
     private var accountSource: String {
@@ -1656,13 +1665,25 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var accountDetail: String {
-        guard accountCoversVisibleRange else {
-            if reader.accountTokenActivity.tokens != nil {
-                return "No account total for this selected range"
+    private func summaryTokens(
+        in range: AccountTokenActivityRange
+    ) -> Int64? {
+        if store.state.timeRange == .currentWindow {
+            return reader.accountTokenActivity.tokens
+        }
+        return range.completeTokens
+    }
+
+    private func summaryDetail(
+        in range: AccountTokenActivityRange
+    ) -> String {
+        guard store.state.timeRange == .currentWindow else {
+            if range.completeDayCount == 0 {
+                return "No full days in this range"
             }
-            return reader.accountTokenActivity.reason
-                ?? "Account token activity is unavailable"
+            return range.completeTokens == nil
+                ? "Codex returned only part of this range"
+                : "Sum of \(range.completeDayCount) complete days"
         }
         switch reader.accountTokenActivity.method {
         case .lifetimeDelta:
@@ -1677,8 +1698,14 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var accountCoverage: String {
-        guard accountCoversVisibleRange else { return "Unavailable" }
+    private func summaryCoverage(
+        in range: AccountTokenActivityRange
+    ) -> String {
+        guard store.state.timeRange == .currentWindow else {
+            return range.completeTokens == nil
+                ? "Unavailable"
+                : "Complete days"
+        }
         switch reader.accountTokenActivity.state {
         case .exact: return "Complete"
         case .partial: return "Partial"
@@ -1686,54 +1713,33 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var localDetail: String {
-        var details: [String] = []
-        if let version = reader.localTokenActivity.sourceVersion {
-            details.append("Codex \(version)")
-        }
-        if let reason = localSlice.reason {
-            details.append(readerFacingLocalReason(reason))
-        }
-        return details.isEmpty
-            ? "Local Codex records are unavailable"
-            : details.joined(separator: " · ")
+    private func renderedDays(
+        _ range: AccountTokenActivityRange
+    ) -> [TokenDay] {
+        downsampledForDisplay(range.days)
     }
 
-    private var localEmptyMessage: String {
-        localSlice.reason.map(readerFacingLocalReason)
-            ?? "No local token events were found in this range."
-    }
-
-    private var chartPoints: [LocalTokenActivityPoint] {
-        if localSlice.points.first?.date == visibleRange.start {
-            return localSlice.points
-        }
-        return [LocalTokenActivityPoint(date: visibleRange.start, tokens: 0)]
-            + localSlice.points
-    }
-
-    private var localChart: some View {
+    private func accountChart(
+        _ range: AccountTokenActivityRange
+    ) -> some View {
         Chart {
-            ForEach(chartPoints) { point in
-                LineMark(
-                    x: .value("Time", point.date),
-                    y: .value("Local tokens", point.tokens),
-                    series: .value("Source", "Local Codex records")
+            ForEach(renderedDays(range), id: \.date) { tokenDay in
+                BarMark(
+                    x: .value("Day", tokenDay.date, unit: .day),
+                    y: .value("Account tokens", tokenDay.tokens)
                 )
-                .foregroundStyle(Color.purple)
-                .lineStyle(StrokeStyle(lineWidth: 2))
-                .interpolationMethod(.stepEnd)
+                .foregroundStyle(Color.blue)
             }
 
-            if let selectedPoint {
-                RuleMark(x: .value("Selected time", selectedPoint.date))
+            if let selectedDay {
+                RuleMark(x: .value("Selected time", selectedDay.date))
                     .foregroundStyle(Color.primary.opacity(0.45))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
                 PointMark(
-                    x: .value("Selected time", selectedPoint.date),
-                    y: .value("Local tokens", selectedPoint.tokens)
+                    x: .value("Selected day", selectedDay.date),
+                    y: .value("Account tokens", selectedDay.tokens)
                 )
-                .foregroundStyle(Color.purple)
+                .foregroundStyle(Color.blue)
                 .symbolSize(52)
             }
         }
@@ -1761,21 +1767,22 @@ private struct TokenActivityWorkspace: View {
                             selectNearestPoint(
                                 at: location,
                                 proxy: proxy,
-                                geometry: geometry
+                                geometry: geometry,
+                                days: range.days
                             )
                         case .ended:
-                            selectedPoint = nil
+                            selectedDay = nil
                         }
                     }
             }
         }
-        .frame(height: 220)
+        .frame(height: 180)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Local token activity")
+        .accessibilityLabel("Account token activity")
         .accessibilityValue(
-            selectedPoint.map {
-                "\(compactTokenCount($0.tokens)) local tokens, \($0.date.formatted(date: .abbreviated, time: .shortened))"
-            } ?? "\(compactTokenCount(localSlice.tokens)) local tokens in the selected range"
+            selectedDay.map {
+                "\(compactTokenCount($0.tokens)) account tokens, \($0.date.formatted(date: .abbreviated, time: .omitted))"
+            } ?? "Daily account token totals are shown."
         )
         .accessibilityHint(
             "Use Previous point and Next point for exact values."
@@ -1783,35 +1790,37 @@ private struct TokenActivityWorkspace: View {
     }
 
     @ViewBuilder
-    private var selectedPointDetail: some View {
+    private func selectedPointDetail(
+        _ range: AccountTokenActivityRange
+    ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 10) {
-                if let selectedPoint {
+                if let selectedDay {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 10) {
-                            Text("Local Codex records")
+                            Text("Daily account total")
                                 .fontWeight(.semibold)
-                            Text(compactTokenCount(selectedPoint.tokens))
+                            Text(compactTokenCount(selectedDay.tokens))
                                 .monospacedDigit()
                             Text(
-                                selectedPoint.date.formatted(
+                                selectedDay.date.formatted(
                                     date: .abbreviated,
-                                    time: .shortened
+                                    time: .omitted
                                 )
                             )
                             .foregroundStyle(.secondary)
                         }
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(spacing: 8) {
-                                Text("Local Codex records")
+                                Text("Daily account total")
                                     .fontWeight(.semibold)
-                                Text(compactTokenCount(selectedPoint.tokens))
+                                Text(compactTokenCount(selectedDay.tokens))
                                     .monospacedDigit()
                             }
                             Text(
-                                selectedPoint.date.formatted(
+                                selectedDay.date.formatted(
                                     date: .abbreviated,
-                                    time: .shortened
+                                    time: .omitted
                                 )
                             )
                             .foregroundStyle(.secondary)
@@ -1823,27 +1832,17 @@ private struct TokenActivityWorkspace: View {
                 }
                 Spacer()
                 Button {
-                    moveSelection(by: -1)
+                    moveSelection(in: range.days, by: -1)
                 } label: {
                     Image(systemName: "chevron.left")
                 }
                 .accessibilityLabel("Previous point")
                 Button {
-                    moveSelection(by: 1)
+                    moveSelection(in: range.days, by: 1)
                 } label: {
                     Image(systemName: "chevron.right")
                 }
                 .accessibilityLabel("Next point")
-            }
-            if selectedPoint != nil {
-                HStack(spacing: 10) {
-                    Text("Account · \(accountSource)")
-                        .fontWeight(.semibold)
-                    Text(accountValue)
-                        .monospacedDigit()
-                    Text("selected range")
-                        .foregroundStyle(.secondary)
-                }
             }
         }
         .font(.caption)
@@ -1855,69 +1854,33 @@ private struct TokenActivityWorkspace: View {
         )
     }
 
-    private func moveSelection(by offset: Int) {
-        selectedPoint = steppedPoint(
-            in: localSlice.points,
-            from: selectedPoint,
+    private func moveSelection(
+        in days: [TokenDay],
+        by offset: Int
+    ) {
+        selectedDay = steppedPoint(
+            in: days,
+            from: selectedDay,
             by: offset
         )
-    }
-
-    private func readerFacingLocalReason(_ reason: String) -> String {
-        switch reason {
-        case "Local token activity starts from an unbounded counter":
-            "The first local reading has no earlier reading"
-        case "Local rollout path is unavailable",
-             "Local task records are missing":
-            "Some local Codex records could not be found"
-        case "Local task discovery is incomplete",
-             "Local task metadata is incomplete",
-             "Local task identity is missing":
-            "Some local tasks could not be checked"
-        case "This Codex CLI version has not been checked":
-            "This Codex version has not been checked"
-        case "Installed Codex CLI version is unavailable",
-             "Codex CLI version is unavailable":
-            "The installed Codex version could not be checked"
-        case "Only local activity on this Mac is observed":
-            "Only activity on this Mac is included"
-        case "Saved local activity could not be read":
-            "Saved local activity could not be read"
-        case "Local activity could not be saved":
-            "Local activity could not be saved"
-        case "Local task record continuity changed":
-            "A local task record changed"
-        default:
-            reason
-        }
     }
 
     private func selectNearestPoint(
         at location: CGPoint,
         proxy: ChartProxy,
-        geometry: GeometryProxy
+        geometry: GeometryProxy,
+        days: [TokenDay]
     ) {
         guard let date = chartDate(
             at: location,
             proxy: proxy,
             geometry: geometry
         ) else { return }
-        selectedPoint = nearestPoint(
-            in: localSlice.points,
+        selectedDay = nearestPoint(
+            in: days,
             to: date,
             date: \.date
         )
-    }
-
-    private func coverageName(_ coverage: CoverageLevel) -> String {
-        switch coverage {
-        case .complete: "Complete"
-        case .high: "High"
-        case .partial: "Partial"
-        case .low: "Low"
-        case .unavailable: "Unavailable"
-        case .notApplicable: "Not applicable"
-        }
     }
 
     private func intervalText(_ interval: DateInterval) -> String {
@@ -2193,7 +2156,7 @@ private struct UsageRemainingChart: View {
             .chartOverlay { proxy in
                 chartOverlay(proxy: proxy)
             }
-            .frame(height: 300)
+            .frame(height: 240)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Usage remaining")
             .accessibilityValue(
@@ -2316,7 +2279,11 @@ private struct UsageRemainingChart: View {
     @ChartContentBuilder
     private var observedMarks: some ChartContent {
         ForEach(
-            Array(chart.observedSegments(within: visibleRange).enumerated()),
+            Array(
+                chart.observedSegments(within: visibleRange)
+                    .map { downsampledForDisplay($0) }
+                    .enumerated()
+            ),
             id: \.offset
         ) { segmentIndex, segment in
             ForEach(segment) { point in
@@ -2759,22 +2726,17 @@ private struct FactsWorkspace: View {
                 }
             }
 
-            WorkspaceCard(title: "Active Time") {
-                activeTimeContent
-            }
-
-            WorkspaceCard(title: "Usage Receipts") {
-                receiptContent
-            }
         }
     }
 
     private var activeTimeContent: some View {
-        let slice = reader.activityTimeline.slice(
-            in: reader.activityTimeline.interval,
-            filters: store.state.filters
-        )
         let availability = reader.activeTimeAvailability
+        let filteredSlice = store.state.filters.isEmpty
+            ? nil
+            : reader.activityTimeline.slice(
+                in: reader.activityTimeline.interval,
+                filters: store.state.filters
+            )
         return VStack(alignment: .leading, spacing: 9) {
             FactRow(
                 label: "Active time this week",
@@ -2806,20 +2768,23 @@ private struct FactsWorkspace: View {
             }
             FactRow(
                 label: "Peak concurrency",
-                value: "\(slice.maximumConcurrency)"
+                value: "\(filteredSlice?.maximumConcurrency ?? availability.maximumConcurrency)"
             )
             FactRow(
                 label: "Waiting",
-                value: slice.waitingTime.map {
+                value: (filteredSlice?.waitingTime
+                    ?? availability.waitingTime).map {
                     duration(Int64($0.rounded(.down)))
                 } ?? "Unavailable"
             )
             FactRow(
                 label: "Polling",
-                value: slice.pollingTime.map {
+                value: (filteredSlice?.pollingTime
+                    ?? availability.pollingTime).map {
                     duration(Int64($0.rounded(.down)))
                 } ?? "Unavailable",
-                detail: slice.activityBreakdownReason
+                detail: filteredSlice?.activityBreakdownReason
+                    ?? availability.activityBreakdownReason
             )
             FactRow(
                 label: "Source",
@@ -2902,44 +2867,54 @@ private struct FactsWorkspace: View {
 
     @ViewBuilder
     private var receiptContent: some View {
-        let slice = reader.usageReceipts.slice(
+        let overview = reader.usageReceipts.overview(
             in: receiptRange,
             filters: store.state.filters
         )
-        if slice.receipts.isEmpty {
-            Text(slice.reason ?? "No Usage Receipts are available.")
+        if overview.receipts.isEmpty {
+            Text(overview.reason ?? "No Usage Receipts are available.")
                 .foregroundStyle(.secondary)
         } else {
             HStack {
-                Text("\(compactTokenCount(slice.totalTokens)) local tokens")
+                Text(
+                    "\(compactTokenCount(overview.totalTokens)) local tokens"
+                )
                 Spacer()
-                Text("\(slice.receiptCoverage.displayName) coverage")
+                Text("\(overview.receiptCoverage.displayName) coverage")
                     .foregroundStyle(.secondary)
             }
             .font(.caption)
             .accessibilityElement(children: .combine)
-            if let receiptReason = slice.receiptReason {
+            if let receiptReason = overview.receiptReason {
                 Text(receiptReason)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
 
-            if slice.unattributedTokens > 0 {
+            if overview.unattributedTokens > 0 {
                 Text(
-                    "\(compactTokenCount(slice.unattributedTokens)) local tokens could not be matched to a Task."
+                    "\(compactTokenCount(overview.unattributedTokens)) local tokens could not be matched to a Task."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
 
-            ForEach(receiptProjects(in: slice), id: \.self) { project in
+            ForEach(receiptProjects(in: overview), id: \.self) { project in
                 DisclosureGroup {
                     ForEach(
-                        slice.receipts.filter {
+                        overview.receipts.filter {
                             $0.projectLabel == project
                         }
-                    ) { receipt in
-                        receiptDisclosure(receipt)
+                    ) { summary in
+                        UsageReceiptSummaryDisclosure(
+                            summary: summary,
+                            snapshot: reader.usageReceipts,
+                            selectedInterval: receiptRange,
+                            filters: store.state.filters,
+                            contentRevision:
+                                reader.reusableLocalAggregates?.contentRevision
+                                    ?? 0
+                        )
                     }
                 } label: {
                     Label(
@@ -2964,72 +2939,10 @@ private struct FactsWorkspace: View {
     }
 
     private func receiptProjects(
-        in slice: UsageReceiptSlice
+        in overview: UsageReceiptOverview
     ) -> [String?] {
-        Array(Set(slice.receipts.map(\.projectLabel))).sorted {
+        Array(Set(overview.receipts.map(\.projectLabel))).sorted {
             ($0 ?? "") < ($1 ?? "")
-        }
-    }
-
-    @ViewBuilder
-    private func receiptDisclosure(_ receipt: UsageReceipt) -> some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                FactRow(
-                    label: "Local Token Activity",
-                    value: compactTokenCount(receipt.tokens)
-                )
-                FactRow(
-                    label: "Task Tree",
-                    value: "\(receipt.taskCount) \(receipt.taskCount == 1 ? "Task" : "Tasks")"
-                )
-                FactRow(
-                    label: "Range",
-                    value: receipt.intervalText
-                )
-                UsageReceiptDiagnosticsView(
-                    diagnostics: receipt.diagnostics
-                )
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Task Tree")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Text(
-                        "Open a Task to see its agents and turns. Models are the effective settings recorded for each turn."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    UsageReceiptTaskTreeView(
-                        node: receipt.taskTree,
-                        isRoot: true
-                    )
-                }
-                UsageReceiptBreakdownView(
-                    title: "Models",
-                    values: receipt.models
-                )
-                UsageReceiptBreakdownView(
-                    title: "Reasoning",
-                    values: receipt.reasoningLevels
-                )
-                FactRow(
-                    label: "Coverage",
-                    value: receipt.coverage.displayName,
-                    detail: receipt.reason
-                )
-            }
-            .padding(.leading, 4)
-        } label: {
-            HStack {
-                Text("Task \(receipt.displayTaskID)")
-                Spacer()
-                Text(compactTokenCount(receipt.tokens))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(receipt.accessibilityValue)
         }
     }
 
@@ -3125,6 +3038,123 @@ private struct FactsWorkspace: View {
     }
 }
 
+private struct UsageReceiptSummaryDisclosure: View {
+    let summary: UsageReceiptSummary
+    let snapshot: UsageReceiptSnapshot
+    let selectedInterval: DateInterval
+    let filters: WorkspaceFilters
+    let contentRevision: UInt64
+
+    @State private var isExpanded = false
+    @State private var receipt: UsageReceipt?
+
+    var body: some View {
+        DisclosureGroup(isExpanded: expansion) {
+            if let receipt {
+                receiptDetails(receipt)
+            } else {
+                Text("Task details are not available.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } label: {
+            HStack {
+                Text("Task \(summary.displayTaskID)")
+                Spacer()
+                Text(compactTokenCount(summary.tokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(summary.accessibilityValue)
+        }
+        .onChange(of: summary) { _, _ in
+            reloadIfExpanded()
+        }
+        .onChange(of: selectedInterval) { _, _ in
+            reloadIfExpanded()
+        }
+        .onChange(of: filters) { _, _ in
+            reloadIfExpanded()
+        }
+        .onChange(of: contentRevision) { _, _ in
+            reloadIfExpanded()
+        }
+    }
+
+    private var expansion: Binding<Bool> {
+        Binding(
+            get: { isExpanded },
+            set: { expanded in
+                isExpanded = expanded
+                receipt = expanded ? loadReceipt() : nil
+            }
+        )
+    }
+
+    private func loadReceipt() -> UsageReceipt? {
+        snapshot.receipt(
+            rootTaskID: summary.rootTaskID,
+            in: selectedInterval,
+            filters: filters
+        )
+    }
+
+    private func reloadIfExpanded() {
+        guard isExpanded else { return }
+        receipt = loadReceipt()
+    }
+
+    private func receiptDetails(_ receipt: UsageReceipt) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            FactRow(
+                label: "Local Token Activity",
+                value: compactTokenCount(receipt.tokens)
+            )
+            FactRow(
+                label: "Task Tree",
+                value: "\(receipt.taskCount) \(receipt.taskCount == 1 ? "Task" : "Tasks")"
+            )
+            FactRow(
+                label: "Range",
+                value: receipt.intervalText
+            )
+            UsageReceiptDiagnosticsView(
+                diagnostics: receipt.diagnostics
+            )
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Task Tree")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(
+                    "Open a Task to see its agents and turns. Models are the effective settings recorded for each turn."
+                )
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                UsageReceiptTaskTreeView(
+                    node: receipt.taskTree,
+                    isRoot: true
+                )
+            }
+            UsageReceiptBreakdownView(
+                title: "Models",
+                values: receipt.models
+            )
+            UsageReceiptBreakdownView(
+                title: "Reasoning",
+                values: receipt.reasoningLevels
+            )
+            FactRow(
+                label: "Coverage",
+                value: receipt.coverage.displayName,
+                detail: receipt.reason
+            )
+        }
+        .padding(.leading, 4)
+    }
+}
+
 private func compactTokenCount(_ value: Int64) -> String {
     value.formatted(
         .number.notation(.compactName).precision(.fractionLength(0 ... 1))
@@ -3141,6 +3171,18 @@ func usageReceiptTokenTotalDetail(_ reconciles: Bool?) -> String {
     return "Input or output is unavailable"
 }
 
+func downsampledForDisplay<Point>(
+    _ points: [Point],
+    limit requestedLimit: Int = 1_000
+) -> [Point] {
+    let limit = max(requestedLimit, 2)
+    guard points.count > limit else { return points }
+    let step = Double(points.count - 1) / Double(limit - 1)
+    return (0 ..< limit).map {
+        points[min(Int((Double($0) * step).rounded()), points.count - 1)]
+    }
+}
+
 private func steppedPoint<Point: Equatable>(
     in points: [Point],
     from selected: Point?,
@@ -3153,15 +3195,42 @@ private func steppedPoint<Point: Equatable>(
     return points[min(max(index + offset, 0), points.count - 1)]
 }
 
-private func nearestPoint<Point>(
+func nearestPoint<Point>(
     in points: [Point],
     to target: Date,
-    date: KeyPath<Point, Date>
+    date: KeyPath<Point, Date>,
+    within interval: DateInterval? = nil
 ) -> Point? {
-    points.min {
-        abs($0[keyPath: date].timeIntervalSince(target))
-            < abs($1[keyPath: date].timeIntervalSince(target))
+    func lowerBound(_ target: Date, from start: Int, to end: Int) -> Int {
+        var lower = start
+        var upper = end
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if points[middle][keyPath: date] < target {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return lower
     }
+    let start = interval.map {
+        lowerBound($0.start, from: 0, to: points.count)
+    } ?? 0
+    let end = interval.map {
+        let index = lowerBound($0.end, from: start, to: points.count)
+        return index < points.count
+            && points[index][keyPath: date] == $0.end ? index + 1 : index
+    } ?? points.count
+    guard start < end else { return nil }
+    let insertion = lowerBound(target, from: start, to: end)
+    let candidates = [insertion - 1, insertion].filter {
+        $0 >= start && $0 < end
+    }
+    return candidates.min {
+        abs(points[$0][keyPath: date].timeIntervalSince(target))
+            < abs(points[$1][keyPath: date].timeIntervalSince(target))
+    }.map { points[$0] }
 }
 
 private func chartDate(
