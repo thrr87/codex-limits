@@ -75,7 +75,16 @@ struct MenuContentView: View {
                 .padding(.vertical, 12)
         }
         .frame(width: layout.width, height: layout.height)
-        .task { await monitor.refresh(forceHistorySync: false) }
+        .task(id: workspace.state) {
+            let state = workspace.state
+            await monitor.setLocalAnalyticsVisible(
+                state.usesLocalAnalytics
+            )
+            if state.section == .graphs,
+               state.graph == .tokenActivity {
+                await monitor.refreshAccountIfStale()
+            }
+        }
         .environment(\.locale, Locale(identifier: "en_US"))
     }
 
@@ -486,7 +495,7 @@ private struct GraphsWorkspace: View {
                 set: store.selectGraph
             )
         ) {
-            ForEach(AnalyticsGraph.allCases) { graph in
+            ForEach(AnalyticsGraph.coreCases) { graph in
                 Text(graph.rawValue).tag(graph)
             }
         }
@@ -518,9 +527,7 @@ private struct GraphsWorkspace: View {
             Label("Account", systemImage: "person.crop.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help(
-                    "Project, Task Tree, model, and reasoning filters do not change \(store.state.graph.rawValue)."
-                )
+                .help("Data from your Codex account.")
                 .accessibilityLabel("Account scope")
         } else {
             WorkspaceFilterMenu(reader: reader, store: store)
@@ -1511,66 +1518,72 @@ private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
 
-    @State private var selectedPoint: LocalTokenActivityPoint?
+    @State private var selectedDay: TokenDay?
+    private let day: TimeInterval = 86_400
+
+    private var accountDays: [TokenDay] {
+        (reader.account?.tokenHistory ?? []).sorted { $0.date < $1.date }
+    }
+
+    private var currentWindowBounds: DateInterval? {
+        reader.weeklyUsageRemaining.map {
+            DateInterval(
+                start: $0.window.startsAt,
+                end: $0.window.resetsAt
+            )
+        }
+    }
 
     private var bounds: DateInterval {
-        reader.localTokenActivity.interval
+        let fallback = reader.fetchedAt ?? Date()
+        let first = accountDays.first?.date
+            ?? currentWindowBounds?.start
+            ?? fallback.addingTimeInterval(-day)
+        let last = accountDays.last?.date.addingTimeInterval(day)
+            ?? currentWindowBounds?.end
+            ?? fallback
+        return DateInterval(
+            start: min(first, currentWindowBounds?.start ?? first),
+            end: max(last, currentWindowBounds?.end ?? last)
+        )
     }
 
     private var visibleRange: DateInterval {
-        store.effectiveRange(
+        if store.state.timeRange == .currentWindow,
+           let currentWindowBounds {
+            return currentWindowBounds
+        }
+        return store.effectiveRange(
             within: bounds,
             endingAt: min(
-                reader.localTokenActivity.observedAt ?? bounds.end,
+                reader.fetchedAt ?? bounds.end,
                 bounds.end
             )
         )
     }
 
-    private var localSlice: LocalTokenActivitySlice {
-        guard !store.state.filters.isEmpty else {
-            return reader.localTokenActivity.slice(in: visibleRange)
-        }
-        return reader.usageReceipts.localTokenSlice(
-            in: visibleRange,
-            filters: store.state.filters
+    private var accountRange: AccountTokenActivityRange {
+        AccountTokenActivityRange(
+            days: accountDays,
+            interval: visibleRange
         )
     }
 
-    private var accountCoversVisibleRange: Bool {
-        guard let interval = reader.accountTokenActivity.interval else {
-            return false
-        }
-        return abs(interval.start.timeIntervalSince(visibleRange.start)) < 1
-            && abs(interval.end.timeIntervalSince(visibleRange.end)) < 1
-    }
-
     var body: some View {
-        content(localSlice)
+        content(accountRange)
     }
 
-    private func content(_ slice: LocalTokenActivitySlice) -> some View {
+    private func content(_ range: AccountTokenActivityRange) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Token activity")
                     .font(.title3.weight(.semibold))
-                Text(
-                    "Account and local token counts may differ, so we show them separately."
-                )
+                Text("Daily token totals from your Codex account.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
 
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 12) {
-                    accountCard
-                    localCard(slice)
-                }
-                VStack(spacing: 12) {
-                    accountCard
-                    localCard(slice)
-                }
-            }
+            accountCard(range)
 
             VStack(alignment: .leading, spacing: 10) {
                 ViewThatFits(in: .horizontal) {
@@ -1585,33 +1598,35 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
-                if slice.points.isEmpty {
+                if range.days.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
-                        title: "No local token activity",
-                        message: localEmptyMessage(slice)
+                        title: "No account token activity",
+                        message: "Codex did not return daily totals for this range."
                     ) {
                         EmptyView()
                     }
                     .frame(minHeight: 170)
                 } else {
-                    localChart(slice)
+                    accountChart(range)
                 }
 
-                selectedPointDetail(slice)
+                selectedPointDetail(range)
             }
         }
         .onChange(of: visibleRange) { _, range in
-            if let selectedPoint, !range.contains(selectedPoint.date) {
-                self.selectedPoint = nil
+            if let selectedDay,
+               selectedDay.date >= range.end
+                || selectedDay.date.addingTimeInterval(day) <= range.start {
+                self.selectedDay = nil
             }
         }
     }
 
     private var chartSourceLabel: some View {
         ChartLegendItem(
-            label: "Local Codex records",
-            color: .purple
+            label: "Daily totals · Account",
+            color: .blue
         )
     }
 
@@ -1621,40 +1636,22 @@ private struct TokenActivityWorkspace: View {
             .foregroundStyle(.tertiary)
     }
 
-    private var accountCard: some View {
+    private func accountCard(
+        _ range: AccountTokenActivityRange
+    ) -> some View {
         TokenSourceCard(
             title: "Account",
-            source: accountSource,
-            value: accountValue,
-            detail: accountDetail,
-            coverage: accountCoverage,
-            freshness: reader.accountTokenActivity.interval?.end,
-            freshnessLabel: "Through",
+            source: store.state.timeRange == .currentWindow
+                ? accountSource
+                : "Codex daily token totals",
+            value: summaryTokens(in: range).map(compactTokenCount)
+                ?? "Not available",
+            detail: summaryDetail(in: range),
+            coverage: summaryCoverage(in: range),
+            freshness: reader.fetchedAt,
+            freshnessLabel: "Updated",
             color: .blue
         )
-    }
-
-    private func localCard(_ slice: LocalTokenActivitySlice) -> some View {
-        TokenSourceCard(
-            title: "Local",
-            source: "Local Codex records",
-            value: reader.localTokenActivity.tokens == nil
-                ? "Not available"
-                : compactTokenCount(slice.tokens),
-            detail: localDetail(slice),
-            coverage: coverageName(slice.coverage),
-            freshness: reader.localTokenActivity.observedAt,
-            freshnessLabel: "Updated",
-            color: .purple
-        )
-    }
-
-    private var accountValue: String {
-        guard accountCoversVisibleRange,
-              let tokens = reader.accountTokenActivity.tokens else {
-            return "Not available"
-        }
-        return compactTokenCount(tokens)
     }
 
     private var accountSource: String {
@@ -1668,13 +1665,25 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var accountDetail: String {
-        guard accountCoversVisibleRange else {
-            if reader.accountTokenActivity.tokens != nil {
-                return "No account total for this selected range"
+    private func summaryTokens(
+        in range: AccountTokenActivityRange
+    ) -> Int64? {
+        if store.state.timeRange == .currentWindow {
+            return reader.accountTokenActivity.tokens
+        }
+        return range.completeTokens
+    }
+
+    private func summaryDetail(
+        in range: AccountTokenActivityRange
+    ) -> String {
+        guard store.state.timeRange == .currentWindow else {
+            if range.completeDayCount == 0 {
+                return "No full days in this range"
             }
-            return reader.accountTokenActivity.reason
-                ?? "Account token activity is unavailable"
+            return range.completeTokens == nil
+                ? "Codex returned only part of this range"
+                : "Sum of \(range.completeDayCount) complete days"
         }
         switch reader.accountTokenActivity.method {
         case .lifetimeDelta:
@@ -1689,8 +1698,14 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var accountCoverage: String {
-        guard accountCoversVisibleRange else { return "Unavailable" }
+    private func summaryCoverage(
+        in range: AccountTokenActivityRange
+    ) -> String {
+        guard store.state.timeRange == .currentWindow else {
+            return range.completeTokens == nil
+                ? "Unavailable"
+                : "Complete days"
+        }
         switch reader.accountTokenActivity.state {
         case .exact: return "Complete"
         case .partial: return "Partial"
@@ -1698,57 +1713,33 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private func localDetail(_ slice: LocalTokenActivitySlice) -> String {
-        var details: [String] = []
-        if let version = reader.localTokenActivity.sourceVersion {
-            details.append("Codex \(version)")
-        }
-        if let reason = slice.reason {
-            details.append(readerFacingLocalReason(reason))
-        }
-        return details.isEmpty
-            ? "Local Codex records are unavailable"
-            : details.joined(separator: " · ")
+    private func renderedDays(
+        _ range: AccountTokenActivityRange
+    ) -> [TokenDay] {
+        downsampledForDisplay(range.days)
     }
 
-    private func localEmptyMessage(_ slice: LocalTokenActivitySlice) -> String {
-        slice.reason.map(readerFacingLocalReason)
-            ?? "No local token events were found in this range."
-    }
-
-    private func renderedChartPoints(
-        _ slice: LocalTokenActivitySlice
-    ) -> [LocalTokenActivityPoint] {
-        let points = slice.points
-        if points.first?.date == visibleRange.start {
-            return downsampledForDisplay(points)
-        }
-        return [LocalTokenActivityPoint(date: visibleRange.start, tokens: 0)]
-            + downsampledForDisplay(points, limit: 999)
-    }
-
-    private func localChart(_ slice: LocalTokenActivitySlice) -> some View {
+    private func accountChart(
+        _ range: AccountTokenActivityRange
+    ) -> some View {
         Chart {
-            ForEach(renderedChartPoints(slice)) { point in
-                LineMark(
-                    x: .value("Time", point.date),
-                    y: .value("Local tokens", point.tokens),
-                    series: .value("Source", "Local Codex records")
+            ForEach(renderedDays(range), id: \.date) { tokenDay in
+                BarMark(
+                    x: .value("Day", tokenDay.date, unit: .day),
+                    y: .value("Account tokens", tokenDay.tokens)
                 )
-                .foregroundStyle(Color.purple)
-                .lineStyle(StrokeStyle(lineWidth: 2))
-                .interpolationMethod(.stepEnd)
+                .foregroundStyle(Color.blue)
             }
 
-            if let selectedPoint {
-                RuleMark(x: .value("Selected time", selectedPoint.date))
+            if let selectedDay {
+                RuleMark(x: .value("Selected time", selectedDay.date))
                     .foregroundStyle(Color.primary.opacity(0.45))
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
                 PointMark(
-                    x: .value("Selected time", selectedPoint.date),
-                    y: .value("Local tokens", selectedPoint.tokens)
+                    x: .value("Selected day", selectedDay.date),
+                    y: .value("Account tokens", selectedDay.tokens)
                 )
-                .foregroundStyle(Color.purple)
+                .foregroundStyle(Color.blue)
                 .symbolSize(52)
             }
         }
@@ -1777,21 +1768,21 @@ private struct TokenActivityWorkspace: View {
                                 at: location,
                                 proxy: proxy,
                                 geometry: geometry,
-                                points: slice.points
+                                days: range.days
                             )
                         case .ended:
-                            selectedPoint = nil
+                            selectedDay = nil
                         }
                     }
             }
         }
-        .frame(height: 220)
+        .frame(height: 180)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Local token activity")
+        .accessibilityLabel("Account token activity")
         .accessibilityValue(
-            selectedPoint.map {
-                "\(compactTokenCount($0.tokens)) local tokens, \($0.date.formatted(date: .abbreviated, time: .shortened))"
-            } ?? "\(compactTokenCount(slice.tokens)) local tokens in the selected range"
+            selectedDay.map {
+                "\(compactTokenCount($0.tokens)) account tokens, \($0.date.formatted(date: .abbreviated, time: .omitted))"
+            } ?? "Daily account token totals are shown."
         )
         .accessibilityHint(
             "Use Previous point and Next point for exact values."
@@ -1800,36 +1791,36 @@ private struct TokenActivityWorkspace: View {
 
     @ViewBuilder
     private func selectedPointDetail(
-        _ slice: LocalTokenActivitySlice
+        _ range: AccountTokenActivityRange
     ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 10) {
-                if let selectedPoint {
+                if let selectedDay {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 10) {
-                            Text("Local Codex records")
+                            Text("Daily account total")
                                 .fontWeight(.semibold)
-                            Text(compactTokenCount(selectedPoint.tokens))
+                            Text(compactTokenCount(selectedDay.tokens))
                                 .monospacedDigit()
                             Text(
-                                selectedPoint.date.formatted(
+                                selectedDay.date.formatted(
                                     date: .abbreviated,
-                                    time: .shortened
+                                    time: .omitted
                                 )
                             )
                             .foregroundStyle(.secondary)
                         }
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(spacing: 8) {
-                                Text("Local Codex records")
+                                Text("Daily account total")
                                     .fontWeight(.semibold)
-                                Text(compactTokenCount(selectedPoint.tokens))
+                                Text(compactTokenCount(selectedDay.tokens))
                                     .monospacedDigit()
                             }
                             Text(
-                                selectedPoint.date.formatted(
+                                selectedDay.date.formatted(
                                     date: .abbreviated,
-                                    time: .shortened
+                                    time: .omitted
                                 )
                             )
                             .foregroundStyle(.secondary)
@@ -1841,27 +1832,17 @@ private struct TokenActivityWorkspace: View {
                 }
                 Spacer()
                 Button {
-                    moveSelection(in: slice.points, by: -1)
+                    moveSelection(in: range.days, by: -1)
                 } label: {
                     Image(systemName: "chevron.left")
                 }
                 .accessibilityLabel("Previous point")
                 Button {
-                    moveSelection(in: slice.points, by: 1)
+                    moveSelection(in: range.days, by: 1)
                 } label: {
                     Image(systemName: "chevron.right")
                 }
                 .accessibilityLabel("Next point")
-            }
-            if selectedPoint != nil {
-                HStack(spacing: 10) {
-                    Text("Account · \(accountSource)")
-                        .fontWeight(.semibold)
-                    Text(accountValue)
-                        .monospacedDigit()
-                    Text("selected range")
-                        .foregroundStyle(.secondary)
-                }
             }
         }
         .font(.caption)
@@ -1874,78 +1855,32 @@ private struct TokenActivityWorkspace: View {
     }
 
     private func moveSelection(
-        in points: [LocalTokenActivityPoint],
+        in days: [TokenDay],
         by offset: Int
     ) {
-        selectedPoint = steppedPoint(
-            in: points,
-            from: selectedPoint,
+        selectedDay = steppedPoint(
+            in: days,
+            from: selectedDay,
             by: offset
         )
-    }
-
-    private func readerFacingLocalReason(_ reason: String) -> String {
-        switch reason {
-        case "Local token activity starts from an unbounded counter":
-            "The first local reading has no earlier reading"
-        case "Local rollout path is unavailable",
-             "Local task records are missing":
-            "Some local Codex records could not be found"
-        case "Local task discovery is incomplete",
-             "Local task metadata is incomplete",
-             "Local task identity is missing":
-            "Some local tasks could not be checked"
-        case "This Codex CLI version has not been checked":
-            "This Codex version has not been checked"
-        case "Installed Codex CLI version is unavailable",
-             "Codex CLI version is unavailable":
-            "The installed Codex version could not be checked"
-        case "Only local activity on this Mac is observed":
-            "Only activity on this Mac is included"
-        case "Saved local activity could not be read":
-            "Saved local activity could not be read"
-        case "Local activity could not be saved":
-            "Local activity could not be saved"
-        case "Local task import is still in progress":
-            "Local activity is still loading"
-        case "Local task record continuity changed":
-            "A local task record changed"
-        case "Local activity read was cancelled":
-            "Local activity could not finish loading"
-        case "Account changed during local activity read":
-            "Local activity changed while loading"
-        default:
-            reason
-        }
     }
 
     private func selectNearestPoint(
         at location: CGPoint,
         proxy: ChartProxy,
         geometry: GeometryProxy,
-        points: [LocalTokenActivityPoint]
+        days: [TokenDay]
     ) {
         guard let date = chartDate(
             at: location,
             proxy: proxy,
             geometry: geometry
         ) else { return }
-        selectedPoint = nearestPoint(
-            in: points,
+        selectedDay = nearestPoint(
+            in: days,
             to: date,
             date: \.date
         )
-    }
-
-    private func coverageName(_ coverage: CoverageLevel) -> String {
-        switch coverage {
-        case .complete: "Complete"
-        case .high: "High"
-        case .partial: "Partial"
-        case .low: "Low"
-        case .unavailable: "Unavailable"
-        case .notApplicable: "Not applicable"
-        }
     }
 
     private func intervalText(_ interval: DateInterval) -> String {
@@ -2221,7 +2156,7 @@ private struct UsageRemainingChart: View {
             .chartOverlay { proxy in
                 chartOverlay(proxy: proxy)
             }
-            .frame(height: 300)
+            .frame(height: 240)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Usage remaining")
             .accessibilityValue(
@@ -2791,13 +2726,6 @@ private struct FactsWorkspace: View {
                 }
             }
 
-            WorkspaceCard(title: "Active Time") {
-                activeTimeContent
-            }
-
-            WorkspaceCard(title: "Usage Receipts") {
-                receiptContent
-            }
         }
     }
 

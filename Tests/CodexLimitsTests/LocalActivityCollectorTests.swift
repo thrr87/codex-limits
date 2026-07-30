@@ -47,6 +47,87 @@ final class LocalActivityCollectorTests: XCTestCase {
         XCTAssertEqual(second.observation.coverage, .high)
     }
 
+    func testReleasedFactsRestoreFromThePersistedCache() async throws {
+        let fixture = try CollectorFixture()
+        _ = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent(
+                "collector-state",
+                isDirectory: true
+            )
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let first = await collector.refresh(interval: interval)
+
+        await collector.releaseCachedFacts()
+        let restored = await collector.refresh(interval: interval)
+
+        XCTAssertEqual(restored.facts, first.facts)
+    }
+
+    func testReleasedFactsStayReleasedWhenARefreshWasSuspended() async throws {
+        let fixture = try CollectorFixture()
+        let file = try fixture.rollout(
+            day: "2026/07/28",
+            threadID: "task-1",
+            lines: [
+                fixture.session(threadID: "task-1", ordinal: 0),
+                fixture.tokens(total: 100, ordinal: 1, minute: 1),
+                fixture.tokens(total: 600, ordinal: 2, minute: 2)
+            ]
+        )
+        let versionDelay = SecondInstalledVersionDelay()
+        let collector = LocalActivityCollector(
+            rootDirectory: fixture.root,
+            stateDirectory: fixture.root.appendingPathComponent(
+                "collector-state",
+                isDirectory: true
+            ),
+            installedCLIVersion: {
+                await versionDelay.response()
+            }
+        )
+        await collector.selectPartition("stable-account")
+        let interval = try fixture.interval()
+        let first = await collector.refresh(interval: interval)
+        try fixture.append(
+            fixture.tokens(total: 800, ordinal: 3, minute: 3),
+            to: file
+        )
+        let suspended = Task {
+            await collector.refresh(interval: interval)
+        }
+        await versionDelay.waitUntilSecondRequest()
+
+        await collector.releaseCachedFacts()
+        await versionDelay.releaseSecondRequest()
+        _ = await suspended.value
+        let restored = await collector.refresh(
+            interval: interval,
+            refreshMetadata: false
+        )
+
+        XCTAssertEqual(
+            first.facts.filter { $0.key == .token }.compactMap(\.numericDelta),
+            [500]
+        )
+        XCTAssertEqual(
+            restored.facts.filter { $0.key == .token }
+                .compactMap(\.numericDelta),
+            [500, 200]
+        )
+    }
+
     func testMissingTrackedFileKeepsFactsAndNamesTheSourceGap() async throws {
         let fixture = try CollectorFixture()
         let file = try fixture.rollout(
@@ -2399,6 +2480,32 @@ private actor CancellableProjectionDelay {
         while !started {
             await Task.yield()
         }
+    }
+}
+
+private actor SecondInstalledVersionDelay {
+    private var requestCount = 0
+    private var secondRequestStarted = false
+    private var secondRequestContinuation: CheckedContinuation<String?, Never>?
+
+    func response() async -> String? {
+        requestCount += 1
+        guard requestCount == 2 else { return "0.145.0" }
+        secondRequestStarted = true
+        return await withCheckedContinuation { continuation in
+            secondRequestContinuation = continuation
+        }
+    }
+
+    func waitUntilSecondRequest() async {
+        while !secondRequestStarted {
+            await Task.yield()
+        }
+    }
+
+    func releaseSecondRequest() {
+        secondRequestContinuation?.resume(returning: "0.145.0")
+        secondRequestContinuation = nil
     }
 }
 
