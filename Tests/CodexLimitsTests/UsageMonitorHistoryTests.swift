@@ -587,6 +587,44 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
+    func testTokenActivityRefreshesOnlyWhenAccountDataIsStale() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fetchedAt = Date(timeIntervalSince1970: 1_700_000)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 90
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt.addingTimeInterval(600),
+                remaining: 89
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.refresh()
+        await monitor.refreshAccountIfStale(
+            now: fetchedAt.addingTimeInterval(599)
+        )
+        var callCount = await source.callCount
+        XCTAssertEqual(callCount, 1)
+
+        await monitor.refreshAccountIfStale(
+            now: fetchedAt.addingTimeInterval(600)
+        )
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 2)
+    }
+
     func testBlockedEvaluationDoesNotFreezeMainActorOrPublishAStaleSnapshot() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -876,6 +914,20 @@ final class UsageMonitorHistoryTests: XCTestCase {
 
         await monitor.start()
         var requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        await monitor.refresh()
+        requestCount = await requests.count
+        XCTAssertEqual(requestCount, 0)
+
+        for graph in AnalyticsGraph.coreCases {
+            var state = AnalyticsExplorationState.initial
+            state.graph = graph
+            await monitor.setLocalAnalyticsVisible(
+                state.usesLocalAnalytics
+            )
+        }
+        requestCount = await requests.count
         XCTAssertEqual(requestCount, 0)
 
         let automatic = Task { @MainActor in

@@ -14,6 +14,7 @@ enum SafetyBufferPolicy {
 
 @MainActor
 final class UsageMonitor: ObservableObject {
+    private static let accountRefreshInterval: TimeInterval = 600
     static let safetyBufferKey = "safetyBuffer"
 
     @Published private(set) var readerSnapshot = UsageIntelligenceEngine.evaluate(
@@ -198,7 +199,11 @@ final class UsageMonitor: ObservableObject {
             )
         }
 
-        Timer.publish(every: 600, on: .main, in: .common)
+        Timer.publish(
+            every: Self.accountRefreshInterval,
+            on: .main,
+            in: .common
+        )
             .autoconnect()
             .sink { [weak self] _ in
                 Task {
@@ -224,6 +229,15 @@ final class UsageMonitor: ObservableObject {
             forceHistorySync: false,
             includeLocalActivity: false
         )
+    }
+
+    func refreshAccountIfStale(now: Date = Date()) async {
+        guard let fetchedAt = accountSnapshot?.fetchedAt,
+              now.timeIntervalSince(fetchedAt)
+                < Self.accountRefreshInterval else {
+            await automaticRefresh()
+            return
+        }
     }
 
     func refresh(
