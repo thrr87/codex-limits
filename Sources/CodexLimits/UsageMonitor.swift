@@ -80,6 +80,8 @@ final class UsageMonitor: ObservableObject {
     private var evaluationTask: Task<UsageReaderSnapshot?, Never>?
     private var localImportGeneration: UInt64 = 0
     private var localImportTask: Task<Void, Never>?
+    private var localAnalyticsVisible = false
+    private var localAnalyticsNeedsLoad = false
 
     convenience init() {
         self.init(
@@ -200,9 +202,7 @@ final class UsageMonitor: ObservableObject {
             .autoconnect()
             .sink { [weak self] _ in
                 Task {
-                    @MainActor in await self?.refresh(
-                        forceHistorySync: false
-                    )
+                    @MainActor in await self?.automaticRefresh()
                 }
             }
             .store(in: &cancellables)
@@ -211,21 +211,31 @@ final class UsageMonitor: ObservableObject {
             .publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
                 Task {
-                    @MainActor in await self?.refresh(
-                        forceHistorySync: false
-                    )
+                    @MainActor in await self?.automaticRefresh()
                 }
             }
             .store(in: &cancellables)
 
-        await refresh(forceHistorySync: false)
+        await automaticRefresh()
     }
 
-    func refresh(forceHistorySync: Bool = true) async {
+    func automaticRefresh() async {
+        await refresh(
+            forceHistorySync: false,
+            includeLocalActivity: false
+        )
+    }
+
+    func refresh(
+        forceHistorySync: Bool = true,
+        includeLocalActivity: Bool = true
+    ) async {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
-        cancelLocalImport()
+        if includeLocalActivity {
+            cancelLocalImport()
+        }
 
         await restoreHistoryIfAvailable()
         let fetchTask = Task { try await fetchUsage() }
@@ -239,14 +249,14 @@ final class UsageMonitor: ObservableObject {
                 )
                 accountSnapshot = result.snapshot
                 sourceState = .available
-                await localActivityCollector?.selectPartition(
-                    historyPartition.id
-                )
-                await refreshLocalActivity(
-                    for: result.snapshot,
-                    observedAt: result.snapshot.fetchedAt,
-                    identityVerified: false
-                )
+                if localAnalyticsVisible,
+                   includeLocalActivity || localAnalyticsNeedsLoad {
+                    await refreshLocalActivity(
+                        for: result.snapshot,
+                        observedAt: result.snapshot.fetchedAt,
+                        identityVerified: false
+                    )
+                }
                 let published = await recalculate(
                     now: result.snapshot.fetchedAt
                 )
@@ -297,10 +307,13 @@ final class UsageMonitor: ObservableObject {
             }
             accountSnapshot = newSnapshot
             sourceState = .available
-            await refreshLocalActivity(
-                for: newSnapshot,
-                observedAt: newSnapshot.fetchedAt
-            )
+            if localAnalyticsVisible,
+               includeLocalActivity || localAnalyticsNeedsLoad {
+                await refreshLocalActivity(
+                    for: newSnapshot,
+                    observedAt: newSnapshot.fetchedAt
+                )
+            }
             let published = await recalculate(now: newSnapshot.fetchedAt)
             persist()
             if published {
@@ -314,10 +327,9 @@ final class UsageMonitor: ObservableObject {
                 (error as? CodexClientError)?.localizedDescription
                     ?? "Couldn’t read Codex usage. Try refreshing again."
             )
-            if let accountSnapshot {
-                await localActivityCollector?.selectPartition(
-                    historyPartition.id
-                )
+            if localAnalyticsVisible,
+               includeLocalActivity || localAnalyticsNeedsLoad,
+               let accountSnapshot {
                 await refreshLocalActivity(
                     for: accountSnapshot,
                     observedAt: Date(),
@@ -327,6 +339,46 @@ final class UsageMonitor: ObservableObject {
             _ = await recalculate()
             persist()
         }
+    }
+
+    func setLocalAnalyticsVisible(_ isVisible: Bool) async {
+        if isVisible {
+            if !localAnalyticsVisible {
+                localAnalyticsVisible = true
+                localAnalyticsNeedsLoad = true
+            }
+            guard localAnalyticsNeedsLoad else { return }
+        } else {
+            guard localAnalyticsVisible || localAnalyticsNeedsLoad else {
+                return
+            }
+            localAnalyticsVisible = false
+            localAnalyticsNeedsLoad = false
+            cancelLocalImport()
+            localActivityCollection = .unavailable(
+                "Codex local records are unavailable"
+            )
+            await localActivityCollector?.releaseCachedFacts()
+            _ = await recalculate()
+            return
+        }
+        while isRefreshing {
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard localAnalyticsVisible,
+              localAnalyticsNeedsLoad,
+              let accountSnapshot else {
+            return
+        }
+        let identityVerified = sourceState == .available
+            && historyAccountIdentity != nil
+        await refreshLocalActivity(
+            for: accountSnapshot,
+            observedAt: identityVerified ? accountSnapshot.fetchedAt : Date(),
+            identityVerified: identityVerified
+        )
+        _ = await recalculate()
     }
 
     func updateSafetyBuffer(_ value: Double) {
@@ -425,7 +477,6 @@ final class UsageMonitor: ObservableObject {
         planType: String? = nil,
         observedAt: Date
     ) async {
-        cancelLocalImport()
         let partition: AccountHistoryPartition
         let authState: String
         let previousAuthState = defaults.string(forKey: Self.historyAuthStateKey)
@@ -473,8 +524,8 @@ final class UsageMonitor: ObservableObject {
         if let planType {
             defaults.set(planType, forKey: Self.historyPlanTypeKey)
         }
-        await localActivityCollector?.selectPartition(partition.id)
         guard partition != historyPartition else { return }
+        cancelLocalImport()
         historyPartition = partition
         historyConnectionActive = false
         if let data = try? JSONEncoder().encode(partition) {
@@ -906,6 +957,8 @@ final class UsageMonitor: ObservableObject {
         identityVerified: Bool = true
     ) async {
         cancelLocalImport()
+        let generation = localImportGeneration
+        localAnalyticsNeedsLoad = false
         guard let interval = UsageIntelligenceEngine.tokenActivityInterval(
             account: snapshot,
             samples: historyMatchesCurrentSnapshot ? samples : [],
@@ -922,6 +975,8 @@ final class UsageMonitor: ObservableObject {
             )
             return
         }
+        await localActivityCollector.selectPartition(historyPartition.id)
+        guard generation == localImportGeneration else { return }
         localActivityCollection = .unavailable(
             "Codex local records are unavailable"
         )
@@ -929,16 +984,22 @@ final class UsageMonitor: ObservableObject {
             interval: interval,
             observedAt: observedAt
         )
-        if await localActivityCollector.hasPendingHistoryDeletion() {
+        guard generation == localImportGeneration else { return }
+        let deletionPending =
+            await localActivityCollector.hasPendingHistoryDeletion()
+        guard generation == localImportGeneration else { return }
+        if deletionPending {
             historyDeletionStatus = .pendingLocal
         }
         localActivityCollection = identityVerified
             ? collection
             : collection.loweringCoverage(
                 "Codex account identity could not be checked"
-            )
-        guard await localActivityCollector.hasPendingImport() else { return }
-        let generation = localImportGeneration
+        )
+        let importPending = await localActivityCollector.hasPendingImport()
+        guard generation == localImportGeneration, importPending else {
+            return
+        }
         localImportTask = Task(priority: .background) { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             await self?.continueLocalActivityImport(

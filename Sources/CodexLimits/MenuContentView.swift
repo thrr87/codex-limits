@@ -75,7 +75,16 @@ struct MenuContentView: View {
                 .padding(.vertical, 12)
         }
         .frame(width: layout.width, height: layout.height)
-        .task { await monitor.refresh(forceHistorySync: false) }
+        .task(id: workspace.state.usesLocalActivity) {
+            await monitor.setLocalAnalyticsVisible(
+                workspace.state.usesLocalActivity
+            )
+        }
+        .onDisappear {
+            Task {
+                await monitor.setLocalAnalyticsVisible(false)
+            }
+        }
         .environment(\.locale, Locale(identifier: "en_US"))
     }
 
@@ -2221,7 +2230,7 @@ private struct UsageRemainingChart: View {
             .chartOverlay { proxy in
                 chartOverlay(proxy: proxy)
             }
-            .frame(height: 300)
+            .frame(height: 240)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Usage remaining")
             .accessibilityValue(

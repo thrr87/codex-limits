@@ -101,6 +101,10 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
         pinnedUsageBaselineID: nil,
         pinnedUsageBaselineAccountPartitionID: nil
     )
+
+    var usesLocalActivity: Bool {
+        section != .graphs || graph != .usageRemaining
+    }
 }
 
 @MainActor

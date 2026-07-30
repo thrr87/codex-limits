@@ -149,6 +149,17 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertFalse(AnalyticsGraph.tokenActivity.usesAccountScope)
     }
 
+    func testOnlyUsageRemainingSkipsLocalActivity() {
+        var state = AnalyticsExplorationState.initial
+
+        XCTAssertFalse(state.usesLocalActivity)
+        state.graph = .tokenActivity
+        XCTAssertTrue(state.usesLocalActivity)
+        state.graph = .usageRemaining
+        state.section = .facts
+        XCTAssertTrue(state.usesLocalActivity)
+    }
+
     func testPresetRangeEndsAtLatestObservedTimeAndIsClampedToWindow() {
         let end = Date(timeIntervalSince1970: 10 * 86_400)
         let bounds = DateInterval(

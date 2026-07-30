@@ -816,6 +816,21 @@ actor LocalActivityCollector {
         importContinuationPending
     }
 
+    func releaseCachedFacts() {
+        refreshGeneration = nextRevision(after: refreshGeneration)
+        guard stateURL != nil else { return }
+        if !changedPaths.isEmpty, !persist() {
+            return
+        }
+        guard changedPaths.isEmpty,
+              pendingFactWrites.isEmpty else {
+            return
+        }
+        restartPartialFactRestores()
+        clearPublishedContent()
+        unloadPersistedFacts(activePaths: [])
+    }
+
     func deleteHistory(at deletedAt: Date = Date()) throws {
         historyCutoff = deletedAt
         historyDeletionPending = stateDirectory != nil
@@ -1256,9 +1271,9 @@ actor LocalActivityCollector {
         guard let directory = stateURL else { return }
         for path in Array(files.keys) {
             guard var state = files[path],
-                  state.factsLoaded,
                   !changedPaths.contains(path),
-                  pendingFactWrites[path] == nil else {
+                  pendingFactWrites[path] == nil,
+                  state.factsLoaded || !activePaths.contains(path) else {
                 continue
             }
             let file = factsURL(
