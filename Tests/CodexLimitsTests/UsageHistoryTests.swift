@@ -108,7 +108,33 @@ final class UsageHistoryTests: XCTestCase {
         XCTAssertEqual(state.samples.first?.comparisonBreak, true)
     }
 
-    func testNegativeLifetimeTokenReadingIsRejectedDuringNormalization() async throws {
+    func testConflictingLifetimeCountersKeepBothReadings() async throws {
+        let root = temporaryDirectory()
+        let observedAt = Date(timeIntervalSince1970: 1_900_000)
+        let resetsAt = Date(timeIntervalSince1970: 2_000_000)
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+        _ = await history.record(UsageSample(
+            observedAt: observedAt,
+            remainingPercent: 80,
+            resetsAt: resetsAt,
+            lifetimeTokens: 1_200
+        ))
+
+        let state = await history.record(UsageSample(
+            observedAt: observedAt,
+            remainingPercent: 80,
+            resetsAt: resetsAt,
+            lifetimeTokens: 1_500
+        ))
+
+        XCTAssertEqual(state.samples.map(\.lifetimeTokens), [1_200, 1_500])
+    }
+
+    func testNegativeLifetimeTokenReadingIsPreservedAsABreak() async throws {
         let root = temporaryDirectory()
         let history = UsageHistory(
             localDirectory: root,
@@ -125,7 +151,7 @@ final class UsageHistoryTests: XCTestCase {
             )
         )
 
-        XCTAssertTrue(state.samples.isEmpty)
+        XCTAssertEqual(state.samples.map(\.lifetimeTokens), [-1])
     }
 
     func testDailyFileRestoreKeepsValidSamplesBesideAnInvalidSample() async throws {
@@ -1556,12 +1582,14 @@ final class UsageHistoryTests: XCTestCase {
         let firstSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
             remainingPercent: 82,
-            resetsAt: reset
+            resetsAt: reset,
+            lifetimeTokens: 1_000
         )
         let secondSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_060),
             remainingPercent: 81,
-            resetsAt: reset
+            resetsAt: reset,
+            lifetimeTokens: 1_200
         )
 
         _ = await firstWriter.load()
@@ -1582,6 +1610,10 @@ final class UsageHistoryTests: XCTestCase {
 
         XCTAssertEqual(firstState.samples, [firstSample, secondSample])
         XCTAssertEqual(secondState.samples, [firstSample, secondSample])
+        XCTAssertEqual(
+            firstState.samples.compactMap(\.lifetimeTokens),
+            [1_000, 1_200]
+        )
         XCTAssertNil(firstState.errorMessage)
         XCTAssertNil(secondState.errorMessage)
     }

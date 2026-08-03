@@ -193,7 +193,8 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
     ) -> CodexMetadataAnalysisPayload {
         let deterministicInput = DeterministicInsightInput(
             reader: reader,
-            exploration: exploration
+            exploration: exploration,
+            now: now
         )
         let selectedUsage = deterministicInput.usagePerToken
         let range = deterministicInput.selectedRange ?? reader.interval.map {

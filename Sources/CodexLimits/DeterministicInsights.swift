@@ -110,7 +110,8 @@ struct DeterministicInsightInput: Equatable, Sendable {
 
     init(
         reader: UsageReaderSnapshot,
-        exploration: AnalyticsExplorationState
+        exploration: AnalyticsExplorationState,
+        now: Date = Date()
     ) {
         sourceState = reader.sourceState
         freshness = reader.freshness
@@ -133,7 +134,7 @@ struct DeterministicInsightInput: Equatable, Sendable {
         selectedRange = Self.effectiveRange(
             usagePerToken: selectedUsage,
             observedInterval: reader.interval,
-            fetchedAt: reader.fetchedAt,
+            now: now,
             exploration: exploration
         )
         filters = exploration.filters
@@ -166,7 +167,7 @@ struct DeterministicInsightInput: Equatable, Sendable {
     static func effectiveRange(
         usagePerToken: UsagePerTokenSnapshot,
         observedInterval: UsageObservedInterval?,
-        fetchedAt: Date?,
+        now: Date,
         exploration: AnalyticsExplorationState
     ) -> DateInterval? {
         let evidence = usagePerToken.history
@@ -183,7 +184,7 @@ struct DeterministicInsightInput: Equatable, Sendable {
                 ? exploration.visibleRange
                 : nil
         }
-        let bounds = DateInterval(start: start, end: end)
+        let bounds = DateInterval(start: start, end: max(end, now))
         if exploration.timeRange == .currentWindow {
             return usagePerToken.current?.interval ?? observedRange
         }
@@ -195,7 +196,7 @@ struct DeterministicInsightInput: Equatable, Sendable {
         }
         return exploration.timeRange.interval(
             within: bounds,
-            endingAt: fetchedAt ?? evidenceEnd ?? end
+            now: now
         )
     }
 }
@@ -207,12 +208,14 @@ enum DeterministicInsightEngine {
     static func evaluate(
         reader: UsageReaderSnapshot,
         exploration: AnalyticsExplorationState,
+        now: Date = Date(),
         dispositions: [String: InsightDisposition]
     ) -> DeterministicInsightsSnapshot {
         evaluate(
             DeterministicInsightInput(
                 reader: reader,
-                exploration: exploration
+                exploration: exploration,
+                now: now
             ),
             dispositions: dispositions
         )

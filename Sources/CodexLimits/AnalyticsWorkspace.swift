@@ -50,7 +50,7 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
 
     func interval(
         within bounds: DateInterval,
-        endingAt proposedEnd: Date
+        now: Date
     ) -> DateInterval {
         let duration: TimeInterval
         switch self {
@@ -65,63 +65,138 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
         case .twelveWeeks:
             duration = 84 * 86_400
         }
-        let end = min(max(proposedEnd, bounds.start), bounds.end)
+        let end = max(now, bounds.start)
         return DateInterval(
-            start: max(bounds.start, end.addingTimeInterval(-duration)),
+            start: end.addingTimeInterval(-duration),
             end: end
         )
     }
 }
 
-struct AccountTokenActivityRange: Equatable, Sendable {
-    let days: [TokenDay]
-    let completeDayCount: Int
-    let completeTokens: Int64?
-
-    init(days: [TokenDay], interval: DateInterval) {
-        let day: TimeInterval = 86_400
-        self.days = days
-            .filter {
-                $0.date >= interval.start
-                    && $0.date.addingTimeInterval(day) <= interval.end
-            }
-            .sorted { $0.date < $1.date }
-
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)
-            ?? calendar.timeZone
-        let startOfDay = calendar.startOfDay(for: interval.start)
-        var expected = startOfDay < interval.start
-            ? startOfDay.addingTimeInterval(day)
-            : startOfDay
-        var expectedDates: [Date] = []
-        while expected.addingTimeInterval(day) <= interval.end {
-            expectedDates.append(expected)
-            expected = expected.addingTimeInterval(day)
-        }
-        completeDayCount = expectedDates.count
-
-        guard !expectedDates.isEmpty else {
-            completeTokens = nil
-            return
-        }
-        var total: Int64 = 0
-        for date in expectedDates {
-            guard let bucket = self.days.first(where: { $0.date == date }),
-                  bucket.completeness == .complete,
-                  bucket.tokens >= 0 else {
-                completeTokens = nil
-                return
-            }
-            let result = total.addingReportingOverflow(bucket.tokens)
-            guard !result.overflow else {
-                completeTokens = nil
-                return
-            }
-            total = result.partialValue
-        }
-        completeTokens = total
+func accountTokenInterval(
+    at date: Date,
+    in intervals: [AccountTokenActivityInterval],
+    within range: DateInterval
+) -> AccountTokenActivityInterval? {
+    intervals.first {
+        $0.start >= range.start
+            && $0.end <= range.end
+            && $0.start <= date
+            && date <= $0.end
     }
+}
+
+func steppedAccountTokenInterval(
+    in intervals: [AccountTokenActivityInterval],
+    from selected: AccountTokenActivityInterval?,
+    by offset: Int
+) -> AccountTokenActivityInterval? {
+    let ordered = intervals.sorted {
+        $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
+    }
+    guard !ordered.isEmpty else { return nil }
+    guard let selected,
+          let index = ordered.firstIndex(of: selected) else {
+        return offset < 0 ? ordered.last : ordered.first
+    }
+    return ordered[min(max(index + offset, 0), ordered.count - 1)]
+}
+
+func retainedAccountTokenInterval(
+    _ selected: AccountTokenActivityInterval?,
+    in intervals: [AccountTokenActivityInterval],
+    range: DateInterval
+) -> AccountTokenActivityInterval? {
+    guard let selected,
+          selected.start >= range.start,
+          selected.end <= range.end else { return nil }
+    return intervals.first { $0 == selected }
+}
+
+struct AccountTokenActivityDisplayInterval: Equatable, Hashable, Identifiable,
+    Sendable {
+    let sourceIntervals: [AccountTokenActivityInterval]
+
+    init(sourceIntervals: [AccountTokenActivityInterval]) {
+        precondition(!sourceIntervals.isEmpty)
+        self.sourceIntervals = sourceIntervals
+    }
+
+    var id: Self { self }
+    var start: Date { sourceIntervals[0].start }
+    var end: Date { sourceIntervals[sourceIntervals.count - 1].end }
+    var tokenDelta: Int64 {
+        sourceIntervals.reduce(0) { $0 + $1.tokenDelta }
+    }
+    var method: AccountTokenActivityMethod { sourceIntervals[0].method }
+    var isAggregated: Bool { sourceIntervals.count > 1 }
+}
+
+func displayedAccountTokenIntervals(
+    _ intervals: [AccountTokenActivityInterval],
+    breaks: [AccountTokenActivityBreak],
+    maximumMarks: Int
+) -> [AccountTokenActivityDisplayInterval] {
+    let ordered = intervals.sorted {
+        $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
+    }
+    guard !ordered.isEmpty else { return [] }
+    let groupLimit = max(
+        Int(ceil(Double(ordered.count) / Double(max(maximumMarks, 1)))),
+        1
+    )
+    var result: [AccountTokenActivityDisplayInterval] = []
+    var group = [ordered[0]]
+    for interval in ordered.dropFirst() {
+        let previous = group[group.count - 1]
+        let hasBreak = breaks.contains {
+            $0.timestamp == previous.end
+                && $0.timestamp == interval.start
+        }
+        let compatible = previous.end == interval.start
+            && previous.method == interval.method
+            && previous.accountPartitionID == interval.accountPartitionID
+            && previous.limitID == interval.limitID
+            && previous.allowanceReset == interval.allowanceReset
+            && (previous.tokenDelta == 0) == (interval.tokenDelta == 0)
+            && !hasBreak
+        if compatible, group.count < groupLimit {
+            group.append(interval)
+        } else {
+            result.append(AccountTokenActivityDisplayInterval(
+                sourceIntervals: group
+            ))
+            group = [interval]
+        }
+    }
+    result.append(AccountTokenActivityDisplayInterval(sourceIntervals: group))
+    return result
+}
+
+func accountTokenDisplayInterval(
+    at date: Date,
+    in intervals: [AccountTokenActivityDisplayInterval],
+    within range: DateInterval
+) -> AccountTokenActivityDisplayInterval? {
+    intervals.first {
+        $0.start >= range.start
+            && $0.end <= range.end
+            && $0.start <= date
+            && date <= $0.end
+    }
+}
+
+func steppedAccountTokenDisplayInterval(
+    in intervals: [AccountTokenActivityDisplayInterval],
+    from selected: AccountTokenActivityDisplayInterval?,
+    by offset: Int
+) -> AccountTokenActivityDisplayInterval? {
+    guard !intervals.isEmpty else { return nil }
+    guard let selected,
+          let index = intervals.firstIndex(of: selected) else {
+        return offset < 0 ? intervals.last : intervals.first
+    }
+    return intervals[min(max(index + offset, 0), intervals.count - 1)]
 }
 
 struct WorkspaceFilters: Codable, Equatable, Sendable {
@@ -312,7 +387,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
 
     func effectiveRange(
         within bounds: DateInterval,
-        endingAt latestObserved: Date
+        now: Date
     ) -> DateInterval {
         if state.timeRange == .selected,
            let visibleRange = state.visibleRange,
@@ -321,7 +396,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
         }
         return state.timeRange.interval(
             within: bounds,
-            endingAt: latestObserved
+            now: now
         )
     }
 

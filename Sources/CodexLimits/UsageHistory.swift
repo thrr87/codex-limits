@@ -983,34 +983,39 @@ actor UsageHistory {
     }
 
     private func normalized(_ samples: [UsageSample]) -> [UsageSample] {
-        let valid = samples.filter(\.isValid)
-        var byIdentity: [UsageSample: UsageSample] = [:]
-        for sample in valid {
-            guard let existing = byIdentity[sample] else {
-                byIdentity[sample] = sample
-                continue
+        let valid = samples.filter(\.hasValidObservationMetadata)
+        let normalized = Dictionary(grouping: valid, by: { $0 }).values
+            .flatMap { matchingSamples -> [UsageSample] in
+                let sample = matchingSamples[0]
+                let comparisonBreak = matchingSamples.contains {
+                    $0.comparisonBreak
+                }
+                let counters = Set(matchingSamples.compactMap(\.lifetimeTokens))
+                if counters.isEmpty {
+                    return [UsageSample(
+                        observedAt: sample.observedAt,
+                        remainingPercent: sample.remainingPercent,
+                        resetsAt: sample.resetsAt,
+                        comparisonBreak: comparisonBreak
+                    )]
+                }
+                return counters.map {
+                    UsageSample(
+                        observedAt: sample.observedAt,
+                        remainingPercent: sample.remainingPercent,
+                        resetsAt: sample.resetsAt,
+                        lifetimeTokens: $0,
+                        comparisonBreak: comparisonBreak
+                    )
+                }
             }
-            let lifetimeTokens = if let newTokens = sample.lifetimeTokens,
-                                    newTokens > (existing.lifetimeTokens ?? .min) {
-                newTokens
-            } else {
-                existing.lifetimeTokens
-            }
-            byIdentity[sample] = UsageSample(
-                observedAt: existing.observedAt,
-                remainingPercent: existing.remainingPercent,
-                resetsAt: existing.resetsAt,
-                lifetimeTokens: lifetimeTokens,
-                comparisonBreak:
-                    existing.comparisonBreak || sample.comparisonBreak
-            )
-        }
-        return byIdentity.values.sorted {
+        return normalized.sorted {
             if $0.observedAt != $1.observedAt { return $0.observedAt < $1.observedAt }
             if $0.remainingPercent != $1.remainingPercent {
                 return $0.remainingPercent > $1.remainingPercent
             }
-            return $0.resetsAt < $1.resetsAt
+            if $0.resetsAt != $1.resetsAt { return $0.resetsAt < $1.resetsAt }
+            return ($0.lifetimeTokens ?? .min) < ($1.lifetimeTokens ?? .min)
         }
     }
 

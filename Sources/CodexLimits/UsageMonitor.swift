@@ -144,7 +144,9 @@ final class UsageMonitor: ObservableObject {
         }
         if let data = defaults.data(forKey: Self.stateKey),
            let state = try? JSONDecoder().decode(StoredState.self, from: data) {
-            let restoredSamples = state.samples.filter(\.isValid)
+            let restoredSamples = state.samples.filter(
+                \.hasValidObservationMetadata
+            )
             accountSnapshot = state.snapshot.flatMap {
                 $0.isValid ? $0 : nil
             }
@@ -918,13 +920,13 @@ final class UsageMonitor: ObservableObject {
     ) {
         let input = DeterministicInsightInput(
             reader: readerSnapshot,
-            exploration: exploration
+            exploration: exploration,
+            now: Date()
         )
         readerSnapshot.insights = DeterministicInsightEngine.evaluate(
             input,
             dispositions: dispositions
         )
-        guard evaluationTask != nil else { return }
         let pending = beginRecalculation(
             analyticsExploration: exploration,
             insightDispositions: dispositions

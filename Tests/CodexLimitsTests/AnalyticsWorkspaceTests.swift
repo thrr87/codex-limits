@@ -123,45 +123,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
-    func testAccountTokenRangeSumsOnlyCompleteFullDays() throws {
-        let formatter = ISO8601DateFormatter()
-        let interval = DateInterval(
-            start: try XCTUnwrap(
-                formatter.date(from: "2026-07-01T12:00:00Z")
-            ),
-            end: try XCTUnwrap(
-                formatter.date(from: "2026-07-04T12:00:00Z")
-            )
-        )
-        let days = try [
-            ("2026-07-01T00:00:00Z", 100, TokenDayCompleteness.complete),
-            ("2026-07-02T00:00:00Z", 200, .complete),
-            ("2026-07-03T00:00:00Z", 300, .complete),
-            ("2026-07-04T00:00:00Z", 400, .partial)
-        ].map {
-            TokenDay(
-                date: try XCTUnwrap(formatter.date(from: $0.0)),
-                tokens: Int64($0.1),
-                completeness: $0.2
-            )
-        }
-
-        let range = AccountTokenActivityRange(
-            days: days,
-            interval: interval
-        )
-
-        XCTAssertEqual(range.days.map(\.tokens), [200, 300])
-        XCTAssertEqual(range.completeDayCount, 2)
-        XCTAssertEqual(range.completeTokens, 500)
-
-        let missingDay = AccountTokenActivityRange(
-            days: days.filter { $0.date != days[2].date },
-            interval: interval
-        )
-        XCTAssertNil(missingDay.completeTokens)
-    }
-
     func testRestoredLocalGraphFallsBackToUsageRemaining() throws {
         let defaults = try XCTUnwrap(
             UserDefaults(
@@ -277,30 +238,586 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertNil(reader.localTokenActivity.tokens)
     }
 
-    func testPresetRangeEndsAtLatestObservedTimeAndIsClampedToWindow() {
-        let end = Date(timeIntervalSince1970: 10 * 86_400)
-        let bounds = DateInterval(
-            start: end.addingTimeInterval(-7 * 86_400),
-            end: end
+    func testRollingTokenActivityViewDistinguishesObservedZeroAndMissing() {
+        let now = Date(timeIntervalSince1970: 10 * 86_400)
+        let account = usageSnapshot(fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
+        exploration.timeRange = .oneDay
+        let evaluate: ([UsageSample]) -> UsageReaderSnapshot = { samples in
+            UsageIntelligenceEngine.evaluate(
+                UsageIntelligenceInput(
+                    account: account,
+                    samples: samples,
+                    safetyBuffer: 3,
+                    sourceState: .available,
+                    now: now,
+                    previousStatus: nil,
+                    analyticsExploration: exploration
+                )
+            )
+        }
+        let first = UsageSample(
+            observedAt: now.addingTimeInterval(-6 * 3_600),
+            remainingPercent: 80,
+            resetsAt: reset,
+            lifetimeTokens: 1_000
         )
-        let latestObserved = end.addingTimeInterval(-5 * 86_400)
+        let positive = evaluate([
+            first,
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 75,
+                resetsAt: reset,
+                lifetimeTokens: 1_300
+            )
+        ])
+        let zero = evaluate([
+            first,
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 75,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            )
+        ])
+        let missing = evaluate([first])
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        store.selectGraph(.tokenActivity)
+        store.selectTimeRange(.oneDay)
+
+        XCTAssertEqual(positive.accountTokenActivity.tokens, 300)
+        XCTAssertTrue(
+            positive.accountTokenActivity.accessibilityValue.contains(
+                "Time without account observations is missing, not zero"
+            )
+        )
+        XCTAssertFalse(
+            positive.accountTokenActivity.accessibilityValue.contains(
+                "Coverage"
+            )
+        )
+        XCTAssertEqual(zero.accountTokenActivity.tokens, 0)
+        XCTAssertTrue(
+            zero.accountTokenActivity.accessibilityValue.contains(
+                "observed zero-token interval"
+            )
+        )
+        XCTAssertEqual(
+            missing.accountTokenActivity.accessibilityValue,
+            "No account readings in this range"
+        )
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: positive,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore(),
+                    now: now
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
+    func testUTCBucketIntervalUsesTheRequestedMacTimeZoneForDisplay() throws {
+        let formatter = ISO8601DateFormatter()
+        let locale = Locale(identifier: "en_US_POSIX")
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let winter = DateInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-01-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-01-02T00:00:00Z"))
+        )
+        let summer = DateInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-07-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-07-02T00:00:00Z"))
+        )
+
+        let utcText = accountTokenIntervalText(
+            winter,
+            timeZone: utc,
+            locale: locale
+        )
+        let cetText = accountTokenIntervalText(
+            winter,
+            timeZone: berlin,
+            locale: locale
+        )
+        let summerUTCText = accountTokenIntervalText(
+            summer,
+            timeZone: utc,
+            locale: locale
+        )
+        let cestText = accountTokenIntervalText(
+            summer,
+            timeZone: berlin,
+            locale: locale
+        )
+
+        XCTAssertNotEqual(utcText, cetText)
+        XCTAssertNotEqual(summerUTCText, cestText)
+        XCTAssertEqual(berlin.secondsFromGMT(for: winter.start), 3_600)
+        XCTAssertEqual(berlin.secondsFromGMT(for: summer.start), 7_200)
+        XCTAssertEqual(winter.duration, 86_400)
+        XCTAssertEqual(summer.duration, 86_400)
+    }
+
+    func testCurrentWindowTokenActivityExposesSoFarCopyAndRenders() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let now = try date("2026-08-03T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "weekly",
+                name: "Weekly",
+                window: UsageWindow(
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: now
+        )
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_000
+                    ),
+                    UsageSample(
+                        observedAt: now,
+                        remainingPercent: 70,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_300
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        store.selectGraph(.tokenActivity)
+        store.selectTimeRange(.currentWindow)
+
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 300)
+        XCTAssertTrue(
+            reader.accountTokenActivity.currentWindowAccessibilityValue
+                .contains("so far")
+        )
+        XCTAssertTrue(
+            reader.accountTokenActivity.currentWindowAccessibilityValue
+                .contains("Time from now until reset is future and has no observation")
+        )
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore(),
+                    now: now
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
+    func testAccountTokenIntervalSelectionPreservesFactualIdentity() {
+        let range = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 10_000)
+        )
+        let positive = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 3_000),
+            tokenDelta: 300,
+            method: .lifetimeDelta,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: range.end
+        )
+        let zero = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 5_000),
+            end: Date(timeIntervalSince1970: 6_000),
+            tokenDelta: 0,
+            method: .lifetimeDelta,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: range.end
+        )
+        let daily = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 7_000),
+            end: Date(timeIntervalSince1970: 8_000),
+            tokenDelta: 900,
+            method: .dailyBuckets,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: nil
+        )
+        let intervals = [daily, zero, positive]
 
         XCTAssertEqual(
-            AnalyticsTimeRange.oneDay.interval(
-                within: bounds,
-                endingAt: latestObserved
+            accountTokenInterval(
+                at: Date(timeIntervalSince1970: 2_500),
+                in: intervals,
+                within: range
             ),
-            DateInterval(
-                start: latestObserved.addingTimeInterval(-86_400),
-                end: latestObserved
+            positive
+        )
+        XCTAssertEqual(
+            accountTokenInterval(
+                at: Date(timeIntervalSince1970: 5_500),
+                in: intervals,
+                within: range
+            ),
+            zero
+        )
+        XCTAssertNil(accountTokenInterval(
+            at: Date(timeIntervalSince1970: 4_000),
+            in: intervals,
+            within: range
+        ))
+        XCTAssertNil(accountTokenInterval(
+            at: Date(timeIntervalSince1970: 9_000),
+            in: intervals,
+            within: range
+        ))
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: nil,
+                by: 1
+            ),
+            positive
+        )
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: positive,
+                by: 1
+            ),
+            zero
+        )
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: zero,
+                by: 1
+            ),
+            daily
+        )
+        XCTAssertEqual(
+            retainedAccountTokenInterval(
+                daily,
+                in: intervals,
+                range: range
+            ),
+            daily
+        )
+        XCTAssertNil(retainedAccountTokenInterval(
+            daily,
+            in: [positive, zero],
+            range: range
+        ))
+        XCTAssertNil(retainedAccountTokenInterval(
+            daily,
+            in: intervals,
+            range: DateInterval(start: range.start, end: daily.start)
+        ))
+        XCTAssertEqual(zero.method.displayName, "Lifetime counter interval")
+        XCTAssertEqual(daily.method.displayName, "UTC daily bucket")
+        XCTAssertTrue(
+            accountTokenIntervalAccessibilityValue(zero)
+                .contains("0 account tokens. Account.")
+        )
+        XCTAssertTrue(
+            accountTokenIntervalAccessibilityValue(daily)
+                .contains("UTC daily bucket")
+        )
+    }
+
+    func testSelectedTokenIntervalFormattingDoesNotChangeIdentity() throws {
+        let formatter = ISO8601DateFormatter()
+        let interval = AccountTokenActivityInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-07-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-07-02T00:00:00Z")),
+            tokenDelta: 900,
+            method: .dailyBuckets,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: nil
+        )
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let locale = Locale(identifier: "en_US_POSIX")
+        let dateInterval = DateInterval(start: interval.start, end: interval.end)
+
+        XCTAssertNotEqual(
+            accountTokenIntervalText(
+                dateInterval,
+                timeZone: utc,
+                locale: locale
+            ),
+            accountTokenIntervalText(
+                dateInterval,
+                timeZone: berlin,
+                locale: locale
             )
+        )
+        XCTAssertEqual(interval.tokenDelta, 900)
+        XCTAssertEqual(interval.id, interval)
+    }
+
+    func testTokenDisplayAggregationPreservesTotalsGapsAndBreaks() {
+        let base = Date(timeIntervalSince1970: 1_000)
+        let reset = base.addingTimeInterval(20_000)
+        func interval(
+            _ start: TimeInterval,
+            _ end: TimeInterval,
+            _ tokens: Int64,
+            method: AccountTokenActivityMethod = .lifetimeDelta
+        ) -> AccountTokenActivityInterval {
+            AccountTokenActivityInterval(
+                start: base.addingTimeInterval(start),
+                end: base.addingTimeInterval(end),
+                tokenDelta: tokens,
+                method: method,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: reset
+            )
+        }
+        let source = [
+            interval(0, 10, 10),
+            interval(10, 20, 20),
+            interval(30, 40, 30),
+            interval(40, 50, 40),
+            interval(50, 60, 50, method: .dailyBuckets),
+            interval(60, 70, 0, method: .dailyBuckets),
+            interval(70, 80, 0, method: .dailyBuckets)
+        ]
+        let breakAt40 = AccountTokenActivityBreak(
+            timestamp: base.addingTimeInterval(40),
+            reason: .counterDecrease
+        )
+        let coarse = displayedAccountTokenIntervals(
+            source.reversed(),
+            breaks: [breakAt40],
+            maximumMarks: 2
+        )
+        let fine = displayedAccountTokenIntervals(
+            source,
+            breaks: [breakAt40],
+            maximumMarks: 100
+        )
+        let sourceTotal = source.reduce(Int64(0)) { $0 + $1.tokenDelta }
+
+        XCTAssertEqual(
+            coarse.reduce(Int64(0)) { $0 + $1.tokenDelta },
+            sourceTotal
+        )
+        XCTAssertEqual(
+            fine.reduce(Int64(0)) { $0 + $1.tokenDelta },
+            sourceTotal
+        )
+        XCTAssertEqual(
+            coarse,
+            displayedAccountTokenIntervals(
+                source,
+                breaks: [breakAt40],
+                maximumMarks: 2
+            )
+        )
+        XCTAssertGreaterThanOrEqual(fine.count, coarse.count)
+        XCTAssertEqual(fine.count, source.count)
+        XCTAssertEqual(coarse.first?.sourceIntervals.count, 2)
+        XCTAssertFalse(coarse.contains {
+            $0.start < base.addingTimeInterval(30)
+                && $0.end > base.addingTimeInterval(20)
+        })
+        XCTAssertFalse(coarse.contains {
+            $0.start < breakAt40.timestamp
+                && $0.end > breakAt40.timestamp
+        })
+        XCTAssertFalse(coarse.contains {
+            Set($0.sourceIntervals.map(\.method)).count > 1
+        })
+        XCTAssertFalse(coarse.contains {
+            $0.sourceIntervals.contains { $0.tokenDelta == 0 }
+                && $0.sourceIntervals.contains { $0.tokenDelta > 0 }
+        })
+        XCTAssertEqual(source.count, 7)
+    }
+
+    func testAggregatedTokenSelectionAndAccessibilityRemainTruthful() {
+        let range = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        func sourceInterval(_ index: Int) -> AccountTokenActivityInterval {
+            AccountTokenActivityInterval(
+                start: range.start.addingTimeInterval(Double(index) * 100),
+                end: range.start.addingTimeInterval(Double(index + 1) * 100),
+                tokenDelta: Int64((index + 1) * 100),
+                method: .lifetimeDelta,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: range.end
+            )
+        }
+        let source = [0, 1, 2].map(sourceInterval)
+        let display = displayedAccountTokenIntervals(
+            source,
+            breaks: [],
+            maximumMarks: 1
+        )
+        let zoomedRange = DateInterval(
+            start: source[0].start,
+            end: source[1].end
+        )
+        let zoomed = displayedAccountTokenIntervals(
+            source.filter {
+                $0.start >= zoomedRange.start && $0.end <= zoomedRange.end
+            },
+            breaks: [],
+            maximumMarks: 3
+        )
+        let selected = accountTokenDisplayInterval(
+            at: range.start.addingTimeInterval(150),
+            in: display,
+            within: range
+        )
+
+        XCTAssertEqual(display.count, 1)
+        XCTAssertEqual(selected?.tokenDelta, 600)
+        XCTAssertEqual(selected?.sourceIntervals.count, 3)
+        XCTAssertEqual(zoomed.count, 2)
+        XCTAssertTrue(zoomed.allSatisfy { !$0.isAggregated })
+        XCTAssertEqual(source.count, 3)
+        XCTAssertEqual(
+            steppedAccountTokenDisplayInterval(
+                in: display,
+                from: nil,
+                by: 1
+            ),
+            selected
+        )
+        XCTAssertTrue(
+            accountTokenDisplayIntervalAccessibilityValue(selected!)
+                .contains("Combined from 3 observed periods")
+        )
+        XCTAssertNil(accountTokenDisplayInterval(
+            at: range.start.addingTimeInterval(500),
+            in: display,
+            within: range
+        ))
+
+        let zero = AccountTokenActivityDisplayInterval(
+            sourceIntervals: [AccountTokenActivityInterval(
+                start: range.start,
+                end: range.start.addingTimeInterval(100),
+                tokenDelta: 0,
+                method: .lifetimeDelta,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: range.end
+            )]
+        )
+        XCTAssertTrue(
+            accountTokenDisplayIntervalAccessibilityValue(zero)
+                .contains("Observed zero-token interval")
+        )
+    }
+
+    func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
+        let now = try date("2026-08-03T09:08:00Z")
+        let latestObserved = now.addingTimeInterval(-6 * 3_600)
+        let bounds = DateInterval(
+            start: now.addingTimeInterval(-12 * 3_600),
+            end: latestObserved
+        )
+
+        for (range, duration) in [
+            (AnalyticsTimeRange.oneDay, 86_400.0),
+            (.threeDays, 259_200.0),
+            (.fourWeeks, 2_419_200.0),
+            (.twelveWeeks, 7_257_600.0)
+        ] {
+            let resolved = range.interval(within: bounds, now: now)
+            XCTAssertEqual(resolved.start, now.addingTimeInterval(-duration))
+            XCTAssertEqual(resolved.end, now)
+            XCTAssertEqual(resolved.duration, duration)
+        }
+        XCTAssertNotEqual(
+            AnalyticsTimeRange.oneDay.interval(within: bounds, now: now).end,
+            latestObserved
         )
         XCTAssertEqual(
             AnalyticsTimeRange.currentWindow.interval(
                 within: bounds,
-                endingAt: latestObserved
+                now: now
             ),
             bounds
+        )
+    }
+
+    func testRollingPresetDatesKeepElapsedDurationAcrossTimezonesAndDST() throws {
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let losAngeles = try XCTUnwrap(
+            TimeZone(identifier: "America/Los_Angeles")
+        )
+
+        for now in [
+            try date("2026-03-29T10:08:00Z"),
+            try date("2026-10-25T11:08:00Z")
+        ] {
+            let interval = AnalyticsTimeRange.oneDay.interval(
+                within: DateInterval(
+                    start: now.addingTimeInterval(-2 * 86_400),
+                    end: now.addingTimeInterval(3_600)
+                ),
+                now: now
+            )
+            XCTAssertEqual(interval.start, now.addingTimeInterval(-86_400))
+            XCTAssertEqual(interval.end, now)
+            XCTAssertEqual(interval.duration, 86_400)
+            XCTAssertNotEqual(
+                boundaryLabel(interval.start, timeZone: berlin),
+                boundaryLabel(interval.end, timeZone: berlin)
+            )
+        }
+
+        let now = try date("2026-08-03T09:08:00Z")
+        let interval = AnalyticsTimeRange.oneDay.interval(
+            within: DateInterval(
+                start: now.addingTimeInterval(-2 * 86_400),
+                end: now.addingTimeInterval(3_600)
+            ),
+            now: now
+        )
+        XCTAssertEqual(interval.end, now)
+        XCTAssertEqual(interval.duration, 86_400)
+        XCTAssertNotEqual(
+            boundaryLabel(interval.end, timeZone: berlin),
+            boundaryLabel(interval.end, timeZone: losAngeles)
         )
     }
 
@@ -332,6 +849,189 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 to: bounds
             )
         )
+    }
+
+    func testSelectedRangeStaysFixedAfterRefresh() throws {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: try date("2026-08-02T08:15:00Z"),
+            end: try date("2026-08-02T14:45:00Z")
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: try date("2026-08-01T00:00:00Z"),
+                end: try date("2026-08-03T00:00:00Z")
+            )
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: DateInterval(
+                    start: try date("2026-08-01T00:00:00Z"),
+                    end: try date("2026-08-04T00:00:00Z")
+                ),
+                now: try date("2026-08-03T12:00:00Z")
+            ),
+            chosen
+        )
+    }
+
+    func testSelectedRangeIgnoresAdvancingNowAndPresetsClearIt() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let bounds = DateInterval(
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 20_000)
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(chosen, within: bounds)
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: bounds,
+                now: Date(timeIntervalSince1970: 15_000)
+            ),
+            chosen
+        )
+
+        store.selectTimeRange(.oneDay)
+        XCTAssertNil(store.state.visibleRange)
+        store.selectVisibleRange(chosen, within: bounds)
+        store.resetVisibleRange()
+        XCTAssertEqual(store.state.timeRange, .currentWindow)
+        XCTAssertNil(store.state.visibleRange)
+    }
+
+    func testSelectedRangeRestoresExactBoundaries() {
+        let suite = "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        AnalyticsWorkspaceStore(defaults: defaults).selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+
+        let restored = AnalyticsWorkspaceStore(defaults: defaults)
+        XCTAssertEqual(restored.state.timeRange, .selected)
+        XCTAssertEqual(restored.state.visibleRange, chosen)
+    }
+
+    func testSelectedRangeClampsOneSideWithoutMovingTheOther() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: DateInterval(
+                    start: Date(timeIntervalSince1970: 4_000),
+                    end: Date(timeIntervalSince1970: 10_000)
+                ),
+                now: .now
+            ),
+            DateInterval(
+                start: Date(timeIntervalSince1970: 4_000),
+                end: Date(timeIntervalSince1970: 8_000)
+            )
+        )
+    }
+
+    func testSelectedRangeUsesBoundsWhenItNoLongerIntersects() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+        let refreshedBounds = DateInterval(
+            start: Date(timeIntervalSince1970: 10_000),
+            end: Date(timeIntervalSince1970: 20_000)
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(within: refreshedBounds, now: .now),
+            refreshedBounds
+        )
+        XCTAssertEqual(store.state.visibleRange, chosen)
+    }
+
+    func testZoomInAndOutContinueFromSelectedRange() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let bounds = DateInterval(
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 10_000)
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        let anchor = Date(timeIntervalSince1970: 5_000)
+        store.selectVisibleRange(chosen, within: bounds)
+        store.zoom(
+            factor: 2,
+            anchor: anchor,
+            currentRange: store.effectiveRange(within: bounds, now: .now),
+            within: bounds
+        )
+
+        let zoomed = DateInterval(
+            start: Date(timeIntervalSince1970: 3_500),
+            end: Date(timeIntervalSince1970: 6_500)
+        )
+        XCTAssertEqual(store.state.visibleRange, zoomed)
+
+        store.zoom(
+            factor: 0.5,
+            anchor: anchor,
+            currentRange: store.effectiveRange(within: bounds, now: .now),
+            within: bounds
+        )
+        XCTAssertEqual(store.state.visibleRange, chosen)
     }
 
     func testZoomKeepsRangeInsideWindowAndAroundAnchor() {
@@ -369,11 +1069,11 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             start: Date(timeIntervalSince1970: 0),
             end: Date(timeIntervalSince1970: 200_000)
         )
-        let latestObserved = Date(timeIntervalSince1970: 150_000)
+        let now = Date(timeIntervalSince1970: 150_000)
         store.selectTimeRange(.oneDay)
         let visible = store.effectiveRange(
             within: bounds,
-            endingAt: latestObserved
+            now: now
         )
 
         store.zoom(
@@ -604,7 +1304,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         store.selectTimeRange(.fourWeeks)
         XCTAssertEqual(
-            store.effectiveRange(within: bounds, endingAt: observedAt),
+            store.effectiveRange(within: bounds, now: observedAt),
             DateInterval(
                 start: observedAt.addingTimeInterval(-28 * 86_400),
                 end: observedAt
@@ -613,7 +1313,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         store.selectTimeRange(.twelveWeeks)
         XCTAssertEqual(
-            store.effectiveRange(within: bounds, endingAt: observedAt),
+            store.effectiveRange(within: bounds, now: observedAt),
             DateInterval(start: oldest, end: observedAt)
         )
     }
@@ -936,6 +1636,71 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testExpiredCurrentWindowRendersUnavailableAndHistoricalUsage() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let observedAt = try date("2026-08-03T12:13:00Z")
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: UsageSnapshot(
+                    mainLimit: LimitReading(
+                        limitId: "weekly",
+                        name: "Weekly",
+                        window: UsageWindow(
+                            remainingPercent: 70,
+                            resetsAt: reset,
+                            durationMinutes: 10_080
+                        )
+                    ),
+                    otherLimits: [],
+                    tokenHistory: [],
+                    emergencyResetCount: 0,
+                    fetchedAt: observedAt
+                ),
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: try date("2026-08-09T12:13:00Z"),
+                previousStatus: nil
+            )
+        )
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+
+        XCTAssertNil(reader.weeklyUsageRemaining)
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore()
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+
+        store.selectTimeRange(.fourWeeks)
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore()
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
     func testUsagePerTokenComparisonRendersAtSmallAndLargeSizes() {
         let suiteName =
             "AnalyticsWorkspaceTests-usage-per-token-\(UUID().uuidString)"
@@ -976,6 +1741,22 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 "Usage per token comparison did not render at \(size)"
             )
         }
+    }
+
+    private func date(_ value: String) throws -> Date {
+        try XCTUnwrap(ISO8601DateFormatter().date(from: value))
+    }
+
+    private func boundaryLabel(
+        _ date: Date,
+        timeZone: TimeZone
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     private func renders<Content: View>(
