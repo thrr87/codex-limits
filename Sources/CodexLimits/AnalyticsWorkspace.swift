@@ -113,6 +113,92 @@ func retainedAccountTokenInterval(
     return intervals.first { $0 == selected }
 }
 
+struct AccountTokenActivityDisplayInterval: Equatable, Hashable, Identifiable,
+    Sendable {
+    let sourceIntervals: [AccountTokenActivityInterval]
+
+    init(sourceIntervals: [AccountTokenActivityInterval]) {
+        precondition(!sourceIntervals.isEmpty)
+        self.sourceIntervals = sourceIntervals
+    }
+
+    var id: Self { self }
+    var start: Date { sourceIntervals[0].start }
+    var end: Date { sourceIntervals[sourceIntervals.count - 1].end }
+    var tokenDelta: Int64 {
+        sourceIntervals.reduce(0) { $0 + $1.tokenDelta }
+    }
+    var method: AccountTokenActivityMethod { sourceIntervals[0].method }
+    var isAggregated: Bool { sourceIntervals.count > 1 }
+}
+
+func displayedAccountTokenIntervals(
+    _ intervals: [AccountTokenActivityInterval],
+    breaks: [AccountTokenActivityBreak],
+    maximumMarks: Int
+) -> [AccountTokenActivityDisplayInterval] {
+    let ordered = intervals.sorted {
+        $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
+    }
+    guard !ordered.isEmpty else { return [] }
+    let groupLimit = max(
+        Int(ceil(Double(ordered.count) / Double(max(maximumMarks, 1)))),
+        1
+    )
+    var result: [AccountTokenActivityDisplayInterval] = []
+    var group = [ordered[0]]
+    for interval in ordered.dropFirst() {
+        let previous = group[group.count - 1]
+        let hasBreak = breaks.contains {
+            $0.timestamp == previous.end
+                && $0.timestamp == interval.start
+        }
+        let compatible = previous.end == interval.start
+            && previous.method == interval.method
+            && previous.accountPartitionID == interval.accountPartitionID
+            && previous.limitID == interval.limitID
+            && previous.allowanceReset == interval.allowanceReset
+            && (previous.tokenDelta == 0) == (interval.tokenDelta == 0)
+            && !hasBreak
+        if compatible, group.count < groupLimit {
+            group.append(interval)
+        } else {
+            result.append(AccountTokenActivityDisplayInterval(
+                sourceIntervals: group
+            ))
+            group = [interval]
+        }
+    }
+    result.append(AccountTokenActivityDisplayInterval(sourceIntervals: group))
+    return result
+}
+
+func accountTokenDisplayInterval(
+    at date: Date,
+    in intervals: [AccountTokenActivityDisplayInterval],
+    within range: DateInterval
+) -> AccountTokenActivityDisplayInterval? {
+    intervals.first {
+        $0.start >= range.start
+            && $0.end <= range.end
+            && $0.start <= date
+            && date <= $0.end
+    }
+}
+
+func steppedAccountTokenDisplayInterval(
+    in intervals: [AccountTokenActivityDisplayInterval],
+    from selected: AccountTokenActivityDisplayInterval?,
+    by offset: Int
+) -> AccountTokenActivityDisplayInterval? {
+    guard !intervals.isEmpty else { return nil }
+    guard let selected,
+          let index = intervals.firstIndex(of: selected) else {
+        return offset < 0 ? intervals.last : intervals.first
+    }
+    return intervals[min(max(index + offset, 0), intervals.count - 1)]
+}
+
 struct WorkspaceFilters: Codable, Equatable, Sendable {
     var projectID: String?
     var taskTreeID: String?

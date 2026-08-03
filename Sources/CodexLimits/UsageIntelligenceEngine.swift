@@ -453,14 +453,14 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
         let zero = intervals.contains { $0.tokenDelta == 0 }
             ? " Includes an observed zero-token interval."
             : ""
-        return "\(tokens) account tokens observed.\(zero) Time without an account reading is empty."
+        return "\(tokens) account tokens observed.\(zero) Time without account observations is missing, not zero."
     }
 
     var currentWindowAccessibilityValue: String {
         guard let tokens else {
             return reason ?? "No account readings in this range"
         }
-        return "\(tokens) account tokens so far. Activity after the latest account reading is empty."
+        return "\(tokens) account tokens so far. Future time after the latest account reading has no observation."
     }
 
     var sourceDescription: String {

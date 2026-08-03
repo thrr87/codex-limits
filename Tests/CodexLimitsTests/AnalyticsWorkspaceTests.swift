@@ -294,7 +294,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertEqual(positive.accountTokenActivity.tokens, 300)
         XCTAssertTrue(
             positive.accountTokenActivity.accessibilityValue.contains(
-                "Time without an account reading is empty"
+                "Time without account observations is missing, not zero"
             )
         )
         XCTAssertFalse(
@@ -425,7 +425,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
         XCTAssertTrue(
             reader.accountTokenActivity.currentWindowAccessibilityValue
-                .contains("after the latest account reading is empty")
+                .contains("Future time after the latest account reading has no observation")
         )
         XCTAssertTrue(
             renders(
@@ -584,6 +584,167 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
         XCTAssertEqual(interval.tokenDelta, 900)
         XCTAssertEqual(interval.id, interval)
+    }
+
+    func testTokenDisplayAggregationPreservesTotalsGapsAndBreaks() {
+        let base = Date(timeIntervalSince1970: 1_000)
+        let reset = base.addingTimeInterval(20_000)
+        func interval(
+            _ start: TimeInterval,
+            _ end: TimeInterval,
+            _ tokens: Int64,
+            method: AccountTokenActivityMethod = .lifetimeDelta
+        ) -> AccountTokenActivityInterval {
+            AccountTokenActivityInterval(
+                start: base.addingTimeInterval(start),
+                end: base.addingTimeInterval(end),
+                tokenDelta: tokens,
+                method: method,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: reset
+            )
+        }
+        let source = [
+            interval(0, 10, 10),
+            interval(10, 20, 20),
+            interval(30, 40, 30),
+            interval(40, 50, 40),
+            interval(50, 60, 50, method: .dailyBuckets),
+            interval(60, 70, 0, method: .dailyBuckets),
+            interval(70, 80, 0, method: .dailyBuckets)
+        ]
+        let breakAt40 = AccountTokenActivityBreak(
+            timestamp: base.addingTimeInterval(40),
+            reason: .counterDecrease
+        )
+        let coarse = displayedAccountTokenIntervals(
+            source.reversed(),
+            breaks: [breakAt40],
+            maximumMarks: 2
+        )
+        let fine = displayedAccountTokenIntervals(
+            source,
+            breaks: [breakAt40],
+            maximumMarks: 100
+        )
+        let sourceTotal = source.reduce(Int64(0)) { $0 + $1.tokenDelta }
+
+        XCTAssertEqual(
+            coarse.reduce(Int64(0)) { $0 + $1.tokenDelta },
+            sourceTotal
+        )
+        XCTAssertEqual(
+            fine.reduce(Int64(0)) { $0 + $1.tokenDelta },
+            sourceTotal
+        )
+        XCTAssertEqual(
+            coarse,
+            displayedAccountTokenIntervals(
+                source,
+                breaks: [breakAt40],
+                maximumMarks: 2
+            )
+        )
+        XCTAssertGreaterThanOrEqual(fine.count, coarse.count)
+        XCTAssertEqual(fine.count, source.count)
+        XCTAssertEqual(coarse.first?.sourceIntervals.count, 2)
+        XCTAssertFalse(coarse.contains {
+            $0.start < base.addingTimeInterval(30)
+                && $0.end > base.addingTimeInterval(20)
+        })
+        XCTAssertFalse(coarse.contains {
+            $0.start < breakAt40.timestamp
+                && $0.end > breakAt40.timestamp
+        })
+        XCTAssertFalse(coarse.contains {
+            Set($0.sourceIntervals.map(\.method)).count > 1
+        })
+        XCTAssertFalse(coarse.contains {
+            $0.sourceIntervals.contains { $0.tokenDelta == 0 }
+                && $0.sourceIntervals.contains { $0.tokenDelta > 0 }
+        })
+        XCTAssertEqual(source.count, 7)
+    }
+
+    func testAggregatedTokenSelectionAndAccessibilityRemainTruthful() {
+        let range = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 2_000)
+        )
+        func sourceInterval(_ index: Int) -> AccountTokenActivityInterval {
+            AccountTokenActivityInterval(
+                start: range.start.addingTimeInterval(Double(index) * 100),
+                end: range.start.addingTimeInterval(Double(index + 1) * 100),
+                tokenDelta: Int64((index + 1) * 100),
+                method: .lifetimeDelta,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: range.end
+            )
+        }
+        let source = [0, 1, 2].map(sourceInterval)
+        let display = displayedAccountTokenIntervals(
+            source,
+            breaks: [],
+            maximumMarks: 1
+        )
+        let zoomedRange = DateInterval(
+            start: source[0].start,
+            end: source[1].end
+        )
+        let zoomed = displayedAccountTokenIntervals(
+            source.filter {
+                $0.start >= zoomedRange.start && $0.end <= zoomedRange.end
+            },
+            breaks: [],
+            maximumMarks: 3
+        )
+        let selected = accountTokenDisplayInterval(
+            at: range.start.addingTimeInterval(150),
+            in: display,
+            within: range
+        )
+
+        XCTAssertEqual(display.count, 1)
+        XCTAssertEqual(selected?.tokenDelta, 600)
+        XCTAssertEqual(selected?.sourceIntervals.count, 3)
+        XCTAssertEqual(zoomed.count, 2)
+        XCTAssertTrue(zoomed.allSatisfy { !$0.isAggregated })
+        XCTAssertEqual(source.count, 3)
+        XCTAssertEqual(
+            steppedAccountTokenDisplayInterval(
+                in: display,
+                from: nil,
+                by: 1
+            ),
+            selected
+        )
+        XCTAssertTrue(
+            accountTokenDisplayIntervalAccessibilityValue(selected!)
+                .contains("Aggregated from 3 source intervals")
+        )
+        XCTAssertNil(accountTokenDisplayInterval(
+            at: range.start.addingTimeInterval(500),
+            in: display,
+            within: range
+        ))
+
+        let zero = AccountTokenActivityDisplayInterval(
+            sourceIntervals: [AccountTokenActivityInterval(
+                start: range.start,
+                end: range.start.addingTimeInterval(100),
+                tokenDelta: 0,
+                method: .lifetimeDelta,
+                accountPartitionID: "account-a",
+                limitID: "weekly",
+                allowanceReset: range.end
+            )]
+        )
+        XCTAssertTrue(
+            accountTokenDisplayIntervalAccessibilityValue(zero)
+                .contains("Observed zero-token interval")
+        )
     }
 
     func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {

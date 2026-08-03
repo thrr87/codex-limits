@@ -1566,12 +1566,39 @@ func accountTokenIntervalAccessibilityValue(
     return "\(interval.tokenDelta) account tokens. Account. \(dates). \(interval.method.displayName)."
 }
 
+func accountTokenDisplayIntervalAccessibilityValue(
+    _ interval: AccountTokenActivityDisplayInterval,
+    timeZone: TimeZone = .autoupdatingCurrent,
+    locale: Locale = .autoupdatingCurrent
+) -> String {
+    let dates = accountTokenIntervalText(
+        DateInterval(start: interval.start, end: interval.end),
+        timeZone: timeZone,
+        locale: locale
+    )
+    let aggregation = interval.isAggregated
+        ? " Aggregated from \(interval.sourceIntervals.count) source intervals."
+        : ""
+    let zero = interval.tokenDelta == 0
+        ? " Observed zero-token interval."
+        : ""
+    return "\(interval.tokenDelta) account tokens. Account. \(dates). \(interval.method.displayName).\(aggregation)\(zero)"
+}
+
 private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
     let now: Date
 
-    @State private var selectedInterval: AccountTokenActivityInterval?
+    @State private var selectedInterval: AccountTokenActivityDisplayInterval?
+
+    private var displayIntervals: [AccountTokenActivityDisplayInterval] {
+        displayedAccountTokenIntervals(
+            reader.accountTokenActivity.intervals,
+            breaks: reader.accountTokenActivity.breaks,
+            maximumMarks: 120
+        )
+    }
 
     private var currentWindowBounds: DateInterval? {
         reader.weeklyUsageRemaining.map {
@@ -1580,6 +1607,20 @@ private struct TokenActivityWorkspace: View {
                 end: $0.window.resetsAt
             )
         }
+    }
+
+    private var zoomBounds: DateInterval {
+        let tokenDates = (reader.account?.tokenHistory ?? []).flatMap {
+            [$0.date, $0.date.addingTimeInterval(86_400)]
+        }
+        let dates = reader.chart.allObserved.map(\.date)
+            + tokenDates
+            + [visibleRange.start, visibleRange.end, now]
+            + [currentWindowBounds?.start, currentWindowBounds?.end].compactMap { $0 }
+        return DateInterval(
+            start: dates.min() ?? visibleRange.start,
+            end: dates.max() ?? visibleRange.end
+        )
     }
 
     private var visibleRange: DateInterval {
@@ -1622,6 +1663,8 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
+                zoomControls
+
                 if reader.accountTokenActivity.intervals.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
@@ -1634,7 +1677,7 @@ private struct TokenActivityWorkspace: View {
                     .frame(minHeight: 170)
                 } else {
                     accountIntervalChart(
-                        reader.accountTokenActivity.intervals
+                        displayIntervals
                     )
                 }
 
@@ -1642,19 +1685,19 @@ private struct TokenActivityWorkspace: View {
                 evidenceDetails
             }
         }
-        .onChange(of: reader.accountTokenActivity.intervals) { _, intervals in
-            selectedInterval = retainedAccountTokenInterval(
-                selectedInterval,
-                in: intervals,
-                range: visibleRange
-            )
+        .onChange(of: reader.accountTokenActivity.intervals) { _, _ in
+            selectedInterval = displayIntervals.first { $0 == selectedInterval }
         }
         .onChange(of: visibleRange) { _, range in
-            selectedInterval = retainedAccountTokenInterval(
-                selectedInterval,
-                in: reader.accountTokenActivity.intervals,
-                range: range
-            )
+            guard let selectedInterval,
+                  selectedInterval.start >= range.start,
+                  selectedInterval.end <= range.end else {
+                self.selectedInterval = nil
+                return
+            }
+            self.selectedInterval = displayIntervals.first {
+                $0 == selectedInterval
+            }
         }
     }
 
@@ -1669,6 +1712,30 @@ private struct TokenActivityWorkspace: View {
         Text(accountTokenIntervalText(visibleRange))
             .font(.caption)
             .foregroundStyle(.tertiary)
+    }
+
+    private var zoomControls: some View {
+        HStack(spacing: 10) {
+            Button {
+                zoom(by: 1.5)
+            } label: {
+                Label("Zoom in", systemImage: "plus.magnifyingglass")
+            }
+            .help("Show a shorter range")
+            Button {
+                zoom(by: 1 / 1.5)
+            } label: {
+                Label("Zoom out", systemImage: "minus.magnifyingglass")
+            }
+            .help("Show a longer range")
+            if store.state.timeRange == .selected {
+                Button("Reset range") {
+                    store.resetVisibleRange()
+                }
+            }
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
     }
 
     private var accountCard: some View {
@@ -1696,7 +1763,7 @@ private struct TokenActivityWorkspace: View {
     }
 
     private func accountIntervalChart(
-        _ intervals: [AccountTokenActivityInterval]
+        _ intervals: [AccountTokenActivityDisplayInterval]
     ) -> some View {
         Chart {
             ForEach(intervals) { interval in
@@ -1769,9 +1836,11 @@ private struct TokenActivityWorkspace: View {
     }
 
     private func midpoint(
-        of interval: AccountTokenActivityInterval
+        of interval: AccountTokenActivityDisplayInterval
     ) -> Date {
-        interval.start.addingTimeInterval(interval.duration / 2)
+        interval.start.addingTimeInterval(
+            interval.end.timeIntervalSince(interval.start) / 2
+        )
     }
 
     private var intervalSelectionDetail: some View {
@@ -1786,10 +1855,18 @@ private struct TokenActivityWorkspace: View {
                         "\(accountTokenIntervalText(DateInterval(start: selectedInterval.start, end: selectedInterval.end))) · \(selectedInterval.method.displayName)"
                     )
                     .foregroundStyle(.secondary)
+                    if selectedInterval.isAggregated {
+                        Text(
+                            "Aggregated display interval · \(selectedInterval.sourceIntervals.count) source intervals"
+                        )
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(
-                    accountTokenIntervalAccessibilityValue(selectedInterval)
+                    accountTokenDisplayIntervalAccessibilityValue(
+                        selectedInterval
+                    )
                 )
             } else {
                 Text("Choose an observed interval for exact details.")
@@ -1859,10 +1936,30 @@ private struct TokenActivityWorkspace: View {
     }
 
     private func moveIntervalSelection(by offset: Int) {
-        selectedInterval = steppedAccountTokenInterval(
-            in: reader.accountTokenActivity.intervals,
+        selectedInterval = steppedAccountTokenDisplayInterval(
+            in: displayIntervals,
             from: selectedInterval,
             by: offset
+        )
+    }
+
+    private func zoom(by factor: CGFloat) {
+        let anchor = selectedInterval.map {
+            Date(
+                timeIntervalSince1970:
+                    ($0.start.timeIntervalSince1970
+                        + $0.end.timeIntervalSince1970) / 2
+            )
+        } ?? Date(
+            timeIntervalSince1970:
+                (visibleRange.start.timeIntervalSince1970
+                    + visibleRange.end.timeIntervalSince1970) / 2
+        )
+        store.zoom(
+            factor: Double(factor),
+            anchor: anchor,
+            currentRange: visibleRange,
+            within: zoomBounds
         )
     }
 
@@ -1876,9 +1973,9 @@ private struct TokenActivityWorkspace: View {
             proxy: proxy,
             geometry: geometry
         ) else { return }
-        selectedInterval = accountTokenInterval(
+        selectedInterval = accountTokenDisplayInterval(
             at: date,
-            in: reader.accountTokenActivity.intervals,
+            in: displayIntervals,
             within: visibleRange
         )
     }
