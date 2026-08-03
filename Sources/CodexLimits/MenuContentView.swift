@@ -1540,6 +1540,19 @@ private struct ConcurrencyWorkspace: View {
     }
 }
 
+func accountTokenIntervalText(
+    _ interval: DateInterval,
+    timeZone: TimeZone = .autoupdatingCurrent,
+    locale: Locale = .autoupdatingCurrent
+) -> String {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    formatter.timeZone = timeZone
+    formatter.locale = locale
+    return "\(formatter.string(from: interval.start))–\(formatter.string(from: interval.end))"
+}
+
 private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
@@ -1677,7 +1690,7 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var chartIntervalLabel: some View {
-        Text(intervalText(visibleRange))
+        Text(accountTokenIntervalText(visibleRange))
             .font(.caption)
             .foregroundStyle(.tertiary)
     }
@@ -1702,14 +1715,7 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var accountSource: String {
-        switch reader.accountTokenActivity.method {
-        case .lifetimeDelta:
-            "Codex account summary"
-        case .dailyBuckets:
-            "Codex daily token totals"
-        case nil:
-            "Codex account"
-        }
+        reader.accountTokenActivity.sourceDescription
     }
 
     private func summaryTokens(
@@ -1730,7 +1736,7 @@ private struct TokenActivityWorkspace: View {
                 return reader.accountTokenActivity.reason
                     ?? "No account readings in this range"
             }
-            return "Observed from \(intervalText(observed))"
+            return "Observed from \(accountTokenIntervalText(observed))"
         }
         guard store.state.timeRange == .currentWindow else {
             if range.completeDayCount == 0 {
@@ -1972,17 +1978,6 @@ private struct TokenActivityWorkspace: View {
         )
     }
 
-    private func intervalText(_ interval: DateInterval) -> String {
-        let start = interval.start.formatted(
-            date: .abbreviated,
-            time: .shortened
-        )
-        let end = interval.end.formatted(
-            date: .abbreviated,
-            time: .shortened
-        )
-        return "\(start)–\(end)"
-    }
 }
 
 private struct TokenSourceCard: View {

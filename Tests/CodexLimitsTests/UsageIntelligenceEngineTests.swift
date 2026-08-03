@@ -648,6 +648,105 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(activity.breaks.first?.timestamp, epoch)
     }
 
+    func testRollingDayLifetimeIntervalsTakePrecedenceOverDailyBuckets() throws {
+        let now = try date("2026-08-03T00:00:00Z")
+        let bucketStart = try date("2026-08-02T00:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [TokenDay(
+                date: bucketStart,
+                tokens: 900,
+                completeness: .complete
+            )]
+        )
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: bucketStart.addingTimeInterval(6 * 3_600),
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: bucketStart.addingTimeInterval(12 * 3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_300
+            )
+        ]
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: readings,
+            now: now
+        )
+
+        XCTAssertEqual(activity.method, .lifetimeDelta)
+        XCTAssertEqual(activity.tokens, 300)
+        XCTAssertEqual(activity.intervals.count, 1)
+        XCTAssertEqual(activity.intervals.first?.method, .lifetimeDelta)
+    }
+
+    func testRollingDayFallsBackToACompleteUTCDailyBucket() throws {
+        let now = try date("2026-08-03T00:00:00Z")
+        let bucketStart = try date("2026-08-02T00:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [TokenDay(
+                date: bucketStart,
+                tokens: 900,
+                completeness: .complete
+            )]
+        )
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: [],
+            now: now
+        )
+
+        XCTAssertEqual(activity.method, .dailyBuckets)
+        XCTAssertEqual(activity.tokens, 900)
+        XCTAssertEqual(activity.sourceDescription, "Codex UTC daily token totals")
+        XCTAssertEqual(
+            activity.interval,
+            DateInterval(start: bucketStart, end: now)
+        )
+        XCTAssertEqual(activity.intervals.map(\.method), [.dailyBuckets])
+    }
+
+    func testRollingDayExcludesPartialUTCDailyBuckets() throws {
+        let now = try date("2026-08-03T12:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [
+                TokenDay(
+                    date: try date("2026-08-02T00:00:00Z"),
+                    tokens: 800,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: try date("2026-08-03T00:00:00Z"),
+                    tokens: 900,
+                    completeness: .complete
+                )
+            ]
+        )
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: [],
+            now: now
+        )
+
+        XCTAssertNil(activity.tokens)
+        XCTAssertTrue(activity.intervals.isEmpty)
+        XCTAssertEqual(activity.reason, "No account readings in this range")
+    }
+
     func testReaderPublishesBoundedCurrentUsagePerTokenFacts() throws {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let account = makeSnapshot(

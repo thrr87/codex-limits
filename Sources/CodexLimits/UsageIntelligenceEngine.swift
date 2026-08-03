@@ -370,7 +370,7 @@ struct AccountTokenActivityInterval: Equatable, Hashable, Identifiable, Sendable
     let method: AccountTokenActivityMethod
     let accountPartitionID: String?
     let limitID: String?
-    let allowanceReset: Date
+    let allowanceReset: Date?
 
     var id: Self { self }
     var duration: TimeInterval { end.timeIntervalSince(start) }
@@ -447,6 +447,14 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
             ? " Includes an observed zero-token interval."
             : ""
         return "\(tokens) account tokens observed.\(zero) Time without an account reading is empty."
+    }
+
+    var sourceDescription: String {
+        switch method {
+        case .lifetimeDelta: "Codex account summary"
+        case .dailyBuckets: "Codex UTC daily token totals"
+        case nil: "Codex account"
+        }
     }
 }
 
@@ -1402,6 +1410,14 @@ enum UsageIntelligenceEngine {
         }
         guard let first = intervals.first,
               let last = intervals.last else {
+            if let account,
+               let fallback = dailyTokenActivity(
+                    account: account,
+                    range: range,
+                    accountPartitionID: accountPartitionID
+               ) {
+                return fallback
+            }
             return .unavailable(
                 "No account readings in this range",
                 range: range,
@@ -1428,6 +1444,49 @@ enum UsageIntelligenceEngine {
             range: range,
             intervals: intervals,
             breaks: breaks
+        )
+    }
+
+    private static func dailyTokenActivity(
+        account: UsageSnapshot,
+        range: DateInterval,
+        accountPartitionID: String?
+    ) -> AccountTokenActivitySnapshot? {
+        let intervals = account.tokenHistory.compactMap {
+            day -> AccountTokenActivityInterval? in
+            let end = day.date.addingTimeInterval(86_400)
+            guard day.completeness == .complete,
+                  day.tokens >= 0,
+                  day.date >= range.start,
+                  end <= range.end else { return nil }
+            return AccountTokenActivityInterval(
+                start: day.date,
+                end: end,
+                tokenDelta: day.tokens,
+                method: .dailyBuckets,
+                accountPartitionID: accountPartitionID,
+                limitID: account.mainLimit?.limitId,
+                allowanceReset: nil
+            )
+        }.sorted { $0.start < $1.start }
+        guard let first = intervals.first,
+              let last = intervals.last else { return nil }
+        var total: Int64 = 0
+        for interval in intervals {
+            let sum = total.addingReportingOverflow(interval.tokenDelta)
+            guard !sum.overflow else { return nil }
+            total = sum.partialValue
+        }
+        return AccountTokenActivitySnapshot(
+            state: intervals.count == 1
+                && first.start == range.start
+                && first.end == range.end ? .exact : .partial,
+            tokens: total,
+            method: .dailyBuckets,
+            interval: DateInterval(start: first.start, end: last.end),
+            reason: nil,
+            range: range,
+            intervals: intervals
         )
     }
 

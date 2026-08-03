@@ -364,6 +364,49 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testUTCBucketIntervalUsesTheRequestedMacTimeZoneForDisplay() throws {
+        let formatter = ISO8601DateFormatter()
+        let locale = Locale(identifier: "en_US_POSIX")
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let winter = DateInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-01-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-01-02T00:00:00Z"))
+        )
+        let summer = DateInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-07-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-07-02T00:00:00Z"))
+        )
+
+        let utcText = accountTokenIntervalText(
+            winter,
+            timeZone: utc,
+            locale: locale
+        )
+        let cetText = accountTokenIntervalText(
+            winter,
+            timeZone: berlin,
+            locale: locale
+        )
+        let summerUTCText = accountTokenIntervalText(
+            summer,
+            timeZone: utc,
+            locale: locale
+        )
+        let cestText = accountTokenIntervalText(
+            summer,
+            timeZone: berlin,
+            locale: locale
+        )
+
+        XCTAssertNotEqual(utcText, cetText)
+        XCTAssertNotEqual(summerUTCText, cestText)
+        XCTAssertEqual(berlin.secondsFromGMT(for: winter.start), 3_600)
+        XCTAssertEqual(berlin.secondsFromGMT(for: summer.start), 7_200)
+        XCTAssertEqual(winter.duration, 86_400)
+        XCTAssertEqual(summer.duration, 86_400)
+    }
+
     func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
         let now = try date("2026-08-03T09:08:00Z")
         let latestObserved = now.addingTimeInterval(-6 * 3_600)
