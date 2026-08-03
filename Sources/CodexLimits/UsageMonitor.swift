@@ -925,7 +925,6 @@ final class UsageMonitor: ObservableObject {
             input,
             dispositions: dispositions
         )
-        guard evaluationTask != nil else { return }
         let pending = beginRecalculation(
             analyticsExploration: exploration,
             insightDispositions: dispositions

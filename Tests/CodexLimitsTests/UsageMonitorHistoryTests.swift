@@ -720,6 +720,51 @@ final class UsageMonitorHistoryTests: XCTestCase {
         XCTAssertEqual(monitor.readerSnapshot.menuBarText, "80%")
     }
 
+    func testPreferenceChangeRecalculatesTokenRangeWhenIdle() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let evaluationStarted = expectation(
+            description: "account evaluation started"
+        )
+        let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+        let fetchedAt = Date(timeIntervalSince1970: 1_900_000)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: fetchedAt,
+                remaining: 80
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() },
+            evaluateUsage: { evaluator.evaluate($0) }
+        )
+        let refresh = Task { await monitor.refresh() }
+        await fulfillment(of: [evaluationStarted], timeout: 2)
+        evaluator.release()
+        await refresh.value
+        let initialCalls = evaluator.callCount
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .threeDays
+
+        monitor.analyticsPreferencesDidChange(
+            exploration: exploration,
+            dispositions: [:]
+        )
+        let deadline = ContinuousClock.now + .seconds(2)
+        while evaluator.callCount == initialCalls,
+              ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+
+        XCTAssertGreaterThan(evaluator.callCount, initialCalls)
+        XCTAssertEqual(evaluator.lastExploration, exploration)
+    }
+
     func testFailedRefreshRetainsTheLastReaderSnapshot() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

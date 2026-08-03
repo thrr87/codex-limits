@@ -123,45 +123,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
-    func testAccountTokenRangeSumsOnlyCompleteFullDays() throws {
-        let formatter = ISO8601DateFormatter()
-        let interval = DateInterval(
-            start: try XCTUnwrap(
-                formatter.date(from: "2026-07-01T12:00:00Z")
-            ),
-            end: try XCTUnwrap(
-                formatter.date(from: "2026-07-04T12:00:00Z")
-            )
-        )
-        let days = try [
-            ("2026-07-01T00:00:00Z", 100, TokenDayCompleteness.complete),
-            ("2026-07-02T00:00:00Z", 200, .complete),
-            ("2026-07-03T00:00:00Z", 300, .complete),
-            ("2026-07-04T00:00:00Z", 400, .partial)
-        ].map {
-            TokenDay(
-                date: try XCTUnwrap(formatter.date(from: $0.0)),
-                tokens: Int64($0.1),
-                completeness: $0.2
-            )
-        }
-
-        let range = AccountTokenActivityRange(
-            days: days,
-            interval: interval
-        )
-
-        XCTAssertEqual(range.days.map(\.tokens), [200, 300])
-        XCTAssertEqual(range.completeDayCount, 2)
-        XCTAssertEqual(range.completeTokens, 500)
-
-        let missingDay = AccountTokenActivityRange(
-            days: days.filter { $0.date != days[2].date },
-            interval: interval
-        )
-        XCTAssertNil(missingDay.completeTokens)
-    }
-
     func testRestoredLocalGraphFallsBackToUsageRemaining() throws {
         let defaults = try XCTUnwrap(
             UserDefaults(

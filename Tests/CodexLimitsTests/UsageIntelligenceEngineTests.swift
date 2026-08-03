@@ -747,6 +747,194 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(activity.reason, "No account readings in this range")
     }
 
+    func testEveryRollingTokenRangeUsesExactContainedIntervals() {
+        let now = Date(timeIntervalSince1970: 10_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let cases: [(AnalyticsTimeRange, TimeInterval)] = [
+            (.threeDays, 3 * 86_400),
+            (.fourWeeks, 28 * 86_400),
+            (.twelveWeeks, 84 * 86_400)
+        ]
+
+        for (timeRange, duration) in cases {
+            let rangeStart = now.addingTimeInterval(-duration)
+            let readings = [
+                UsageSample(
+                    observedAt: rangeStart.addingTimeInterval(-60),
+                    remainingPercent: 95,
+                    resetsAt: reset,
+                    lifetimeTokens: 900
+                ),
+                UsageSample(
+                    observedAt: rangeStart,
+                    remainingPercent: 90,
+                    resetsAt: reset,
+                    lifetimeTokens: 1_000
+                ),
+                UsageSample(
+                    observedAt: rangeStart.addingTimeInterval(3_600),
+                    remainingPercent: 85,
+                    resetsAt: reset,
+                    lifetimeTokens: 1_200
+                ),
+                UsageSample(
+                    observedAt: now,
+                    remainingPercent: 80,
+                    resetsAt: reset,
+                    lifetimeTokens: 1_600
+                )
+            ]
+
+            let activity = rollingDayActivity(
+                account: account,
+                samples: readings,
+                now: now,
+                timeRange: timeRange
+            )
+
+            XCTAssertEqual(
+                activity.range,
+                DateInterval(start: rangeStart, end: now),
+                timeRange.rawValue
+            )
+            XCTAssertEqual(activity.range?.duration, duration, timeRange.rawValue)
+            XCTAssertEqual(activity.tokens, 600, timeRange.rawValue)
+            XCTAssertEqual(
+                activity.interval,
+                DateInterval(start: rangeStart, end: now),
+                timeRange.rawValue
+            )
+            XCTAssertEqual(activity.intervals.count, 2, timeRange.rawValue)
+            XCTAssertFalse(activity.intervals.contains {
+                $0.start < rangeStart
+            }, timeRange.rawValue)
+            XCTAssertFalse(activity.intervals.contains {
+                $0.end > now
+            }, timeRange.rawValue)
+        }
+    }
+
+    func testSelectedTokenRangeKeepsExactPersistedBoundariesAcrossRefresh() {
+        let now = Date(timeIntervalSince1970: 10_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let selected = DateInterval(
+            start: now.addingTimeInterval(-10 * 86_400),
+            end: now.addingTimeInterval(-5 * 86_400)
+        )
+        let readings = [
+            UsageSample(
+                observedAt: selected.start.addingTimeInterval(-60),
+                remainingPercent: 95,
+                resetsAt: reset,
+                lifetimeTokens: 900
+            ),
+            UsageSample(
+                observedAt: selected.start,
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: selected.start.addingTimeInterval(3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_200
+            ),
+            UsageSample(
+                observedAt: selected.end,
+                remainingPercent: 80,
+                resetsAt: reset,
+                lifetimeTokens: 1_500
+            ),
+            UsageSample(
+                observedAt: selected.end.addingTimeInterval(60),
+                remainingPercent: 79,
+                resetsAt: reset,
+                lifetimeTokens: 1_600
+            )
+        ]
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: readings,
+            now: now,
+            timeRange: .selected,
+            visibleRange: selected
+        )
+        let refreshed = rollingDayActivity(
+            account: account,
+            samples: readings,
+            now: now.addingTimeInterval(86_400),
+            timeRange: .selected,
+            visibleRange: selected
+        )
+
+        XCTAssertEqual(activity.range, selected)
+        XCTAssertEqual(activity.tokens, 500)
+        XCTAssertEqual(activity.interval, selected)
+        XCTAssertEqual(activity.intervals.count, 2)
+        XCTAssertEqual(refreshed.range, selected)
+        XCTAssertEqual(refreshed.intervals, activity.intervals)
+        XCTAssertEqual(refreshed.tokens, activity.tokens)
+    }
+
+    func testTokenSourcePrecedenceIsEvaluatedInsideEachRange() throws {
+        let now = try date("2026-08-03T00:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [
+                TokenDay(
+                    date: try date("2026-08-01T00:00:00Z"),
+                    tokens: 100,
+                    completeness: .complete
+                ),
+                TokenDay(
+                    date: try date("2026-08-02T00:00:00Z"),
+                    tokens: 200,
+                    completeness: .complete
+                )
+            ]
+        )
+        let reset = account.mainLimit!.window.resetsAt
+        let lifetimeReadings = [
+            UsageSample(
+                observedAt: try date("2026-07-23T00:00:00Z"),
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: try date("2026-07-24T00:00:00Z"),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_300
+            )
+        ]
+
+        let threeDays = rollingDayActivity(
+            account: account,
+            samples: lifetimeReadings,
+            now: now,
+            timeRange: .threeDays
+        )
+        let twelveWeeks = rollingDayActivity(
+            account: account,
+            samples: lifetimeReadings,
+            now: now,
+            timeRange: .twelveWeeks
+        )
+
+        XCTAssertEqual(threeDays.method, .dailyBuckets)
+        XCTAssertEqual(threeDays.tokens, 300)
+        XCTAssertEqual(threeDays.intervals.count, 2)
+        XCTAssertEqual(twelveWeeks.method, .lifetimeDelta)
+        XCTAssertEqual(twelveWeeks.tokens, 300)
+        XCTAssertEqual(twelveWeeks.intervals.count, 1)
+    }
+
     func testReaderPublishesBoundedCurrentUsagePerTokenFacts() throws {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let account = makeSnapshot(
@@ -3143,10 +3331,13 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         samples: S,
         now: Date,
         accountPartitionID: String? = nil,
-        accountEpochStartedAt: Date? = nil
+        accountEpochStartedAt: Date? = nil,
+        timeRange: AnalyticsTimeRange = .oneDay,
+        visibleRange: DateInterval? = nil
     ) -> AccountTokenActivitySnapshot where S.Element == UsageSample {
         var exploration = AnalyticsExplorationState.initial
-        exploration.timeRange = .oneDay
+        exploration.timeRange = timeRange
+        exploration.visibleRange = visibleRange
         return UsageIntelligenceEngine.evaluate(
             UsageIntelligenceInput(
                 account: account,

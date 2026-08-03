@@ -1558,13 +1558,6 @@ private struct TokenActivityWorkspace: View {
     @ObservedObject var store: AnalyticsWorkspaceStore
     let now: Date
 
-    @State private var selectedDay: TokenDay?
-    private let day: TimeInterval = 86_400
-
-    private var accountDays: [TokenDay] {
-        (reader.account?.tokenHistory ?? []).sorted { $0.date < $1.date }
-    }
-
     private var currentWindowBounds: DateInterval? {
         reader.weeklyUsageRemaining.map {
             DateInterval(
@@ -1574,48 +1567,22 @@ private struct TokenActivityWorkspace: View {
         }
     }
 
-    private var bounds: DateInterval {
-        let fallback = reader.fetchedAt ?? now
-        let first = accountDays.first?.date
-            ?? currentWindowBounds?.start
-            ?? fallback.addingTimeInterval(-day)
-        let last = accountDays.last?.date.addingTimeInterval(day)
-            ?? currentWindowBounds?.end
-            ?? fallback
-        return DateInterval(
-            start: min(first, currentWindowBounds?.start ?? first),
-            end: max(last, currentWindowBounds?.end ?? last, now)
-        )
-    }
-
     private var visibleRange: DateInterval {
         if store.state.timeRange == .currentWindow,
            let currentWindowBounds {
             return currentWindowBounds
         }
-        return store.effectiveRange(
-            within: bounds,
+        if store.state.timeRange == .selected,
+           let selected = store.state.visibleRange {
+            return selected
+        }
+        return store.state.timeRange.interval(
+            within: DateInterval(start: now, end: now),
             now: now
         )
     }
 
-    private var accountRange: AccountTokenActivityRange {
-        AccountTokenActivityRange(
-            days: accountDays,
-            interval: visibleRange
-        )
-    }
-
-    private var usesAccountIntervals: Bool {
-        store.state.timeRange == .oneDay
-            || store.state.timeRange == .currentWindow
-    }
-
     var body: some View {
-        content(accountRange)
-    }
-
-    private func content(_ range: AccountTokenActivityRange) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Token activity")
@@ -1625,7 +1592,7 @@ private struct TokenActivityWorkspace: View {
                 .foregroundStyle(.secondary)
             }
 
-            accountCard(range)
+            accountCard
 
             VStack(alignment: .leading, spacing: 10) {
                 ViewThatFits(in: .horizontal) {
@@ -1640,56 +1607,28 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
-                if usesAccountIntervals {
-                    if reader.accountTokenActivity.intervals.isEmpty {
-                        WorkspaceMessage(
-                            icon: "chart.xyaxis.line",
-                            title: reader.accountTokenActivity.reason
-                                ?? "No account readings in this range",
-                            message: "Missing time remains empty."
-                        ) {
-                            EmptyView()
-                        }
-                        .frame(minHeight: 170)
-                    } else {
-                        accountIntervalChart(
-                            reader.accountTokenActivity.intervals
-                        )
-                    }
-                } else if range.days.isEmpty {
+                if reader.accountTokenActivity.intervals.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
-                        title: "No complete daily totals",
-                        message: store.state.timeRange == .currentWindow
-                            ? "Choose 4 weeks to see account history."
-                            : "Codex did not return a complete day for this range."
+                        title: reader.accountTokenActivity.reason
+                            ?? "No account readings in this range",
+                        message: "Missing time remains empty."
                     ) {
                         EmptyView()
                     }
                     .frame(minHeight: 170)
                 } else {
-                    accountChart(range)
+                    accountIntervalChart(
+                        reader.accountTokenActivity.intervals
+                    )
                 }
-
-                if !usesAccountIntervals {
-                    selectedPointDetail(range)
-                }
-            }
-        }
-        .onChange(of: visibleRange) { _, range in
-            if let selectedDay,
-               selectedDay.date >= range.end
-                || selectedDay.date.addingTimeInterval(day) <= range.start {
-                self.selectedDay = nil
             }
         }
     }
 
     private var chartSourceLabel: some View {
         ChartLegendItem(
-            label: usesAccountIntervals
-                ? "Observed intervals · Account"
-                : "Daily totals · Account",
+            label: "Observed intervals · Account",
             color: .blue
         )
     }
@@ -1700,138 +1639,28 @@ private struct TokenActivityWorkspace: View {
             .foregroundStyle(.tertiary)
     }
 
-    private func accountCard(
-        _ range: AccountTokenActivityRange
-    ) -> some View {
+    private var accountCard: some View {
         TokenSourceCard(
             title: "Account",
-            source: store.state.timeRange == .oneDay
-                ? accountSource
-                : store.state.timeRange == .currentWindow
-                ? accountSource
-                : "Codex daily token totals",
-            value: summaryTokens(in: range).map(compactTokenCount)
+            source: reader.accountTokenActivity.sourceDescription,
+            value: reader.accountTokenActivity.tokens.map(compactTokenCount)
                 ?? "Not available",
-            detail: summaryDetail(in: range),
+            detail: summaryDetail,
             freshness: reader.fetchedAt,
             freshnessLabel: "Updated",
             color: .blue
         )
     }
 
-    private var accountSource: String {
-        reader.accountTokenActivity.sourceDescription
-    }
-
-    private func summaryTokens(
-        in range: AccountTokenActivityRange
-    ) -> Int64? {
-        if store.state.timeRange == .oneDay
-            || store.state.timeRange == .currentWindow {
-            return reader.accountTokenActivity.tokens
-        }
-        return range.completeTokens
-    }
-
-    private func summaryDetail(
-        in range: AccountTokenActivityRange
-    ) -> String {
-        if store.state.timeRange == .oneDay {
-            guard let observed = reader.accountTokenActivity.interval else {
-                return reader.accountTokenActivity.reason
-                    ?? "No account readings in this range"
-            }
-            return "Observed from \(accountTokenIntervalText(observed))"
-        }
-        guard store.state.timeRange == .currentWindow else {
-            if range.completeDayCount == 0 {
-                return "No full days in this range"
-            }
-            return range.completeTokens == nil
-                ? "Codex returned only part of this range"
-                : "Sum of \(range.completeDayCount) complete days"
-        }
+    private var summaryDetail: String {
         guard let observed = reader.accountTokenActivity.interval else {
             return reader.accountTokenActivity.reason
                 ?? "Account token activity is unavailable"
         }
-        return "Activity so far · Observed from \(accountTokenIntervalText(observed))"
-    }
-
-    private func renderedDays(
-        _ range: AccountTokenActivityRange
-    ) -> [TokenDay] {
-        downsampledForDisplay(range.days)
-    }
-
-    private func accountChart(
-        _ range: AccountTokenActivityRange
-    ) -> some View {
-        Chart {
-            ForEach(renderedDays(range), id: \.date) { tokenDay in
-                BarMark(
-                    x: .value("Day", tokenDay.date, unit: .day),
-                    y: .value("Account tokens", tokenDay.tokens)
-                )
-                .foregroundStyle(Color.blue)
-            }
-
-            if let selectedDay {
-                RuleMark(x: .value("Selected time", selectedDay.date))
-                    .foregroundStyle(Color.primary.opacity(0.45))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                PointMark(
-                    x: .value("Selected day", selectedDay.date),
-                    y: .value("Account tokens", selectedDay.tokens)
-                )
-                .foregroundStyle(Color.blue)
-                .symbolSize(52)
-            }
-        }
-        .chartXScale(domain: visibleRange.start ... visibleRange.end)
-        .chartYAxis {
-            AxisMarks(position: .leading) { value in
-                AxisGridLine()
-                    .foregroundStyle(Color.secondary.opacity(0.16))
-                AxisValueLabel {
-                    if let tokens = value.as(Int64.self) {
-                        Text(compactTokenCount(tokens))
-                    }
-                }
-            }
-        }
-        .chartLegend(.hidden)
-        .chartOverlay { proxy in
-            GeometryReader { geometry in
-                Rectangle()
-                    .fill(.clear)
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        switch phase {
-                        case let .active(location):
-                            selectNearestPoint(
-                                at: location,
-                                proxy: proxy,
-                                geometry: geometry,
-                                days: range.days
-                            )
-                        case .ended:
-                            selectedDay = nil
-                        }
-                    }
-            }
-        }
-        .frame(height: 180)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Account token activity")
-        .accessibilityValue(
-            selectedDay.map {
-                "\(compactTokenCount($0.tokens)) account tokens, \($0.date.formatted(date: .abbreviated, time: .omitted))"
-            } ?? "Daily account token totals are shown."
-        )
-        .accessibilityHint(
-            "Use Previous point and Next point for exact values."
-        )
+        let qualifier = store.state.timeRange == .currentWindow
+            ? "Activity so far · "
+            : ""
+        return "\(qualifier)Observed from \(accountTokenIntervalText(observed))"
     }
 
     private func accountIntervalChart(
@@ -1886,101 +1715,6 @@ private struct TokenActivityWorkspace: View {
     ) -> Date {
         interval.start.addingTimeInterval(interval.duration / 2)
     }
-
-    @ViewBuilder
-    private func selectedPointDetail(
-        _ range: AccountTokenActivityRange
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 10) {
-                if let selectedDay {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 10) {
-                            Text("Daily account total")
-                                .fontWeight(.semibold)
-                            Text(compactTokenCount(selectedDay.tokens))
-                                .monospacedDigit()
-                            Text(
-                                selectedDay.date.formatted(
-                                    date: .abbreviated,
-                                    time: .omitted
-                                )
-                            )
-                            .foregroundStyle(.secondary)
-                        }
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 8) {
-                                Text("Daily account total")
-                                    .fontWeight(.semibold)
-                                Text(compactTokenCount(selectedDay.tokens))
-                                    .monospacedDigit()
-                            }
-                            Text(
-                                selectedDay.date.formatted(
-                                    date: .abbreviated,
-                                    time: .omitted
-                                )
-                            )
-                            .foregroundStyle(.secondary)
-                        }
-                    }
-                } else {
-                    Text("Choose a point for exact details.")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
-                    moveSelection(in: range.days, by: -1)
-                } label: {
-                    Image(systemName: "chevron.left")
-                }
-                .accessibilityLabel("Previous point")
-                Button {
-                    moveSelection(in: range.days, by: 1)
-                } label: {
-                    Image(systemName: "chevron.right")
-                }
-                .accessibilityLabel("Next point")
-            }
-        }
-        .font(.caption)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            .quaternary.opacity(0.7),
-            in: RoundedRectangle(cornerRadius: 8)
-        )
-    }
-
-    private func moveSelection(
-        in days: [TokenDay],
-        by offset: Int
-    ) {
-        selectedDay = steppedPoint(
-            in: days,
-            from: selectedDay,
-            by: offset
-        )
-    }
-
-    private func selectNearestPoint(
-        at location: CGPoint,
-        proxy: ChartProxy,
-        geometry: GeometryProxy,
-        days: [TokenDay]
-    ) {
-        guard let date = chartDate(
-            at: location,
-            proxy: proxy,
-            geometry: geometry
-        ) else { return }
-        selectedDay = nearestPoint(
-            in: days,
-            to: date,
-            date: \.date
-        )
-    }
-
 }
 
 private struct TokenSourceCard: View {

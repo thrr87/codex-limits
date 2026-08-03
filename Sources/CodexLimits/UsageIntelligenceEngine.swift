@@ -825,42 +825,42 @@ enum UsageIntelligenceEngine {
             account: input.account,
             samples: currentSamples
         )
-        let accountTokenActivity: AccountTokenActivitySnapshot
+        let selectedTokenRange: DateInterval?
         switch input.analyticsExploration.timeRange {
-        case .oneDay:
-            accountTokenActivity = selectedRangeAccountTokenActivity(
-                account: input.account,
-                samples: input.samples,
-                range: DateInterval(
-                    start: input.now.addingTimeInterval(-86_400),
-                    end: input.now
-                ),
-                now: input.now,
-                accountPartitionID: input.accountPartitionID,
-                accountEpochStartedAt: input.accountEpochStartedAt
-            )
         case .currentWindow:
             if let window = input.account?.mainLimit?.window,
                window.startsAt <= input.now,
                input.now < window.resetsAt {
-                accountTokenActivity = selectedRangeAccountTokenActivity(
-                    account: input.account,
-                    samples: input.samples,
-                    range: DateInterval(
-                        start: window.startsAt,
-                        end: window.resetsAt
-                    ),
-                    now: input.now,
-                    accountPartitionID: input.accountPartitionID,
-                    accountEpochStartedAt: input.accountEpochStartedAt
+                selectedTokenRange = DateInterval(
+                    start: window.startsAt,
+                    end: window.resetsAt
                 )
             } else {
-                accountTokenActivity = .unavailable(
-                    "Current allowance window unavailable"
-                )
+                selectedTokenRange = nil
             }
+        case .selected:
+            selectedTokenRange = input.analyticsExploration.visibleRange
         default:
-            accountTokenActivity = weeklyAccountTokenActivity
+            selectedTokenRange = input.analyticsExploration.timeRange.interval(
+                within: DateInterval(start: input.now, end: input.now),
+                now: input.now
+            )
+        }
+        let accountTokenActivity = if let selectedTokenRange {
+            selectedRangeAccountTokenActivity(
+                account: input.account,
+                samples: input.samples,
+                range: selectedTokenRange,
+                now: input.now,
+                accountPartitionID: input.accountPartitionID,
+                accountEpochStartedAt: input.accountEpochStartedAt
+            )
+        } else {
+            AccountTokenActivitySnapshot.unavailable(
+                input.analyticsExploration.timeRange == .currentWindow
+                    ? "Current allowance window unavailable"
+                    : "No account readings in this range"
+            )
         }
         let localTokenActivity: LocalTokenActivitySnapshot
         if let interval = tokenActivityInterval(
