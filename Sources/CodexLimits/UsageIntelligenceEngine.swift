@@ -1273,38 +1273,52 @@ enum UsageIntelligenceEngine {
                 range: range
             )
         }
-        let readings = samples.compactMap { sample -> (Date, Int64)? in
-            guard sample.resetsAt == limit.window.resetsAt,
-                  sample.observedAt <= now,
-                  let tokens = sample.lifetimeTokens,
-                  tokens >= 0 else {
-                return nil
-            }
-            return (sample.observedAt, tokens)
+        let readings = samples.filter {
+            $0.observedAt <= now
+                && ($0.lifetimeTokens ?? -1) >= 0
         }.sorted {
-            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
+            if $0.observedAt != $1.observedAt {
+                return $0.observedAt < $1.observedAt
+            }
+            if $0.resetsAt != $1.resetsAt {
+                return $0.resetsAt < $1.resetsAt
+            }
+            if $0.lifetimeTokens != $1.lifetimeTokens {
+                return ($0.lifetimeTokens ?? -1) < ($1.lifetimeTokens ?? -1)
+            }
+            if $0.remainingPercent != $1.remainingPercent {
+                return $0.remainingPercent < $1.remainingPercent
+            }
+            return !$0.comparisonBreak && $1.comparisonBreak
         }
-        var unique: [(Date, Int64)] = []
+        var unique: [UsageSample] = []
         for reading in readings {
             if let last = unique.last,
-               last.0 == reading.0,
-               last.1 == reading.1 {
+               last.observedAt == reading.observedAt,
+               last.resetsAt == reading.resetsAt,
+               last.lifetimeTokens == reading.lifetimeTokens,
+               last.remainingPercent == reading.remainingPercent,
+               last.comparisonBreak == reading.comparisonBreak {
                 continue
             }
             unique.append(reading)
         }
         let intervals = zip(unique, unique.dropFirst()).compactMap {
             start, end -> AccountTokenActivityInterval? in
-            guard end.0 > start.0,
-                  end.1 >= start.1,
-                  start.0 >= range.start,
-                  end.0 <= range.end else {
+            guard start.resetsAt == limit.window.resetsAt,
+                  end.resetsAt == start.resetsAt,
+                  let startTokens = start.lifetimeTokens,
+                  let endTokens = end.lifetimeTokens,
+                  end.observedAt > start.observedAt,
+                  endTokens >= startTokens,
+                  start.observedAt >= range.start,
+                  end.observedAt <= range.end else {
                 return nil
             }
             return AccountTokenActivityInterval(
-                start: start.0,
-                end: end.0,
-                tokenDelta: end.1 - start.1,
+                start: start.observedAt,
+                end: end.observedAt,
+                tokenDelta: endTokens - startTokens,
                 method: .lifetimeDelta,
                 accountPartitionID: accountPartitionID,
                 limitID: limit.limitId,

@@ -1556,12 +1556,14 @@ final class UsageHistoryTests: XCTestCase {
         let firstSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_000),
             remainingPercent: 82,
-            resetsAt: reset
+            resetsAt: reset,
+            lifetimeTokens: 1_000
         )
         let secondSample = UsageSample(
             observedAt: Date(timeIntervalSince1970: 1_900_060),
             remainingPercent: 81,
-            resetsAt: reset
+            resetsAt: reset,
+            lifetimeTokens: 1_200
         )
 
         _ = await firstWriter.load()
@@ -1582,6 +1584,10 @@ final class UsageHistoryTests: XCTestCase {
 
         XCTAssertEqual(firstState.samples, [firstSample, secondSample])
         XCTAssertEqual(secondState.samples, [firstSample, secondSample])
+        XCTAssertEqual(
+            firstState.samples.compactMap(\.lifetimeTokens),
+            [1_000, 1_200]
+        )
         XCTAssertNil(firstState.errorMessage)
         XCTAssertNil(secondState.errorMessage)
     }
