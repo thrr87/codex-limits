@@ -440,6 +440,152 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testAccountTokenIntervalSelectionPreservesFactualIdentity() {
+        let range = DateInterval(
+            start: Date(timeIntervalSince1970: 1_000),
+            end: Date(timeIntervalSince1970: 10_000)
+        )
+        let positive = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 3_000),
+            tokenDelta: 300,
+            method: .lifetimeDelta,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: range.end
+        )
+        let zero = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 5_000),
+            end: Date(timeIntervalSince1970: 6_000),
+            tokenDelta: 0,
+            method: .lifetimeDelta,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: range.end
+        )
+        let daily = AccountTokenActivityInterval(
+            start: Date(timeIntervalSince1970: 7_000),
+            end: Date(timeIntervalSince1970: 8_000),
+            tokenDelta: 900,
+            method: .dailyBuckets,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: nil
+        )
+        let intervals = [daily, zero, positive]
+
+        XCTAssertEqual(
+            accountTokenInterval(
+                at: Date(timeIntervalSince1970: 2_500),
+                in: intervals,
+                within: range
+            ),
+            positive
+        )
+        XCTAssertEqual(
+            accountTokenInterval(
+                at: Date(timeIntervalSince1970: 5_500),
+                in: intervals,
+                within: range
+            ),
+            zero
+        )
+        XCTAssertNil(accountTokenInterval(
+            at: Date(timeIntervalSince1970: 4_000),
+            in: intervals,
+            within: range
+        ))
+        XCTAssertNil(accountTokenInterval(
+            at: Date(timeIntervalSince1970: 9_000),
+            in: intervals,
+            within: range
+        ))
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: nil,
+                by: 1
+            ),
+            positive
+        )
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: positive,
+                by: 1
+            ),
+            zero
+        )
+        XCTAssertEqual(
+            steppedAccountTokenInterval(
+                in: intervals,
+                from: zero,
+                by: 1
+            ),
+            daily
+        )
+        XCTAssertEqual(
+            retainedAccountTokenInterval(
+                daily,
+                in: intervals,
+                range: range
+            ),
+            daily
+        )
+        XCTAssertNil(retainedAccountTokenInterval(
+            daily,
+            in: [positive, zero],
+            range: range
+        ))
+        XCTAssertNil(retainedAccountTokenInterval(
+            daily,
+            in: intervals,
+            range: DateInterval(start: range.start, end: daily.start)
+        ))
+        XCTAssertEqual(zero.method.displayName, "Lifetime counter interval")
+        XCTAssertEqual(daily.method.displayName, "UTC daily bucket")
+        XCTAssertTrue(
+            accountTokenIntervalAccessibilityValue(zero)
+                .contains("0 account tokens. Account.")
+        )
+        XCTAssertTrue(
+            accountTokenIntervalAccessibilityValue(daily)
+                .contains("UTC daily bucket")
+        )
+    }
+
+    func testSelectedTokenIntervalFormattingDoesNotChangeIdentity() throws {
+        let formatter = ISO8601DateFormatter()
+        let interval = AccountTokenActivityInterval(
+            start: try XCTUnwrap(formatter.date(from: "2026-07-01T00:00:00Z")),
+            end: try XCTUnwrap(formatter.date(from: "2026-07-02T00:00:00Z")),
+            tokenDelta: 900,
+            method: .dailyBuckets,
+            accountPartitionID: "account-a",
+            limitID: "weekly",
+            allowanceReset: nil
+        )
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let locale = Locale(identifier: "en_US_POSIX")
+        let dateInterval = DateInterval(start: interval.start, end: interval.end)
+
+        XCTAssertNotEqual(
+            accountTokenIntervalText(
+                dateInterval,
+                timeZone: utc,
+                locale: locale
+            ),
+            accountTokenIntervalText(
+                dateInterval,
+                timeZone: berlin,
+                locale: locale
+            )
+        )
+        XCTAssertEqual(interval.tokenDelta, 900)
+        XCTAssertEqual(interval.id, interval)
+    }
+
     func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
         let now = try date("2026-08-03T09:08:00Z")
         let latestObserved = now.addingTimeInterval(-6 * 3_600)

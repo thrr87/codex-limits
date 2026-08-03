@@ -1553,10 +1553,25 @@ func accountTokenIntervalText(
     return "\(formatter.string(from: interval.start))–\(formatter.string(from: interval.end))"
 }
 
+func accountTokenIntervalAccessibilityValue(
+    _ interval: AccountTokenActivityInterval,
+    timeZone: TimeZone = .autoupdatingCurrent,
+    locale: Locale = .autoupdatingCurrent
+) -> String {
+    let dates = accountTokenIntervalText(
+        DateInterval(start: interval.start, end: interval.end),
+        timeZone: timeZone,
+        locale: locale
+    )
+    return "\(interval.tokenDelta) account tokens. Account. \(dates). \(interval.method.displayName)."
+}
+
 private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
     let now: Date
+
+    @State private var selectedInterval: AccountTokenActivityInterval?
 
     private var currentWindowBounds: DateInterval? {
         reader.weeklyUsageRemaining.map {
@@ -1622,7 +1637,24 @@ private struct TokenActivityWorkspace: View {
                         reader.accountTokenActivity.intervals
                     )
                 }
+
+                intervalSelectionDetail
+                evidenceDetails
             }
+        }
+        .onChange(of: reader.accountTokenActivity.intervals) { _, intervals in
+            selectedInterval = retainedAccountTokenInterval(
+                selectedInterval,
+                in: intervals,
+                range: visibleRange
+            )
+        }
+        .onChange(of: visibleRange) { _, range in
+            selectedInterval = retainedAccountTokenInterval(
+                selectedInterval,
+                in: reader.accountTokenActivity.intervals,
+                range: range
+            )
         }
     }
 
@@ -1686,6 +1718,15 @@ private struct TokenActivityWorkspace: View {
                     .foregroundStyle(Color.blue)
                 }
             }
+
+            if let selectedInterval {
+                RuleMark(x: .value("Selected start", selectedInterval.start))
+                    .foregroundStyle(Color.primary.opacity(0.5))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                RuleMark(x: .value("Selected end", selectedInterval.end))
+                    .foregroundStyle(Color.primary.opacity(0.5))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
         }
         .chartXScale(domain: visibleRange.start ... visibleRange.end)
         .chartYAxis {
@@ -1700,6 +1741,23 @@ private struct TokenActivityWorkspace: View {
             }
         }
         .chartLegend(.hidden)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onEnded { value in
+                                selectInterval(
+                                    at: value.location,
+                                    proxy: proxy,
+                                    geometry: geometry
+                                )
+                            }
+                    )
+            }
+        }
         .frame(height: 180)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Account token activity")
@@ -1714,6 +1772,115 @@ private struct TokenActivityWorkspace: View {
         of interval: AccountTokenActivityInterval
     ) -> Date {
         interval.start.addingTimeInterval(interval.duration / 2)
+    }
+
+    private var intervalSelectionDetail: some View {
+        HStack(spacing: 10) {
+            if let selectedInterval {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Selected interval")
+                        .fontWeight(.semibold)
+                    Text("\(compactTokenCount(selectedInterval.tokenDelta)) tokens · Account")
+                        .monospacedDigit()
+                    Text(
+                        "\(accountTokenIntervalText(DateInterval(start: selectedInterval.start, end: selectedInterval.end))) · \(selectedInterval.method.displayName)"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    accountTokenIntervalAccessibilityValue(selectedInterval)
+                )
+            } else {
+                Text("Choose an observed interval for exact details.")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                moveIntervalSelection(by: -1)
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .accessibilityLabel("Previous interval")
+            Button {
+                moveIntervalSelection(by: 1)
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .accessibilityLabel("Next interval")
+        }
+        .font(.caption)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            .quaternary.opacity(0.7),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
+
+    private var evidenceDetails: some View {
+        DisclosureGroup("Evidence Details") {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Source · \(reader.accountTokenActivity.sourceDescription)")
+                if let observed = reader.accountTokenActivity.interval {
+                    Text("Observed Interval · \(accountTokenIntervalText(observed))")
+                }
+                if let method = selectedInterval?.method
+                    ?? reader.accountTokenActivity.method {
+                    Text("Method · \(method.displayName)")
+                }
+                ForEach(evidenceCaveats, id: \.self) { caveat in
+                    Text(caveat)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.top, 5)
+        }
+        .font(.caption)
+    }
+
+    private var evidenceCaveats: [String] {
+        var caveats: [String] = []
+        if reader.accountTokenActivity.state == .partial {
+            caveats.append(
+                "Only complete observed intervals inside the selected range are included."
+            )
+        }
+        if reader.accountTokenActivity.method == .dailyBuckets {
+            caveats.append(
+                "Lifetime intervals were unavailable; complete UTC daily buckets were used."
+            )
+        }
+        if !reader.accountTokenActivity.breaks.isEmpty {
+            caveats.append("Counter breaks remain empty on the chart.")
+        }
+        return caveats
+    }
+
+    private func moveIntervalSelection(by offset: Int) {
+        selectedInterval = steppedAccountTokenInterval(
+            in: reader.accountTokenActivity.intervals,
+            from: selectedInterval,
+            by: offset
+        )
+    }
+
+    private func selectInterval(
+        at location: CGPoint,
+        proxy: ChartProxy,
+        geometry: GeometryProxy
+    ) {
+        guard let date = chartDate(
+            at: location,
+            proxy: proxy,
+            geometry: geometry
+        ) else { return }
+        selectedInterval = accountTokenInterval(
+            at: date,
+            in: reader.accountTokenActivity.intervals,
+            within: visibleRange
+        )
     }
 }
 

@@ -73,6 +73,46 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
     }
 }
 
+func accountTokenInterval(
+    at date: Date,
+    in intervals: [AccountTokenActivityInterval],
+    within range: DateInterval
+) -> AccountTokenActivityInterval? {
+    intervals.first {
+        $0.start >= range.start
+            && $0.end <= range.end
+            && $0.start <= date
+            && date <= $0.end
+    }
+}
+
+func steppedAccountTokenInterval(
+    in intervals: [AccountTokenActivityInterval],
+    from selected: AccountTokenActivityInterval?,
+    by offset: Int
+) -> AccountTokenActivityInterval? {
+    let ordered = intervals.sorted {
+        $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
+    }
+    guard !ordered.isEmpty else { return nil }
+    guard let selected,
+          let index = ordered.firstIndex(of: selected) else {
+        return offset < 0 ? ordered.last : ordered.first
+    }
+    return ordered[min(max(index + offset, 0), ordered.count - 1)]
+}
+
+func retainedAccountTokenInterval(
+    _ selected: AccountTokenActivityInterval?,
+    in intervals: [AccountTokenActivityInterval],
+    range: DateInterval
+) -> AccountTokenActivityInterval? {
+    guard let selected,
+          selected.start >= range.start,
+          selected.end <= range.end else { return nil }
+    return intervals.first { $0 == selected }
+}
+
 struct WorkspaceFilters: Codable, Equatable, Sendable {
     var projectID: String?
     var taskTreeID: String?

@@ -361,6 +361,13 @@ enum AccountTokenActivityState: String, Equatable, Sendable {
 enum AccountTokenActivityMethod: String, Equatable, Hashable, Sendable {
     case lifetimeDelta
     case dailyBuckets
+
+    var displayName: String {
+        switch self {
+        case .lifetimeDelta: "Lifetime counter interval"
+        case .dailyBuckets: "UTC daily bucket"
+        }
+    }
 }
 
 struct AccountTokenActivityInterval: Equatable, Hashable, Identifiable, Sendable {
