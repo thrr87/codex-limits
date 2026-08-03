@@ -100,28 +100,31 @@ struct MenuContentView: View {
                 Task { await monitor.refresh() }
             }
         ) {
-            AnalyticsWorkspaceBody(
-                reader: monitor.readerSnapshot,
-                store: workspace,
-                assistedInsights: assistedInsights,
-                analyticsPreferencesChanged: {
-                    monitor.analyticsPreferencesDidChange(
-                        exploration: workspace.state,
-                        dispositions: workspace.insightDispositions
-                    )
-                },
-                resetReminderState: monitor.resetReminderState,
-                setResetReminderEnabled: { isEnabled in
-                    Task {
-                        await monitor.setResetReminderEnabled(isEnabled)
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                AnalyticsWorkspaceBody(
+                    reader: monitor.readerSnapshot,
+                    store: workspace,
+                    assistedInsights: assistedInsights,
+                    now: context.date,
+                    analyticsPreferencesChanged: {
+                        monitor.analyticsPreferencesDidChange(
+                            exploration: workspace.state,
+                            dispositions: workspace.insightDispositions
+                        )
+                    },
+                    resetReminderState: monitor.resetReminderState,
+                    setResetReminderEnabled: { isEnabled in
+                        Task {
+                            await monitor.setResetReminderEnabled(isEnabled)
+                        }
+                    },
+                    setResetReminderLeadTime: { leadTime in
+                        Task {
+                            await monitor.setResetReminderLeadTime(leadTime)
+                        }
                     }
-                },
-                setResetReminderLeadTime: { leadTime in
-                    Task {
-                        await monitor.setResetReminderLeadTime(leadTime)
-                    }
-                }
-            )
+                )
+            }
         }
     }
 
@@ -215,6 +218,7 @@ struct AnalyticsWorkspaceBody: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
     @ObservedObject var assistedInsights: CodexAssistedInsightStore
+    let now: Date
     let analyticsPreferencesChanged: () -> Void
     let resetReminderState: ResetReminderState
     let setResetReminderEnabled: (Bool) -> Void
@@ -224,6 +228,7 @@ struct AnalyticsWorkspaceBody: View {
         reader: UsageReaderSnapshot,
         store: AnalyticsWorkspaceStore,
         assistedInsights: CodexAssistedInsightStore,
+        now: Date = Date(),
         analyticsPreferencesChanged: @escaping () -> Void = {},
         resetReminderState: ResetReminderState = ResetReminderState(
             isEnabled: false,
@@ -237,6 +242,7 @@ struct AnalyticsWorkspaceBody: View {
         self.reader = reader
         self.store = store
         self.assistedInsights = assistedInsights
+        self.now = now
         self.analyticsPreferencesChanged = analyticsPreferencesChanged
         self.resetReminderState = resetReminderState
         self.setResetReminderEnabled = setResetReminderEnabled
@@ -248,7 +254,7 @@ struct AnalyticsWorkspaceBody: View {
         Group {
             switch store.state.section {
             case .graphs:
-                GraphsWorkspace(reader: reader, store: store)
+                GraphsWorkspace(reader: reader, store: store, now: now)
             case .facts:
                 FactsWorkspace(
                     reader: reader,
@@ -448,6 +454,7 @@ private struct HeaderFact: View {
 private struct GraphsWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    let now: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -457,8 +464,13 @@ private struct GraphsWorkspace: View {
             case .usageRemaining:
                 usageRemaining
             case .tokenActivity:
-                if canExploreHistoricalUsage {
-                    TokenActivityWorkspace(reader: reader, store: store)
+                if store.state.timeRange != .currentWindow
+                    || reader.weeklyUsageRemaining != nil {
+                    TokenActivityWorkspace(
+                        reader: reader,
+                        store: store,
+                        now: now
+                    )
                 } else {
                     unavailableCurrentWindow
                 }
@@ -547,7 +559,8 @@ private struct GraphsWorkspace: View {
                     window: weekly.window,
                     chart: reader.chart,
                     evidence: reader.evidence,
-                    store: store
+                    store: store,
+                    now: now
                 )
 
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
@@ -595,11 +608,6 @@ private struct GraphsWorkspace: View {
 
     private var historicalWeeklyUsageRemaining: LimitReading? {
         store.state.timeRange == .currentWindow ? nil : reader.account?.mainLimit
-    }
-
-    private var canExploreHistoricalUsage: Bool {
-        reader.weeklyUsageRemaining != nil
-            || historicalWeeklyUsageRemaining != nil
     }
 
     private var unavailableCurrentWindow: some View {
@@ -652,7 +660,7 @@ struct UsagePerTokenWorkspace: View {
         }
         return store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: snapshot.current?.interval.end ?? bounds.end
         )
     }
 
@@ -1183,7 +1191,10 @@ private struct ConcurrencyWorkspace: View {
     private var visibleRange: DateInterval {
         store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
         )
     }
 
@@ -1532,6 +1543,7 @@ private struct ConcurrencyWorkspace: View {
 private struct TokenActivityWorkspace: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
+    let now: Date
 
     @State private var selectedDay: TokenDay?
     private let day: TimeInterval = 86_400
@@ -1550,7 +1562,7 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var bounds: DateInterval {
-        let fallback = reader.fetchedAt ?? Date()
+        let fallback = reader.fetchedAt ?? now
         let first = accountDays.first?.date
             ?? currentWindowBounds?.start
             ?? fallback.addingTimeInterval(-day)
@@ -1559,7 +1571,7 @@ private struct TokenActivityWorkspace: View {
             ?? fallback
         return DateInterval(
             start: min(first, currentWindowBounds?.start ?? first),
-            end: max(last, currentWindowBounds?.end ?? last)
+            end: max(last, currentWindowBounds?.end ?? last, now)
         )
     }
 
@@ -1570,7 +1582,7 @@ private struct TokenActivityWorkspace: View {
         }
         return store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: now
         )
     }
 
@@ -1973,7 +1985,10 @@ private struct WorkspaceFilterMenu: View {
         let bounds = reader.usageReceipts.interval
         return store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
         )
     }
 
@@ -2055,6 +2070,7 @@ private struct UsageRemainingChart: View {
     let chart: UsageChartSnapshot
     let evidence: UsageEvidence
     @ObservedObject var store: AnalyticsWorkspaceStore
+    let now: Date
 
     @State private var selection: UsageChartSelection?
     @State private var pendingRange: DateInterval?
@@ -2066,7 +2082,11 @@ private struct UsageRemainingChart: View {
     }
 
     private var bounds: DateInterval {
-        chart.availableRange(including: currentWindowBounds)
+        let available = chart.availableRange(including: currentWindowBounds)
+        return DateInterval(
+            start: available.start,
+            end: max(available.end, now)
+        )
     }
 
     private var visibleRange: DateInterval {
@@ -2075,7 +2095,7 @@ private struct UsageRemainingChart: View {
         }
         return store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: now
         )
     }
 
@@ -2942,7 +2962,10 @@ private struct FactsWorkspace: View {
         let bounds = reader.usageReceipts.interval
         return store.effectiveRange(
             within: bounds,
-            now: Date()
+            now: min(
+                reader.localTokenActivity.observedAt ?? bounds.end,
+                bounds.end
+            )
         )
     }
 

@@ -579,7 +579,9 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     var otherLimits: [LimitReading] { account?.otherLimits ?? [] }
 
     var guidanceTitle: String {
-        guidance?.title ?? evidence.reason ?? "Not enough data"
+        guidance?.title
+            ?? (evidence.coverage == .notApplicable ? evidence.reason : nil)
+            ?? "Not enough data"
     }
 
     var guidanceMessage: String {
@@ -587,7 +589,9 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     }
 
     var suggestedPaceText: String {
-        guidance?.suggestedPace ?? evidence.reason ?? "Not enough data"
+        guidance?.suggestedPace
+            ?? (evidence.coverage == .notApplicable ? evidence.reason : nil)
+            ?? "Not enough data"
     }
 
     var evidenceText: String {
@@ -959,7 +963,7 @@ enum UsageIntelligenceEngine {
             selectedRange: DeterministicInsightInput.effectiveRange(
                 usagePerToken: usagePerToken,
                 observedInterval: observedInterval,
-                fetchedAt: input.account?.fetchedAt,
+                now: input.now,
                 exploration: input.analyticsExploration
             ),
             filters: input.analyticsExploration.filters
@@ -1516,7 +1520,7 @@ enum UsageIntelligenceEngine {
                 confidence: .unavailable,
                 reason: now >= window.resetsAt
                     ? "Current allowance window unavailable"
-                    : "Weekly window has not started",
+                    : "Current allowance window has not started",
                 policyVersion: CurrentUsagePolicy.version
             )
         }

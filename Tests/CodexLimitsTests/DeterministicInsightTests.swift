@@ -121,7 +121,7 @@ final class DeterministicInsightTests: XCTestCase {
                 DeterministicInsightInput.effectiveRange(
                     usagePerToken: usage,
                     observedInterval: nil,
-                    fetchedAt: current.interval.end,
+                    now: current.interval.end,
                     exploration: exploration
                 )
             )
@@ -131,6 +131,46 @@ final class DeterministicInsightTests: XCTestCase {
                 accuracy: 0.1
             )
         }
+    }
+
+    func testPresetInsightRangeEndsAtNowWhenEvidenceIsStale() throws {
+        let usage = insightInput(multiplier: 1.4).usagePerToken
+        let latestObserved = try XCTUnwrap(usage.current?.interval.end)
+        let now = latestObserved.addingTimeInterval(6 * 3_600)
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let resolved = try XCTUnwrap(
+            DeterministicInsightInput.effectiveRange(
+                usagePerToken: usage,
+                observedInterval: nil,
+                now: now,
+                exploration: exploration
+            )
+        )
+
+        XCTAssertEqual(resolved.start, now.addingTimeInterval(-86_400))
+        XCTAssertEqual(resolved.end, now)
+    }
+
+    func testSelectedInsightRangeKeepsEmptyTimeAfterStaleEvidence() throws {
+        let usage = insightInput(multiplier: 1.4).usagePerToken
+        let latestObserved = try XCTUnwrap(usage.current?.interval.end)
+        let now = latestObserved.addingTimeInterval(6 * 3_600)
+        let selected = DateInterval(start: latestObserved, end: now)
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .selected
+        exploration.visibleRange = selected
+
+        XCTAssertEqual(
+            DeterministicInsightInput.effectiveRange(
+                usagePerToken: usage,
+                observedInterval: nil,
+                now: now,
+                exploration: exploration
+            ),
+            selected
+        )
     }
 
     func testStaleLowCoverageAndUnavailableSourceWithholdConclusion() {

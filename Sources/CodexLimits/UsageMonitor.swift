@@ -918,7 +918,8 @@ final class UsageMonitor: ObservableObject {
     ) {
         let input = DeterministicInsightInput(
             reader: readerSnapshot,
-            exploration: exploration
+            exploration: exploration,
+            now: Date()
         )
         readerSnapshot.insights = DeterministicInsightEngine.evaluate(
             input,

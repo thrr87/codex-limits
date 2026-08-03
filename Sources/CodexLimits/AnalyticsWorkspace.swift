@@ -65,7 +65,7 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
         case .twelveWeeks:
             duration = 84 * 86_400
         }
-        let end = min(max(now, bounds.start), bounds.end)
+        let end = max(now, bounds.start)
         return DateInterval(
             start: max(bounds.start, end.addingTimeInterval(-duration)),
             end: end

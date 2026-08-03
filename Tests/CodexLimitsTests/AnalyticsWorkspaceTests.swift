@@ -282,7 +282,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         let latestObserved = now.addingTimeInterval(-6 * 3_600)
         let bounds = DateInterval(
             start: now.addingTimeInterval(-90 * 86_400),
-            end: now.addingTimeInterval(3_600)
+            end: latestObserved
         )
 
         for (range, duration) in [
@@ -1281,11 +1281,12 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         _ date: Date,
         timeZone: TimeZone
     ) -> String {
-        date.formatted(
-            Date.FormatStyle(date: .abbreviated, time: .shortened)
-                .locale(Locale(identifier: "en_US"))
-                .timeZone(timeZone)
-        )
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     private func renders<Content: View>(
