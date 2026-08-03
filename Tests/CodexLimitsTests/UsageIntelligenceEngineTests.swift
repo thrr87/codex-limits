@@ -73,7 +73,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(reader.accountTokenActivity.state, .partial)
         XCTAssertEqual(reader.accountTokenActivity.tokens, 600)
         XCTAssertEqual(reader.accountTokenActivity.method, .lifetimeDelta)
         XCTAssertEqual(
@@ -1232,7 +1232,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(reader.accountTokenActivity.state, .partial)
         XCTAssertEqual(
             reader.accountTokenActivity.interval,
             DateInterval(start: boundary.observedAt, end: observedAt)
@@ -1312,10 +1312,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                 )
             )
         )
-        XCTAssertEqual(
-            reader.accountTokenActivity.reason,
-            "Only complete daily token totals are available"
-        )
+        XCTAssertNil(reader.accountTokenActivity.reason)
     }
 
     func testAlignedCompleteDailyBucketsProduceExactAccountTokenActivity() throws {
@@ -1353,7 +1350,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(reader.accountTokenActivity.state, .exact)
+        XCTAssertEqual(reader.accountTokenActivity.state, .partial)
         XCTAssertEqual(reader.accountTokenActivity.tokens, 500)
         XCTAssertEqual(reader.accountTokenActivity.method, .dailyBuckets)
         XCTAssertEqual(
@@ -1402,8 +1399,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.accountTokenActivity.state, .unavailable)
         XCTAssertNil(reader.accountTokenActivity.tokens)
         XCTAssertEqual(
-            reader.accountTokenActivity.reason,
-            "Lifetime token counter decreased"
+            reader.accountTokenActivity.breaks.map(\.reason),
+            [.counterDecrease]
         )
     }
 
@@ -1443,8 +1440,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.accountTokenActivity.state, .unavailable)
         XCTAssertNil(reader.accountTokenActivity.tokens)
         XCTAssertEqual(
-            reader.accountTokenActivity.reason,
-            "Lifetime token reading is invalid"
+            reader.accountTokenActivity.breaks.map(\.reason),
+            [.invalidCounter]
         )
     }
 
@@ -2236,12 +2233,14 @@ final class UsageIntelligenceEngineTests: XCTestCase {
                     UsageSample(
                         observedAt: start,
                         remainingPercent: 100,
-                        resetsAt: reset
+                        resetsAt: reset,
+                        lifetimeTokens: 1_000
                     ),
                     UsageSample(
                         observedAt: latestObservation,
                         remainingPercent: 70,
-                        resetsAt: reset
+                        resetsAt: reset,
+                        lifetimeTokens: 1_300
                     )
                 ],
                 safetyBuffer: 3,
@@ -2256,7 +2255,108 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.chart.target.map(\.date), [start, reset])
         XCTAssertEqual(reader.chart.observed.map(\.date).max(), latestObservation)
         XCTAssertFalse(reader.chart.observed.contains { $0.date > latestObservation })
-        XCTAssertEqual(reader.accountTokenActivity.interval?.end, latestObservation)
+        XCTAssertEqual(
+            reader.accountTokenActivity.range,
+            DateInterval(start: start, end: reset)
+        )
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 300)
+        XCTAssertEqual(
+            reader.accountTokenActivity.interval,
+            DateInterval(start: start, end: latestObservation)
+        )
+        XCTAssertEqual(reader.accountTokenActivity.intervals.count, 1)
+        XCTAssertTrue(
+            reader.accountTokenActivity.currentWindowAccessibilityValue
+                .contains("300 account tokens so far")
+        )
+
+        let refreshedWithoutReading = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_000
+                    ),
+                    UsageSample(
+                        observedAt: latestObservation,
+                        remainingPercent: 70,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_300
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: latestObservation.addingTimeInterval(3_600),
+                previousStatus: nil
+            )
+        )
+        XCTAssertEqual(
+            refreshedWithoutReading.accountTokenActivity.intervals,
+            reader.accountTokenActivity.intervals
+        )
+    }
+
+    func testCurrentWindowDistinguishesZeroFromNoInterval() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let now = try date("2026-08-03T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "codex",
+                name: "Codex",
+                window: UsageWindow(
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: now
+        )
+        let first = UsageSample(
+            observedAt: start,
+            remainingPercent: 100,
+            resetsAt: reset,
+            lifetimeTokens: 1_000
+        )
+        let zero = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    first,
+                    UsageSample(
+                        observedAt: now,
+                        remainingPercent: 70,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_000
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).accountTokenActivity
+        let missing = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [first],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(zero.tokens, 0)
+        XCTAssertEqual(zero.intervals.first?.tokenDelta, 0)
+        XCTAssertNil(missing.tokens)
+        XCTAssertEqual(missing.reason, "No account readings in this range")
     }
 
     func testExpiredCurrentWindowIsUnavailableButKeepsHistoricalSamples() throws {
@@ -2302,6 +2402,11 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertTrue(reader.chart.allObserved.contains {
             $0.date == historicalObservation
         })
+        XCTAssertEqual(
+            reader.accountTokenActivity.reason,
+            "Current allowance window unavailable"
+        )
+        XCTAssertTrue(reader.accountTokenActivity.intervals.isEmpty)
     }
 
     func testQuietDenseHistoryLeavesRoomToUseMore() {

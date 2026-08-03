@@ -1606,6 +1606,11 @@ private struct TokenActivityWorkspace: View {
         )
     }
 
+    private var usesAccountIntervals: Bool {
+        store.state.timeRange == .oneDay
+            || store.state.timeRange == .currentWindow
+    }
+
     var body: some View {
         content(accountRange)
     }
@@ -1635,7 +1640,7 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
-                if store.state.timeRange == .oneDay {
+                if usesAccountIntervals {
                     if reader.accountTokenActivity.intervals.isEmpty {
                         WorkspaceMessage(
                             icon: "chart.xyaxis.line",
@@ -1666,7 +1671,7 @@ private struct TokenActivityWorkspace: View {
                     accountChart(range)
                 }
 
-                if store.state.timeRange != .oneDay {
+                if !usesAccountIntervals {
                     selectedPointDetail(range)
                 }
             }
@@ -1682,7 +1687,7 @@ private struct TokenActivityWorkspace: View {
 
     private var chartSourceLabel: some View {
         ChartLegendItem(
-            label: store.state.timeRange == .oneDay
+            label: usesAccountIntervals
                 ? "Observed intervals · Account"
                 : "Daily totals · Account",
             color: .blue
@@ -1746,17 +1751,11 @@ private struct TokenActivityWorkspace: View {
                 ? "Codex returned only part of this range"
                 : "Sum of \(range.completeDayCount) complete days"
         }
-        switch reader.accountTokenActivity.method {
-        case .lifetimeDelta:
-            return "Change between two account readings"
-        case .dailyBuckets:
-            return reader.accountTokenActivity.state == .partial
-                ? "Sum of complete days"
-                : "Complete daily totals"
-        case nil:
+        guard let observed = reader.accountTokenActivity.interval else {
             return reader.accountTokenActivity.reason
                 ?? "Account token activity is unavailable"
         }
+        return "Activity so far · Observed from \(accountTokenIntervalText(observed))"
     }
 
     private func renderedDays(
@@ -1875,7 +1874,11 @@ private struct TokenActivityWorkspace: View {
         .frame(height: 180)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Account token activity")
-        .accessibilityValue(reader.accountTokenActivity.accessibilityValue)
+        .accessibilityValue(
+            store.state.timeRange == .currentWindow
+                ? reader.accountTokenActivity.currentWindowAccessibilityValue
+                : reader.accountTokenActivity.accessibilityValue
+        )
     }
 
     private func midpoint(

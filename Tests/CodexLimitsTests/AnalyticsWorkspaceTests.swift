@@ -407,6 +407,78 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertEqual(summer.duration, 86_400)
     }
 
+    func testCurrentWindowTokenActivityExposesSoFarCopyAndRenders() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let now = try date("2026-08-03T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "weekly",
+                name: "Weekly",
+                window: UsageWindow(
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: now
+        )
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_000
+                    ),
+                    UsageSample(
+                        observedAt: now,
+                        remainingPercent: 70,
+                        resetsAt: reset,
+                        lifetimeTokens: 1_300
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        store.selectGraph(.tokenActivity)
+        store.selectTimeRange(.currentWindow)
+
+        XCTAssertEqual(reader.accountTokenActivity.tokens, 300)
+        XCTAssertTrue(
+            reader.accountTokenActivity.currentWindowAccessibilityValue
+                .contains("so far")
+        )
+        XCTAssertTrue(
+            reader.accountTokenActivity.currentWindowAccessibilityValue
+                .contains("after the latest account reading is empty")
+        )
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore(),
+                    now: now
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
     func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
         let now = try date("2026-08-03T09:08:00Z")
         let latestObserved = now.addingTimeInterval(-6 * 3_600)

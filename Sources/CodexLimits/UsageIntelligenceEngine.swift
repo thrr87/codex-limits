@@ -449,6 +449,13 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
         return "\(tokens) account tokens observed.\(zero) Time without an account reading is empty."
     }
 
+    var currentWindowAccessibilityValue: String {
+        guard let tokens else {
+            return reason ?? "No account readings in this range"
+        }
+        return "\(tokens) account tokens so far. Activity after the latest account reading is empty."
+    }
+
     var sourceDescription: String {
         switch method {
         case .lifetimeDelta: "Codex account summary"
@@ -818,15 +825,43 @@ enum UsageIntelligenceEngine {
             account: input.account,
             samples: currentSamples
         )
-        let accountTokenActivity = input.analyticsExploration.timeRange == .oneDay
-            ? rollingDayAccountTokenActivity(
+        let accountTokenActivity: AccountTokenActivitySnapshot
+        switch input.analyticsExploration.timeRange {
+        case .oneDay:
+            accountTokenActivity = selectedRangeAccountTokenActivity(
                 account: input.account,
                 samples: input.samples,
+                range: DateInterval(
+                    start: input.now.addingTimeInterval(-86_400),
+                    end: input.now
+                ),
                 now: input.now,
                 accountPartitionID: input.accountPartitionID,
                 accountEpochStartedAt: input.accountEpochStartedAt
             )
-            : weeklyAccountTokenActivity
+        case .currentWindow:
+            if let window = input.account?.mainLimit?.window,
+               window.startsAt <= input.now,
+               input.now < window.resetsAt {
+                accountTokenActivity = selectedRangeAccountTokenActivity(
+                    account: input.account,
+                    samples: input.samples,
+                    range: DateInterval(
+                        start: window.startsAt,
+                        end: window.resetsAt
+                    ),
+                    now: input.now,
+                    accountPartitionID: input.accountPartitionID,
+                    accountEpochStartedAt: input.accountEpochStartedAt
+                )
+            } else {
+                accountTokenActivity = .unavailable(
+                    "Current allowance window unavailable"
+                )
+            }
+        default:
+            accountTokenActivity = weeklyAccountTokenActivity
+        }
         let localTokenActivity: LocalTokenActivitySnapshot
         if let interval = tokenActivityInterval(
             account: input.account,
@@ -1287,18 +1322,27 @@ enum UsageIntelligenceEngine {
         )
     }
 
-    private static func rollingDayAccountTokenActivity(
+    private static func selectedRangeAccountTokenActivity(
         account: UsageSnapshot?,
         samples: [UsageSample],
+        range: DateInterval,
         now: Date,
         accountPartitionID: String?,
         accountEpochStartedAt: Date?
     ) -> AccountTokenActivitySnapshot {
-        let range = DateInterval(
-            start: now.addingTimeInterval(-86_400),
-            end: now
-        )
-        let readings = samples.filter { $0.observedAt <= now }.sorted {
+        var timeline = samples
+        if let account,
+           let window = account.mainLimit?.window,
+           let lifetimeTokens = account.accountFacts?.lifetimeTokens {
+            timeline.append(UsageSample(
+                observedAt: account.accountFacts?.lifetimeTokensObservedAt
+                    ?? account.fetchedAt,
+                remainingPercent: window.remainingPercent,
+                resetsAt: window.resetsAt,
+                lifetimeTokens: lifetimeTokens
+            ))
+        }
+        let readings = timeline.filter { $0.observedAt <= now }.sorted {
             if $0.observedAt != $1.observedAt {
                 return $0.observedAt < $1.observedAt
             }
@@ -1414,6 +1458,7 @@ enum UsageIntelligenceEngine {
                let fallback = dailyTokenActivity(
                     account: account,
                     range: range,
+                    now: now,
                     accountPartitionID: accountPartitionID
                ) {
                 return fallback
@@ -1450,6 +1495,7 @@ enum UsageIntelligenceEngine {
     private static func dailyTokenActivity(
         account: UsageSnapshot,
         range: DateInterval,
+        now: Date,
         accountPartitionID: String?
     ) -> AccountTokenActivitySnapshot? {
         let intervals = account.tokenHistory.compactMap {
@@ -1458,7 +1504,8 @@ enum UsageIntelligenceEngine {
             guard day.completeness == .complete,
                   day.tokens >= 0,
                   day.date >= range.start,
-                  end <= range.end else { return nil }
+                  end <= range.end,
+                  end <= now else { return nil }
             return AccountTokenActivityInterval(
                 start: day.date,
                 end: end,
