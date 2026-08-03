@@ -381,6 +381,189 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
+    func testSelectedRangeStaysFixedAfterRefresh() throws {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: try date("2026-08-02T08:15:00Z"),
+            end: try date("2026-08-02T14:45:00Z")
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: try date("2026-08-01T00:00:00Z"),
+                end: try date("2026-08-03T00:00:00Z")
+            )
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: DateInterval(
+                    start: try date("2026-08-01T00:00:00Z"),
+                    end: try date("2026-08-04T00:00:00Z")
+                ),
+                now: try date("2026-08-03T12:00:00Z")
+            ),
+            chosen
+        )
+    }
+
+    func testSelectedRangeIgnoresAdvancingNowAndPresetsClearIt() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let bounds = DateInterval(
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 20_000)
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(chosen, within: bounds)
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: bounds,
+                now: Date(timeIntervalSince1970: 15_000)
+            ),
+            chosen
+        )
+
+        store.selectTimeRange(.oneDay)
+        XCTAssertNil(store.state.visibleRange)
+        store.selectVisibleRange(chosen, within: bounds)
+        store.resetVisibleRange()
+        XCTAssertEqual(store.state.timeRange, .currentWindow)
+        XCTAssertNil(store.state.visibleRange)
+    }
+
+    func testSelectedRangeRestoresExactBoundaries() {
+        let suite = "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        AnalyticsWorkspaceStore(defaults: defaults).selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+
+        let restored = AnalyticsWorkspaceStore(defaults: defaults)
+        XCTAssertEqual(restored.state.timeRange, .selected)
+        XCTAssertEqual(restored.state.visibleRange, chosen)
+    }
+
+    func testSelectedRangeClampsOneSideWithoutMovingTheOther() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(
+                within: DateInterval(
+                    start: Date(timeIntervalSince1970: 4_000),
+                    end: Date(timeIntervalSince1970: 10_000)
+                ),
+                now: .now
+            ),
+            DateInterval(
+                start: Date(timeIntervalSince1970: 4_000),
+                end: Date(timeIntervalSince1970: 8_000)
+            )
+        )
+    }
+
+    func testSelectedRangeUsesBoundsWhenItNoLongerIntersects() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        store.selectVisibleRange(
+            chosen,
+            within: DateInterval(
+                start: Date(timeIntervalSince1970: 0),
+                end: Date(timeIntervalSince1970: 10_000)
+            )
+        )
+        let refreshedBounds = DateInterval(
+            start: Date(timeIntervalSince1970: 10_000),
+            end: Date(timeIntervalSince1970: 20_000)
+        )
+
+        XCTAssertEqual(
+            store.effectiveRange(within: refreshedBounds, now: .now),
+            refreshedBounds
+        )
+        XCTAssertEqual(store.state.visibleRange, chosen)
+    }
+
+    func testZoomInAndOutContinueFromSelectedRange() {
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        let bounds = DateInterval(
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 10_000)
+        )
+        let chosen = DateInterval(
+            start: Date(timeIntervalSince1970: 2_000),
+            end: Date(timeIntervalSince1970: 8_000)
+        )
+        let anchor = Date(timeIntervalSince1970: 5_000)
+        store.selectVisibleRange(chosen, within: bounds)
+        store.zoom(
+            factor: 2,
+            anchor: anchor,
+            currentRange: store.effectiveRange(within: bounds, now: .now),
+            within: bounds
+        )
+
+        let zoomed = DateInterval(
+            start: Date(timeIntervalSince1970: 3_500),
+            end: Date(timeIntervalSince1970: 6_500)
+        )
+        XCTAssertEqual(store.state.visibleRange, zoomed)
+
+        store.zoom(
+            factor: 0.5,
+            anchor: anchor,
+            currentRange: store.effectiveRange(within: bounds, now: .now),
+            within: bounds
+        )
+        XCTAssertEqual(store.state.visibleRange, chosen)
+    }
+
     func testZoomKeepsRangeInsideWindowAndAroundAnchor() {
         let bounds = DateInterval(
             start: Date(timeIntervalSince1970: 0),
