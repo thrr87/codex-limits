@@ -26,6 +26,7 @@ Codex Limits uses clear, direct English. These rules apply to every label, toolt
 - Do not claim that OpenAI changed a limit when the product only observed a change in intensity.
 - Describe a usage deviation in `Insights`; do not call it an anomaly or send an alert.
 - Use the weekly Codex window for the primary `Usage remaining`; name every other window.
+- Describe `Current window` as the active allowance frame, not as a promise of future observations.
 - Withhold a Low-confidence estimate and say what data is missing.
 - Do not call a partial sum of daily token buckets a weekly total.
 

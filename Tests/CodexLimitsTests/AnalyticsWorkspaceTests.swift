@@ -1166,6 +1166,71 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         }
     }
 
+    func testExpiredCurrentWindowRendersUnavailableAndHistoricalUsage() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let observedAt = try date("2026-08-03T12:13:00Z")
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: UsageSnapshot(
+                    mainLimit: LimitReading(
+                        limitId: "weekly",
+                        name: "Weekly",
+                        window: UsageWindow(
+                            remainingPercent: 70,
+                            resetsAt: reset,
+                            durationMinutes: 10_080
+                        )
+                    ),
+                    otherLimits: [],
+                    tokenHistory: [],
+                    emergencyResetCount: 0,
+                    fetchedAt: observedAt
+                ),
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: try date("2026-08-09T12:13:00Z"),
+                previousStatus: nil
+            )
+        )
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+
+        XCTAssertNil(reader.weeklyUsageRemaining)
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore()
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+
+        store.selectTimeRange(.fourWeeks)
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: reader,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore()
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
     func testUsagePerTokenComparisonRendersAtSmallAndLargeSizes() {
         let suiteName =
             "AnalyticsWorkspaceTests-usage-per-token-\(UUID().uuidString)"

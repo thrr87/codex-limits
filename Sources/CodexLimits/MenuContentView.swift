@@ -296,7 +296,7 @@ private struct WorkspaceHeader: View {
                     Text("% remaining")
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Weekly usage unavailable")
+                    Text(reader.evidence.reason ?? "Weekly usage unavailable")
                         .font(.headline)
                 }
 
@@ -457,7 +457,11 @@ private struct GraphsWorkspace: View {
             case .usageRemaining:
                 usageRemaining
             case .tokenActivity:
-                TokenActivityWorkspace(reader: reader, store: store)
+                if canExploreHistoricalUsage {
+                    TokenActivityWorkspace(reader: reader, store: store)
+                } else {
+                    unavailableCurrentWindow
+                }
             case .usagePerToken:
                 UsagePerTokenWorkspace(
                     sourceSnapshot: reader.usagePerToken,
@@ -536,7 +540,8 @@ private struct GraphsWorkspace: View {
 
     @ViewBuilder
     private var usageRemaining: some View {
-        if let weekly = reader.weeklyUsageRemaining {
+        if let weekly = reader.weeklyUsageRemaining
+            ?? historicalWeeklyUsageRemaining {
             VStack(alignment: .leading, spacing: 14) {
                 UsageRemainingChart(
                     window: weekly.window,
@@ -584,11 +589,24 @@ private struct GraphsWorkspace: View {
                 .font(.callout)
             }
         } else {
-            UnavailableGraph(
-                title: "Weekly usage unavailable",
-                message: "Try refreshing to check again."
-            )
+            unavailableCurrentWindow
         }
+    }
+
+    private var historicalWeeklyUsageRemaining: LimitReading? {
+        store.state.timeRange == .currentWindow ? nil : reader.account?.mainLimit
+    }
+
+    private var canExploreHistoricalUsage: Bool {
+        reader.weeklyUsageRemaining != nil
+            || historicalWeeklyUsageRemaining != nil
+    }
+
+    private var unavailableCurrentWindow: some View {
+        UnavailableGraph(
+            title: reader.evidence.reason ?? "Weekly usage unavailable",
+            message: "Try refreshing to check again."
+        )
     }
 }
 

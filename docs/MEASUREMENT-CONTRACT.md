@@ -26,6 +26,8 @@ The weekly Codex allowance is the primary allowance.
 
 Every allowance-derived metric carries the selected limit ID, duration, start, and reset time.
 
+`Current window` is the active 10,080-minute allowance frame from its start through its reset. It is not a promise of future observations: chart domains continue to reset while observed series end at their latest factual reading.
+
 ## Account Token Activity
 
 Account Token Activity is the primary weekly token total. Use the strongest available method in this order:

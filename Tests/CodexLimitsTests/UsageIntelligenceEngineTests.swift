@@ -1540,6 +1540,106 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertTrue(ended.chart.historicalProjection.isEmpty)
     }
 
+    func testCurrentWindowUsesFullAllowanceFrameAndStopsObservedSeries() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let latestObservation = try date("2026-08-03T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "codex",
+                name: "Codex",
+                window: UsageWindow(
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [
+                TokenDay(
+                    date: latestObservation.addingTimeInterval(-86_400),
+                    tokens: 1_000,
+                    completeness: .complete
+                )
+            ],
+            emergencyResetCount: 0,
+            fetchedAt: latestObservation
+        )
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: start,
+                        remainingPercent: 100,
+                        resetsAt: reset
+                    ),
+                    UsageSample(
+                        observedAt: latestObservation,
+                        remainingPercent: 70,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: latestObservation,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.interval?.startsAt, start)
+        XCTAssertEqual(reader.interval?.resetsAt, reset)
+        XCTAssertEqual(reader.chart.target.map(\.date), [start, reset])
+        XCTAssertEqual(reader.chart.observed.map(\.date).max(), latestObservation)
+        XCTAssertFalse(reader.chart.observed.contains { $0.date > latestObservation })
+        XCTAssertEqual(reader.accountTokenActivity.interval?.end, latestObservation)
+    }
+
+    func testExpiredCurrentWindowIsUnavailableButKeepsHistoricalSamples() throws {
+        let start = try date("2026-08-01T12:13:00Z")
+        let reset = try date("2026-08-08T12:13:00Z")
+        let historicalObservation = try date("2026-08-03T12:13:00Z")
+        let account = UsageSnapshot(
+            mainLimit: LimitReading(
+                limitId: "codex",
+                name: "Codex",
+                window: UsageWindow(
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    durationMinutes: 10_080
+                )
+            ),
+            otherLimits: [],
+            tokenHistory: [],
+            emergencyResetCount: 0,
+            fetchedAt: historicalObservation
+        )
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: historicalObservation,
+                        remainingPercent: 75,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: try date("2026-08-09T12:13:00Z"),
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertNil(reader.weeklyUsageRemaining)
+        XCTAssertNil(reader.interval)
+        XCTAssertEqual(reader.evidence.reason, "Current allowance window unavailable")
+        XCTAssertEqual(reader.guidanceTitle, "Current allowance window unavailable")
+        XCTAssertTrue(reader.chart.allObserved.contains {
+            $0.date == historicalObservation
+        })
+    }
+
     func testQuietDenseHistoryLeavesRoomToUseMore() {
         let now = Date(timeIntervalSince1970: 9_000_000)
         let account = makeSnapshot(remaining: 40, fetchedAt: now)
@@ -2183,6 +2283,10 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             fetchedAt: fetchedAt,
             accountFacts: accountFacts
         )
+    }
+
+    private func date(_ value: String) throws -> Date {
+        try XCTUnwrap(ISO8601DateFormatter().date(from: value))
     }
 
     private func timingFact(

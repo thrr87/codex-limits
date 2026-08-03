@@ -570,14 +570,16 @@ struct UsageReaderSnapshot: Equatable, Sendable {
 
     var fetchedAt: Date? { account?.fetchedAt }
 
-    var weeklyUsageRemaining: LimitReading? { account?.mainLimit }
+    var weeklyUsageRemaining: LimitReading? {
+        interval == nil ? nil : account?.mainLimit
+    }
 
     var accountFacts: AccountFacts? { account?.accountFacts }
 
     var otherLimits: [LimitReading] { account?.otherLimits ?? [] }
 
     var guidanceTitle: String {
-        guidance?.title ?? "Not enough data"
+        guidance?.title ?? evidence.reason ?? "Not enough data"
     }
 
     var guidanceMessage: String {
@@ -585,7 +587,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     }
 
     var suggestedPaceText: String {
-        guidance?.suggestedPace ?? "Not enough data"
+        guidance?.suggestedPace ?? evidence.reason ?? "Not enough data"
     }
 
     var evidenceText: String {
@@ -930,13 +932,18 @@ enum UsageIntelligenceEngine {
                     localHistory: localHistoryCache
                 )
             }
-        let observedInterval = input.account.flatMap { account in
-            account.mainLimit.map {
-                UsageObservedInterval(
-                    limitID: $0.limitId,
-                    durationMinutes: $0.window.durationMinutes,
-                    startsAt: $0.window.startsAt,
-                    resetsAt: $0.window.resetsAt
+        let observedInterval = input.account.flatMap {
+            account -> UsageObservedInterval? in
+            return account.mainLimit.flatMap { limit in
+                guard input.now >= limit.window.startsAt,
+                      input.now < limit.window.resetsAt else {
+                    return nil
+                }
+                return UsageObservedInterval(
+                    limitID: limit.limitId,
+                    durationMinutes: limit.window.durationMinutes,
+                    startsAt: limit.window.startsAt,
+                    resetsAt: limit.window.resetsAt
                 )
             }
         }
@@ -1507,7 +1514,9 @@ enum UsageIntelligenceEngine {
             return UsageEvidence(
                 coverage: .notApplicable,
                 confidence: .unavailable,
-                reason: "Weekly window ended",
+                reason: now >= window.resetsAt
+                    ? "Current allowance window unavailable"
+                    : "Weekly window has not started",
                 policyVersion: CurrentUsagePolicy.version
             )
         }
