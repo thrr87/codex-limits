@@ -1,5 +1,10 @@
 import Foundation
 
+struct RecentAccountMovement: Equatable, Sendable {
+    let latest: UsageSample
+    let percentPerDay: Double
+}
+
 enum ForecastEngine {
     static func evaluate(
         window: UsageWindow,
@@ -7,9 +12,16 @@ enum ForecastEngine {
         tokenHistory: [TokenDay],
         safetyBuffer: Double,
         now: Date,
-        previousStatus: PaceStatus?
+        previousStatus: PaceStatus?,
+        recentMovement: RecentAccountMovement? = nil
     ) -> Forecast {
-        let daysLeft = max(window.resetsAt.timeIntervalSince(now) / 86_400, 0)
+        let latestDate = recentMovement?.latest.observedAt ?? now
+        let latestRemaining = recentMovement?.latest.remainingPercent
+            ?? window.remainingPercent
+        let daysLeft = max(
+            window.resetsAt.timeIntervalSince(latestDate) / 86_400,
+            0
+        )
         let currentSamples = samples
             .filter { $0.resetsAt == window.resetsAt && $0.observedAt <= now }
             .sorted { $0.observedAt < $1.observedAt }
@@ -27,9 +39,10 @@ enum ForecastEngine {
             recentRate = windowRate
         }
 
-        let currentRate = currentIntervalSamples.count > 1
-            ? 0.7 * recentRate + 0.3 * windowRate
-            : windowRate
+        let currentRate = recentMovement?.percentPerDay
+            ?? (currentIntervalSamples.count > 1
+                ? 0.7 * recentRate + 0.3 * windowRate
+                : windowRate)
         let historicalRates = comparableHistoricalRates(
             samples: samples,
             excluding: window.resetsAt
@@ -49,11 +62,13 @@ enum ForecastEngine {
             historicalRate = median(Array(historicalRates.prefix(4)))
             historicalReferenceSource = .accountHistory
         }
-        let expectedRate = 0.75 * currentRate + 0.25 * historicalRate
+        let expectedRate = recentMovement == nil
+            ? 0.75 * currentRate + 0.25 * historicalRate
+            : currentRate
         let safetyRate = max(currentRate, historicalRate) * 1.2
-        let expected = max(window.remainingPercent - expectedRate * daysLeft, 0)
-        let safety = max(window.remainingPercent - safetyRate * daysLeft, 0)
-        let historical = max(window.remainingPercent - historicalRate * daysLeft, 0)
+        let expected = max(latestRemaining - expectedRate * daysLeft, 0)
+        let safety = max(latestRemaining - safetyRate * daysLeft, 0)
+        let historical = max(latestRemaining - historicalRate * daysLeft, 0)
         let historicalReference = historicalReferenceSource.map {
             UsageForecastReference(
                 source: $0,
@@ -62,7 +77,7 @@ enum ForecastEngine {
             )
         }
         let allowanceRate = daysLeft > 0
-            ? max(window.remainingPercent - safetyBuffer, 0) / daysLeft
+            ? max(latestRemaining - safetyBuffer, 0) / daysLeft
             : 0
         let recommended = historicalReferenceSource == .accountHistory
             ? min(allowanceRate, historicalRate * 1.2)

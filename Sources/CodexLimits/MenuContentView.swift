@@ -360,9 +360,6 @@ private struct WorkspaceHeader: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(isCompact ? 2 : 1)
-                    Text(reader.evidenceText)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
                 }
             }
         }
@@ -592,7 +589,7 @@ private struct GraphsWorkspace: View {
                     GridRow {
                         Text("Runway")
                             .foregroundStyle(.secondary)
-                        Text(reader.guidance?.runway.text ?? "Not enough data")
+                        Text(reader.runwayText)
                     }
                     if let gap = reader.guidance?.runway.gapText {
                         GridRow {

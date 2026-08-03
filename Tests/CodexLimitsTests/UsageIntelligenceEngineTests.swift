@@ -1890,7 +1890,10 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertNil(reader.guidance)
         XCTAssertTrue(reader.chart.currentProjection.isEmpty)
         XCTAssertTrue(reader.chart.historicalProjection.isEmpty)
-        XCTAssertEqual(reader.guidanceTitle, "Not enough data")
+        XCTAssertEqual(
+            reader.guidanceTitle,
+            "Couldn’t read Codex usage. Try refreshing again."
+        )
         XCTAssertEqual(
             reader.guidanceMessage,
             "Couldn’t read Codex usage. Try refreshing again."
@@ -1946,7 +1949,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.coverage, .low)
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Less than half of this weekly window is observed")
-        XCTAssertNil(reader.guidance)
+        XCTAssertNotNil(reader.guidance)
         XCTAssertFalse(reader.chart.currentProjection.isEmpty)
     }
 
@@ -1999,7 +2002,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
 
         XCTAssertEqual(reader.evidence.confidence, .low)
-        XCTAssertNil(reader.guidance)
+        XCTAssertNotNil(reader.guidance)
         XCTAssertEqual(reader.chart.currentProjection.count, 2)
         XCTAssertEqual(reader.chart.historicalProjection.count, 2)
         XCTAssertTrue(reader.chart.estimatedBackfill.isEmpty)
@@ -2140,7 +2143,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
-    func testUnknownCorrectionWithholdsGuidance() {
+    func testCorrectionRestoresGuidanceAfterSecondReading() {
         let now = Date(timeIntervalSince1970: 5_900_000)
         let account = makeSnapshot(remaining: 70, fetchedAt: now)
         var samples = denseSamples(
@@ -2170,7 +2173,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.coverage, .low)
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Unknown reset or correction")
-        XCTAssertNil(reader.guidance)
+        XCTAssertNotNil(reader.guidance)
         XCTAssertEqual(reader.chart.observedSegments.count, 2)
         XCTAssertEqual(reader.chart.observedSegments.flatMap { $0 }, reader.chart.observed)
     }
@@ -2274,7 +2277,10 @@ final class UsageIntelligenceEngineTests: XCTestCase {
 
         XCTAssertNil(reader.weeklyUsageRemaining)
         XCTAssertEqual(reader.evidence.coverage, .unavailable)
-        XCTAssertEqual(reader.evidence.reason, "Weekly usage unavailable")
+        XCTAssertEqual(
+            reader.evidence.reason,
+            "No current weekly allowance reading"
+        )
         XCTAssertNil(reader.guidance)
         XCTAssertTrue(reader.chart.observed.isEmpty)
     }
@@ -2439,6 +2445,349 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Not enough account history")
         XCTAssertNil(reader.guidance)
+        XCTAssertEqual(
+            reader.guidanceTitle,
+            "At least two compatible account readings are needed"
+        )
+    }
+
+    func testRecentMovementUsesTwoReadingsFromLessThanTwentyFourHours() throws {
+        let now = Date(timeIntervalSince1970: 6_005_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let first = UsageSample(
+            observedAt: now.addingTimeInterval(-6 * 3_600),
+            remainingPercent: 75,
+            resetsAt: account.mainLimit!.window.resetsAt
+        )
+
+        let reader = makeReader(account: account, samples: [first], now: now)
+        let forecast = try XCTUnwrap(reader.guidance?.forecast)
+
+        XCTAssertEqual(forecast.currentPercentPerDay, 20, accuracy: 0.000_001)
+        XCTAssertEqual(reader.chart.currentProjection.first?.date, now)
+        XCTAssertEqual(reader.chart.currentProjection.first?.remaining, 70)
+    }
+
+    func testRecentMovementUsesExactRollingDayAndExcludesOlderReadings() throws {
+        let now = Date(timeIntervalSince1970: 6_006_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let boundary = UsageSample(
+            observedAt: now.addingTimeInterval(-86_400),
+            remainingPercent: 90,
+            resetsAt: reset
+        )
+        let reader = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-25 * 3_600),
+                    remainingPercent: 100,
+                    resetsAt: reset
+                ),
+                boundary
+            ],
+            now: now
+        )
+        let forecast = try XCTUnwrap(reader.guidance?.forecast)
+
+        XCTAssertEqual(forecast.currentPercentPerDay, 20, accuracy: 0.000_001)
+    }
+
+    func testLongCompatibleIntervalIsFactualCurrentMovement() throws {
+        let now = Date(timeIntervalSince1970: 6_007_000)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let gap = 8 * 3_600 + 36 * 60
+        let reader = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-Double(gap)),
+                    remainingPercent: 80,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                )
+            ],
+            now: now
+        )
+        let forecast = try XCTUnwrap(reader.guidance?.forecast)
+
+        XCTAssertEqual(
+            forecast.currentPercentPerDay,
+            10 / (Double(gap) / 86_400),
+            accuracy: 0.000_001
+        )
+        XCTAssertNotNil(reader.guidance)
+        XCTAssertEqual(reader.chart.currentProjection.count, 2)
+    }
+
+    func testZeroRecentMovementLastsThroughResetAndProjectsFlat() throws {
+        let now = Date(timeIntervalSince1970: 6_008_000)
+        let account = makeSnapshot(remaining: 50, fetchedAt: now)
+        let reader = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-3_600),
+                    remainingPercent: 50,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                )
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(reader.guidance?.runway, .throughReset)
+        XCTAssertEqual(reader.runwayText, "Limit should last through reset")
+        XCTAssertEqual(reader.guidance?.forecast.currentPercentPerDay, 0)
+        XCTAssertEqual(
+            reader.chart.currentProjection.last,
+            UsageChartPoint(
+                date: account.mainLimit!.window.resetsAt,
+                remaining: 50
+            )
+        )
+    }
+
+    func testAllowanceBreaksNeedOneThenTwoNewReadings() {
+        let now = Date(timeIntervalSince1970: 6_009_000)
+        let account = makeSnapshot(
+            remaining: 70,
+            fetchedAt: now,
+            resetAfter: 7 * 86_400 - 4 * 3_600
+        )
+        let reset = account.mainLimit!.window.resetsAt
+        let previousReset = account.mainLimit!.window.startsAt
+
+        let afterResetWaiting = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: previousReset,
+                    remainingPercent: 40,
+                    resetsAt: previousReset
+                )
+            ],
+            now: now
+        )
+        let afterResetRestored = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: previousReset,
+                    remainingPercent: 40,
+                    resetsAt: previousReset
+                ),
+                UsageSample(
+                    observedAt: previousReset.addingTimeInterval(3_600),
+                    remainingPercent: 80,
+                    resetsAt: reset
+                )
+            ],
+            now: now
+        )
+        let afterCorrectionWaiting = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now,
+                    remainingPercent: 70,
+                    resetsAt: reset,
+                    comparisonBreak: true
+                )
+            ],
+            now: now
+        )
+        let afterCorrectionRestored = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-3_600),
+                    remainingPercent: 80,
+                    resetsAt: reset,
+                    comparisonBreak: true
+                )
+            ],
+            now: now
+        )
+        let afterIncreaseWaiting = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-3_600),
+                    remainingPercent: 50,
+                    resetsAt: reset
+                )
+            ],
+            now: now
+        )
+        let afterIncreaseRestored = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-2 * 3_600),
+                    remainingPercent: 50,
+                    resetsAt: reset
+                ),
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-3_600),
+                    remainingPercent: 80,
+                    resetsAt: reset
+                )
+            ],
+            now: now
+        )
+        let accountChanged = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountEpochStartedAt: now
+            )
+        )
+        let accountRecovered = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: now.addingTimeInterval(-3_600),
+                        remainingPercent: 80,
+                        resetsAt: reset,
+                        comparisonBreak: true
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountEpochStartedAt: now.addingTimeInterval(-3_600)
+            )
+        )
+
+        XCTAssertEqual(
+            afterResetWaiting.guidanceUnavailableReason,
+            "Waiting for a second account reading after reset or correction"
+        )
+        XCTAssertNotNil(afterResetRestored.guidance)
+        XCTAssertEqual(
+            afterCorrectionWaiting.guidanceUnavailableReason,
+            "Waiting for a second account reading after reset or correction"
+        )
+        XCTAssertNotNil(afterCorrectionRestored.guidance)
+        XCTAssertEqual(
+            afterIncreaseWaiting.guidanceUnavailableReason,
+            "Waiting for a second account reading after reset or correction"
+        )
+        XCTAssertNotNil(afterIncreaseRestored.guidance)
+        XCTAssertEqual(
+            accountChanged.guidanceUnavailableReason,
+            "Account changed — waiting for a second reading"
+        )
+        XCTAssertNotNil(accountRecovered.guidance)
+    }
+
+    func testRunwayAndCurrentEstimateSharePaceAndLatestReading() throws {
+        let now = Date(timeIntervalSince1970: 6_009_500)
+        let account = makeSnapshot(remaining: 20, fetchedAt: now)
+        let reader = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-12 * 3_600),
+                    remainingPercent: 80,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                )
+            ],
+            now: now
+        )
+        let forecast = try XCTUnwrap(reader.guidance?.forecast)
+        let firstProjection = try XCTUnwrap(reader.chart.currentProjection.first)
+        let lastProjection = try XCTUnwrap(reader.chart.currentProjection.last)
+        guard case let .exhausts(runwayEnd, _) = reader.guidance?.runway else {
+            return XCTFail("Expected current pace to exhaust the allowance")
+        }
+
+        XCTAssertEqual(firstProjection.date, account.fetchedAt)
+        XCTAssertEqual(firstProjection.remaining, 20)
+        XCTAssertEqual(forecast.currentPercentPerDay, 120, accuracy: 0.000_001)
+        XCTAssertEqual(lastProjection.date, runwayEnd)
+    }
+
+    func testRefreshFailureRecoversWithoutExtendingObservedFacts() {
+        let now = Date(timeIntervalSince1970: 6_009_750)
+        let fetchedAt = now.addingTimeInterval(-10 * 60)
+        let account = makeSnapshot(remaining: 70, fetchedAt: fetchedAt)
+        let samples = [
+            UsageSample(
+                observedAt: fetchedAt.addingTimeInterval(-3_600),
+                remainingPercent: 80,
+                resetsAt: account.mainLimit!.window.resetsAt
+            )
+        ]
+        let failed = makeReader(
+            account: account,
+            samples: samples,
+            sourceState: .failed("Account source failed"),
+            now: now
+        )
+        let recovered = makeReader(
+            account: account,
+            samples: samples,
+            now: now
+        )
+
+        XCTAssertNil(failed.guidance)
+        XCTAssertEqual(failed.guidanceTitle, "Account source failed")
+        XCTAssertEqual(failed.chart.observed.last?.date, fetchedAt)
+        XCTAssertTrue(failed.chart.currentProjection.isEmpty)
+        XCTAssertNil(failed.suggestedPacePercentPerDay)
+        XCTAssertNotNil(recovered.guidance)
+        XCTAssertFalse(recovered.chart.currentProjection.isEmpty)
+        XCTAssertNotNil(recovered.suggestedPacePercentPerDay)
+    }
+
+    func testProductionGapShapeStillProducesCurrentGuidance() throws {
+        let now = Date(timeIntervalSince1970: 6_009_900)
+        let account = makeSnapshot(remaining: 60, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let gapStart = now.addingTimeInterval(-(47 * 3_600 + 27 * 60))
+        let denseStart = gapStart.addingTimeInterval(8 * 3_600 + 36 * 60)
+        var samples = [
+            UsageSample(
+                observedAt: gapStart,
+                remainingPercent: 92,
+                resetsAt: reset
+            )
+        ]
+        samples += stride(
+            from: denseStart.timeIntervalSince1970,
+            to: now.timeIntervalSince1970,
+            by: 20 * 60
+        ).map { timestamp in
+            let progress = (timestamp - denseStart.timeIntervalSince1970)
+                / now.timeIntervalSince(denseStart)
+            return UsageSample(
+                observedAt: Date(timeIntervalSince1970: timestamp),
+                remainingPercent: 85 - 25 * progress,
+                resetsAt: reset
+            )
+        }
+        let maximumGap = zip(samples, samples.dropFirst())
+            .map { $1.observedAt.timeIntervalSince($0.observedAt) }
+            .max() ?? 0
+        let reader = makeReader(account: account, samples: samples, now: now)
+        let withoutHistory = makeReader(account: account, now: now)
+
+        XCTAssertGreaterThan(maximumGap, 6 * 3_600)
+        XCTAssertGreaterThan(now.timeIntervalSince(denseStart), 24 * 3_600)
+        XCTAssertNotNil(reader.guidance)
+        XCTAssertFalse(reader.chart.currentProjection.isEmpty)
+        XCTAssertEqual(
+            try XCTUnwrap(reader.suggestedPacePercentPerDay),
+            try XCTUnwrap(withoutHistory.suggestedPacePercentPerDay),
+            accuracy: 0.000_001
+        )
     }
 
     func testSuggestedPaceNeedsOnlyCurrentReadingAndUsesExactFractionalDay() throws {

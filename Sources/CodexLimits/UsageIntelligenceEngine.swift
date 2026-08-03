@@ -97,7 +97,7 @@ enum UsageRunway: Equatable, Sendable {
                     .locale(Locale(identifier: "en_US"))
             )
         case .throughReset:
-            "Through reset"
+            "Limit should last through reset"
         }
     }
 
@@ -646,6 +646,7 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let freshness: UsageFreshness
     let evidence: UsageEvidence
     let guidance: UsageGuidance?
+    let guidanceUnavailableReason: String?
     let suggestedPacePercentPerDay: Double?
     let suggestedPaceUnavailableReason: String?
     let chart: UsageChartSnapshot
@@ -673,12 +674,22 @@ struct UsageReaderSnapshot: Equatable, Sendable {
 
     var guidanceTitle: String {
         guidance?.title
+            ?? guidanceUnavailableReason
             ?? (evidence.coverage == .notApplicable ? evidence.reason : nil)
-            ?? "Not enough data"
+            ?? "Guidance unavailable"
     }
 
     var guidanceMessage: String {
-        guidance?.message ?? evidence.reason ?? "More account history is needed."
+        guidance?.message
+            ?? guidanceUnavailableReason
+            ?? evidence.reason
+            ?? "Guidance unavailable"
+    }
+
+    var runwayText: String {
+        guidance?.runway.text
+            ?? guidanceUnavailableReason
+            ?? "Guidance unavailable"
     }
 
     var suggestedPaceText: String {
@@ -725,6 +736,11 @@ private enum CurrentUsagePolicy {
     static let minimumCorrectionInterval: TimeInterval = 6 * 60 * 60
     static let highShare = 0.8
     static let partialShare = 0.5
+}
+
+private enum RecentMovementBreak {
+    case resetOrCorrection
+    case accountChange
 }
 
 enum UsageIntelligenceEngine {
@@ -774,20 +790,24 @@ enum UsageIntelligenceEngine {
             now: input.now,
             workloadMixChanged: workloadMixChanged
         )
-        let forecast: Forecast? = input.account.flatMap { account in
-            guard let weeklyLimit = account.mainLimit else { return nil }
-            guard case .available = input.sourceState,
-                  input.now >= weeklyLimit.window.startsAt,
-                  input.now < weeklyLimit.window.resetsAt else {
-                return nil
-            }
+        let recentMovement = recentAccountMovement(
+            account: input.account,
+            samples: input.samples,
+            sourceState: input.sourceState,
+            now: input.now,
+            accountEpochStartedAt: input.accountEpochStartedAt
+        )
+        let forecast: Forecast? = recentMovement.movement.flatMap { movement in
+            guard let account = input.account,
+                  let weeklyLimit = account.mainLimit else { return nil }
             return ForecastEngine.evaluate(
                 window: weeklyLimit.window,
                 samples: input.samples,
                 tokenHistory: account.tokenHistory,
                 safetyBuffer: input.safetyBuffer,
                 now: input.now,
-                previousStatus: input.previousStatus
+                previousStatus: input.previousStatus,
+                recentMovement: movement
             )
         }
         let suggestedPace = suggestedPace(
@@ -796,12 +816,11 @@ enum UsageIntelligenceEngine {
             safetyBuffer: input.safetyBuffer,
             now: input.now
         )
-        let guidance: UsageGuidance? = forecast.flatMap { forecast in
-            guard evidence.confidence == .high || evidence.confidence == .medium else {
-                return nil
-            }
-            guard let weeklyLimit = input.account?.mainLimit else { return nil }
-            return UsageGuidance(
+        let guidance: UsageGuidance?
+        if let forecast,
+           let movement = recentMovement.movement,
+           let weeklyLimit = input.account?.mainLimit {
+            guidance = UsageGuidance(
                 source: .derivedEstimate,
                 status: forecast.status,
                 title: title(for: forecast.status),
@@ -809,7 +828,7 @@ enum UsageIntelligenceEngine {
                     window: weeklyLimit.window,
                     forecast: forecast,
                     safetyBuffer: input.safetyBuffer,
-                    now: input.now
+                    movement: movement
                 ),
                 suggestedPace: suggestedPace.percentPerDay
                     .map(formattedSuggestedPace)
@@ -817,8 +836,7 @@ enum UsageIntelligenceEngine {
                     ?? "Weekly usage unavailable",
                 runway: runway(
                     window: weeklyLimit.window,
-                    forecast: forecast,
-                    now: input.now
+                    movement: movement
                 ),
                 remainingAtResetRange: evidence.confidence == .medium
                     ? estimateRange(forecast)
@@ -826,11 +844,14 @@ enum UsageIntelligenceEngine {
                 caveat: evidence.confidence == .medium ? evidence.reason : nil,
                 forecast: forecast
             )
+        } else {
+            guidance = nil
         }
         let chart = chart(
             account: input.account,
             samples: input.samples,
             forecast: forecast,
+            recentMovement: recentMovement.movement,
             safetyBuffer: input.safetyBuffer
         )
         let currentFreshness = freshness(
@@ -1118,6 +1139,7 @@ enum UsageIntelligenceEngine {
             freshness: currentFreshness,
             evidence: evidence,
             guidance: guidance,
+            guidanceUnavailableReason: recentMovement.reason,
             suggestedPacePercentPerDay: suggestedPace.percentPerDay,
             suggestedPaceUnavailableReason: suggestedPace.reason,
             chart: chart,
@@ -1653,6 +1675,7 @@ enum UsageIntelligenceEngine {
         account: UsageSnapshot?,
         samples: [UsageSample],
         forecast: Forecast?,
+        recentMovement: RecentAccountMovement?,
         safetyBuffer: Double
     ) -> UsageChartSnapshot {
         guard let account, let weeklyLimit = account.mainLimit else {
@@ -1675,7 +1698,7 @@ enum UsageIntelligenceEngine {
             account: account,
             samples: samples
         )
-        guard let forecast else {
+        guard let forecast, let recentMovement else {
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: target,
@@ -1706,7 +1729,7 @@ enum UsageIntelligenceEngine {
             UsageChartReferenceSeries(
                 source: $0.source,
                 points: projection(
-                    account: account,
+                    reading: recentMovement.latest,
                     window: window,
                     rate: $0.percentPerDay,
                     remainingAtReset: $0.remainingAtReset
@@ -1720,7 +1743,7 @@ enum UsageIntelligenceEngine {
             observedSource: .account,
             target: target,
             currentProjection: projection(
-                account: account,
+                reading: recentMovement.latest,
                 window: window,
                 rate: forecast.currentPercentPerDay,
                 remainingAtReset: forecast.expectedRemainingAtReset
@@ -1831,26 +1854,26 @@ enum UsageIntelligenceEngine {
     }
 
     private static func projection(
-        account: UsageSnapshot,
+        reading: UsageSample,
         window: UsageWindow,
         rate: Double,
         remainingAtReset: Double
     ) -> [UsageChartPoint] {
         let current = UsageChartPoint(
-            date: account.fetchedAt,
-            remaining: window.remainingPercent
+            date: reading.observedAt,
+            remaining: reading.remainingPercent
         )
         guard rate > 0 else {
             return [
                 current,
                 UsageChartPoint(
                     date: window.resetsAt,
-                    remaining: window.remainingPercent
+                    remaining: reading.remainingPercent
                 )
             ]
         }
-        let exhaustion = account.fetchedAt.addingTimeInterval(
-            window.remainingPercent / rate * 86_400
+        let exhaustion = reading.observedAt.addingTimeInterval(
+            reading.remainingPercent / rate * 86_400
         )
         let endpoint = exhaustion < window.resetsAt
             ? UsageChartPoint(date: exhaustion, remaining: 0)
@@ -1892,6 +1915,130 @@ enum UsageIntelligenceEngine {
             : .fresh
     }
 
+    private static func recentAccountMovement(
+        account: UsageSnapshot?,
+        samples: [UsageSample],
+        sourceState: UsageSourceState,
+        now: Date,
+        accountEpochStartedAt: Date?
+    ) -> (movement: RecentAccountMovement?, reason: String?) {
+        if case let .failed(message) = sourceState {
+            return (nil, message)
+        }
+        guard let account,
+              let window = account.mainLimit?.window,
+              window.isValid else {
+            return (nil, "No current weekly allowance reading")
+        }
+        guard now >= window.startsAt else {
+            return (nil, "Current allowance window has not started")
+        }
+        guard now < window.resetsAt else {
+            return (nil, "Current allowance window unavailable")
+        }
+
+        let current = UsageSample(
+            observedAt: account.fetchedAt,
+            remainingPercent: window.remainingPercent,
+            resetsAt: window.resetsAt,
+            comparisonBreak: accountEpochStartedAt == account.fetchedAt
+        )
+        let rollingStart = max(
+            now.addingTimeInterval(-86_400),
+            window.startsAt,
+            accountEpochStartedAt ?? .distantPast
+        )
+        let grouped = Dictionary(
+            grouping: (samples + [current]).filter {
+                $0.hasValidObservationMetadata
+                    && $0.observedAt >= rollingStart
+                    && $0.observedAt <= account.fetchedAt
+                    && $0.observedAt <= now
+            },
+            by: \.observedAt
+        )
+        var conflicts = Set<Date>()
+        let readings = grouped.compactMap { date, values -> UsageSample? in
+            let preferred = values.first {
+                date == current.observedAt
+                    && $0.remainingPercent == current.remainingPercent
+                    && $0.resetsAt == current.resetsAt
+            } ?? values.min {
+                if $0.resetsAt != $1.resetsAt {
+                    return $0.resetsAt < $1.resetsAt
+                }
+                return $0.remainingPercent < $1.remainingPercent
+            }
+            guard let preferred else { return nil }
+            if values.contains(where: {
+                $0.remainingPercent != preferred.remainingPercent
+                    || $0.resetsAt != preferred.resetsAt
+            }) {
+                conflicts.insert(date)
+            }
+            return UsageSample(
+                observedAt: preferred.observedAt,
+                remainingPercent: preferred.remainingPercent,
+                resetsAt: preferred.resetsAt,
+                lifetimeTokens: preferred.lifetimeTokens,
+                comparisonBreak: values.contains { $0.comparisonBreak }
+            )
+        }.sorted { $0.observedAt < $1.observedAt }
+
+        var segment: [UsageSample] = []
+        var latestBreak: RecentMovementBreak?
+        for reading in readings {
+            let accountChanged = reading.comparisonBreak
+                && accountEpochStartedAt == reading.observedAt
+            if conflicts.contains(reading.observedAt)
+                || reading.comparisonBreak
+                || segment.last.map({
+                    $0.resetsAt != reading.resetsAt
+                        || reading.remainingPercent
+                            > $0.remainingPercent
+                                + UsageHistoryPolicy.correctionTolerance
+                }) == true {
+                segment = [reading]
+                latestBreak = accountChanged ? .accountChange : .resetOrCorrection
+            } else {
+                segment.append(reading)
+            }
+        }
+
+        guard let first = segment.first,
+              let latest = segment.last,
+              segment.count >= 2,
+              latest.observedAt > first.observedAt else {
+            switch latestBreak {
+            case .accountChange:
+                return (nil, "Account changed — waiting for a second reading")
+            case .resetOrCorrection:
+                return (
+                    nil,
+                    "Waiting for a second account reading after reset or correction"
+                )
+            case nil:
+                return (nil, "At least two compatible account readings are needed")
+            }
+        }
+        let elapsedDays = latest.observedAt.timeIntervalSince(first.observedAt)
+            / 86_400
+        let percentPerDay = max(
+            (first.remainingPercent - latest.remainingPercent) / elapsedDays,
+            0
+        )
+        guard percentPerDay.isFinite else {
+            return (nil, "At least two compatible account readings are needed")
+        }
+        return (
+            RecentAccountMovement(
+                latest: latest,
+                percentPerDay: percentPerDay
+            ),
+            nil
+        )
+    }
+
     private static func evidence(
         account: UsageSnapshot?,
         samples: [UsageSample],
@@ -1903,7 +2050,7 @@ enum UsageIntelligenceEngine {
             return UsageEvidence(
                 coverage: .unavailable,
                 confidence: .unavailable,
-                reason: "Weekly usage unavailable",
+                reason: "No current weekly allowance reading",
                 policyVersion: CurrentUsagePolicy.version
             )
         }
@@ -2042,12 +2189,11 @@ enum UsageIntelligenceEngine {
 
     private static func runway(
         window: UsageWindow,
-        forecast: Forecast,
-        now: Date
+        movement: RecentAccountMovement
     ) -> UsageRunway {
-        guard forecast.currentPercentPerDay > 0 else { return .throughReset }
-        let exhaustsAt = now.addingTimeInterval(
-            window.remainingPercent / forecast.currentPercentPerDay * 86_400
+        guard movement.percentPerDay > 0 else { return .throughReset }
+        let exhaustsAt = movement.latest.observedAt.addingTimeInterval(
+            movement.latest.remainingPercent / movement.percentPerDay * 86_400
         )
         return exhaustsAt < window.resetsAt
             ? .exhausts(
@@ -2081,12 +2227,14 @@ enum UsageIntelligenceEngine {
         window: UsageWindow,
         forecast: Forecast,
         safetyBuffer: Double,
-        now: Date
+        movement: RecentAccountMovement
     ) -> String {
         switch forecast.status {
         case .slowDown:
-            let timeLeft = window.resetsAt.timeIntervalSince(now)
-            let timeToEmpty = window.remainingPercent
+            let timeLeft = window.resetsAt.timeIntervalSince(
+                movement.latest.observedAt
+            )
+            let timeToEmpty = movement.latest.remainingPercent
                 / max(forecast.safetyPercentPerDay, 0.01) * 86_400
             let early = max(timeLeft - timeToEmpty, 0)
             return early > 0
