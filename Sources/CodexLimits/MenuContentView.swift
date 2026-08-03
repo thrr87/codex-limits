@@ -634,7 +634,7 @@ struct UsagePerTokenWorkspace: View {
         }
         return store.effectiveRange(
             within: bounds,
-            endingAt: snapshot.current?.interval.end ?? bounds.end
+            now: Date()
         )
     }
 
@@ -1165,10 +1165,7 @@ private struct ConcurrencyWorkspace: View {
     private var visibleRange: DateInterval {
         store.effectiveRange(
             within: bounds,
-            endingAt: min(
-                reader.localTokenActivity.observedAt ?? bounds.end,
-                bounds.end
-            )
+            now: Date()
         )
     }
 
@@ -1555,10 +1552,7 @@ private struct TokenActivityWorkspace: View {
         }
         return store.effectiveRange(
             within: bounds,
-            endingAt: min(
-                reader.fetchedAt ?? bounds.end,
-                bounds.end
-            )
+            now: Date()
         )
     }
 
@@ -1961,10 +1955,7 @@ private struct WorkspaceFilterMenu: View {
         let bounds = reader.usageReceipts.interval
         return store.effectiveRange(
             within: bounds,
-            endingAt: min(
-                reader.localTokenActivity.observedAt ?? bounds.end,
-                bounds.end
-            )
+            now: Date()
         )
     }
 
@@ -2066,7 +2057,7 @@ private struct UsageRemainingChart: View {
         }
         return store.effectiveRange(
             within: bounds,
-            endingAt: chart.preferredZoomAnchor ?? min(Date(), bounds.end)
+            now: Date()
         )
     }
 
@@ -2933,10 +2924,7 @@ private struct FactsWorkspace: View {
         let bounds = reader.usageReceipts.interval
         return store.effectiveRange(
             within: bounds,
-            endingAt: min(
-                reader.localTokenActivity.observedAt ?? bounds.end,
-                bounds.end
-            )
+            now: Date()
         )
     }
 

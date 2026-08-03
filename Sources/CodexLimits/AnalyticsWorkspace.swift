@@ -50,7 +50,7 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
 
     func interval(
         within bounds: DateInterval,
-        endingAt proposedEnd: Date
+        now: Date
     ) -> DateInterval {
         let duration: TimeInterval
         switch self {
@@ -65,7 +65,7 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
         case .twelveWeeks:
             duration = 84 * 86_400
         }
-        let end = min(max(proposedEnd, bounds.start), bounds.end)
+        let end = min(max(now, bounds.start), bounds.end)
         return DateInterval(
             start: max(bounds.start, end.addingTimeInterval(-duration)),
             end: end
@@ -312,7 +312,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
 
     func effectiveRange(
         within bounds: DateInterval,
-        endingAt latestObserved: Date
+        now: Date
     ) -> DateInterval {
         if state.timeRange == .selected,
            let visibleRange = state.visibleRange,
@@ -321,7 +321,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
         }
         return state.timeRange.interval(
             within: bounds,
-            endingAt: latestObserved
+            now: now
         )
     }
 

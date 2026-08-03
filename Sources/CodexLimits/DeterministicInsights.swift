@@ -195,7 +195,7 @@ struct DeterministicInsightInput: Equatable, Sendable {
         }
         return exploration.timeRange.interval(
             within: bounds,
-            endingAt: fetchedAt ?? evidenceEnd ?? end
+            now: fetchedAt ?? evidenceEnd ?? end
         )
     }
 }

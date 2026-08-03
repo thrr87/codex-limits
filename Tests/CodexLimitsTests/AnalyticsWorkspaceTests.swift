@@ -277,30 +277,77 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertNil(reader.localTokenActivity.tokens)
     }
 
-    func testPresetRangeEndsAtLatestObservedTimeAndIsClampedToWindow() {
-        let end = Date(timeIntervalSince1970: 10 * 86_400)
+    func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
+        let now = try date("2026-08-03T09:08:00Z")
+        let latestObserved = now.addingTimeInterval(-6 * 3_600)
         let bounds = DateInterval(
-            start: end.addingTimeInterval(-7 * 86_400),
-            end: end
+            start: now.addingTimeInterval(-90 * 86_400),
+            end: now.addingTimeInterval(3_600)
         )
-        let latestObserved = end.addingTimeInterval(-5 * 86_400)
 
-        XCTAssertEqual(
-            AnalyticsTimeRange.oneDay.interval(
-                within: bounds,
-                endingAt: latestObserved
-            ),
-            DateInterval(
-                start: latestObserved.addingTimeInterval(-86_400),
-                end: latestObserved
-            )
+        for (range, duration) in [
+            (AnalyticsTimeRange.oneDay, 86_400.0),
+            (.threeDays, 259_200.0),
+            (.fourWeeks, 2_419_200.0),
+            (.twelveWeeks, 7_257_600.0)
+        ] {
+            let resolved = range.interval(within: bounds, now: now)
+            XCTAssertEqual(resolved.start, now.addingTimeInterval(-duration))
+            XCTAssertEqual(resolved.end, now)
+            XCTAssertEqual(resolved.duration, duration)
+        }
+        XCTAssertNotEqual(
+            AnalyticsTimeRange.oneDay.interval(within: bounds, now: now).end,
+            latestObserved
         )
         XCTAssertEqual(
             AnalyticsTimeRange.currentWindow.interval(
                 within: bounds,
-                endingAt: latestObserved
+                now: now
             ),
             bounds
+        )
+    }
+
+    func testRollingPresetDatesKeepElapsedDurationAcrossTimezonesAndDST() throws {
+        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
+        let losAngeles = try XCTUnwrap(
+            TimeZone(identifier: "America/Los_Angeles")
+        )
+
+        for now in [
+            try date("2026-03-29T10:08:00Z"),
+            try date("2026-10-25T11:08:00Z")
+        ] {
+            let interval = AnalyticsTimeRange.oneDay.interval(
+                within: DateInterval(
+                    start: now.addingTimeInterval(-2 * 86_400),
+                    end: now.addingTimeInterval(3_600)
+                ),
+                now: now
+            )
+            XCTAssertEqual(interval.start, now.addingTimeInterval(-86_400))
+            XCTAssertEqual(interval.end, now)
+            XCTAssertEqual(interval.duration, 86_400)
+            XCTAssertNotEqual(
+                boundaryLabel(interval.start, timeZone: berlin),
+                boundaryLabel(interval.end, timeZone: berlin)
+            )
+        }
+
+        let now = try date("2026-08-03T09:08:00Z")
+        let interval = AnalyticsTimeRange.oneDay.interval(
+            within: DateInterval(
+                start: now.addingTimeInterval(-2 * 86_400),
+                end: now.addingTimeInterval(3_600)
+            ),
+            now: now
+        )
+        XCTAssertEqual(interval.end, now)
+        XCTAssertEqual(interval.duration, 86_400)
+        XCTAssertNotEqual(
+            boundaryLabel(interval.end, timeZone: berlin),
+            boundaryLabel(interval.end, timeZone: losAngeles)
         )
     }
 
@@ -369,11 +416,11 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             start: Date(timeIntervalSince1970: 0),
             end: Date(timeIntervalSince1970: 200_000)
         )
-        let latestObserved = Date(timeIntervalSince1970: 150_000)
+        let now = Date(timeIntervalSince1970: 150_000)
         store.selectTimeRange(.oneDay)
         let visible = store.effectiveRange(
             within: bounds,
-            endingAt: latestObserved
+            now: now
         )
 
         store.zoom(
@@ -604,7 +651,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         store.selectTimeRange(.fourWeeks)
         XCTAssertEqual(
-            store.effectiveRange(within: bounds, endingAt: observedAt),
+            store.effectiveRange(within: bounds, now: observedAt),
             DateInterval(
                 start: observedAt.addingTimeInterval(-28 * 86_400),
                 end: observedAt
@@ -613,7 +660,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
 
         store.selectTimeRange(.twelveWeeks)
         XCTAssertEqual(
-            store.effectiveRange(within: bounds, endingAt: observedAt),
+            store.effectiveRange(within: bounds, now: observedAt),
             DateInterval(start: oldest, end: observedAt)
         )
     }
@@ -976,6 +1023,21 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 "Usage per token comparison did not render at \(size)"
             )
         }
+    }
+
+    private func date(_ value: String) throws -> Date {
+        try XCTUnwrap(ISO8601DateFormatter().date(from: value))
+    }
+
+    private func boundaryLabel(
+        _ date: Date,
+        timeZone: TimeZone
+    ) -> String {
+        date.formatted(
+            Date.FormatStyle(date: .abbreviated, time: .shortened)
+                .locale(Locale(identifier: "en_US"))
+                .timeZone(timeZone)
+        )
     }
 
     private func renders<Content: View>(
