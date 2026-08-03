@@ -369,11 +369,27 @@ struct AccountTokenActivityInterval: Equatable, Hashable, Identifiable, Sendable
     let tokenDelta: Int64
     let method: AccountTokenActivityMethod
     let accountPartitionID: String?
-    let limitID: String
+    let limitID: String?
     let allowanceReset: Date
 
     var id: Self { self }
     var duration: TimeInterval { end.timeIntervalSince(start) }
+}
+
+enum AccountTokenActivityBreakReason: String, Equatable, Hashable, Sendable {
+    case counterDecrease
+    case accountChange
+    case allowanceWindowChange
+    case conflictingObservation
+    case correction
+    case invalidCounter
+}
+
+struct AccountTokenActivityBreak: Equatable, Hashable, Identifiable, Sendable {
+    let timestamp: Date
+    let reason: AccountTokenActivityBreakReason
+
+    var id: Self { self }
 }
 
 struct AccountTokenActivitySnapshot: Equatable, Sendable {
@@ -384,6 +400,7 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
     let reason: String?
     let range: DateInterval?
     let intervals: [AccountTokenActivityInterval]
+    let breaks: [AccountTokenActivityBreak]
 
     init(
         state: AccountTokenActivityState,
@@ -392,7 +409,8 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
         interval: DateInterval?,
         reason: String?,
         range: DateInterval? = nil,
-        intervals: [AccountTokenActivityInterval] = []
+        intervals: [AccountTokenActivityInterval] = [],
+        breaks: [AccountTokenActivityBreak] = []
     ) {
         self.state = state
         self.tokens = tokens
@@ -401,12 +419,14 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
         self.reason = reason
         self.range = range
         self.intervals = intervals
+        self.breaks = breaks
     }
 
     static func unavailable(
         _ reason: String,
         interval: DateInterval? = nil,
-        range: DateInterval? = nil
+        range: DateInterval? = nil,
+        breaks: [AccountTokenActivityBreak] = []
     ) -> AccountTokenActivitySnapshot {
         AccountTokenActivitySnapshot(
             state: .unavailable,
@@ -414,7 +434,8 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
             method: nil,
             interval: interval,
             reason: reason,
-            range: range
+            range: range,
+            breaks: breaks
         )
     }
 
@@ -794,7 +815,8 @@ enum UsageIntelligenceEngine {
                 account: input.account,
                 samples: input.samples,
                 now: input.now,
-                accountPartitionID: input.accountPartitionID
+                accountPartitionID: input.accountPartitionID,
+                accountEpochStartedAt: input.accountEpochStartedAt
             )
             : weeklyAccountTokenActivity
         let localTokenActivity: LocalTokenActivitySnapshot
@@ -1261,22 +1283,14 @@ enum UsageIntelligenceEngine {
         account: UsageSnapshot?,
         samples: [UsageSample],
         now: Date,
-        accountPartitionID: String?
+        accountPartitionID: String?,
+        accountEpochStartedAt: Date?
     ) -> AccountTokenActivitySnapshot {
         let range = DateInterval(
             start: now.addingTimeInterval(-86_400),
             end: now
         )
-        guard let limit = account?.mainLimit else {
-            return .unavailable(
-                "No account readings in this range",
-                range: range
-            )
-        }
-        let readings = samples.filter {
-            $0.observedAt <= now
-                && ($0.lifetimeTokens ?? -1) >= 0
-        }.sorted {
+        let readings = samples.filter { $0.observedAt <= now }.sorted {
             if $0.observedAt != $1.observedAt {
                 return $0.observedAt < $1.observedAt
             }
@@ -1303,33 +1317,95 @@ enum UsageIntelligenceEngine {
             }
             unique.append(reading)
         }
-        let intervals = zip(unique, unique.dropFirst()).compactMap {
-            start, end -> AccountTokenActivityInterval? in
-            guard start.resetsAt == limit.window.resetsAt,
-                  end.resetsAt == start.resetsAt,
-                  let startTokens = start.lifetimeTokens,
-                  let endTokens = end.lifetimeTokens,
-                  end.observedAt > start.observedAt,
-                  endTokens >= startTokens,
-                  start.observedAt >= range.start,
-                  end.observedAt <= range.end else {
-                return nil
+        let conflictingTimestamps = Set(
+            Dictionary(grouping: unique, by: \.observedAt)
+                .compactMap { $0.value.count > 1 ? $0.key : nil }
+        )
+        var intervals: [AccountTokenActivityInterval] = []
+        var breaks: [AccountTokenActivityBreak] = []
+        var previous: UsageSample?
+        var sawEarlierEpoch = false
+
+        func recordBreak(
+            at timestamp: Date,
+            reason: AccountTokenActivityBreakReason
+        ) {
+            guard range.contains(timestamp) else { return }
+            let value = AccountTokenActivityBreak(
+                timestamp: timestamp,
+                reason: reason
+            )
+            if breaks.last != value { breaks.append(value) }
+        }
+
+        for reading in unique {
+            if let accountEpochStartedAt,
+               reading.observedAt < accountEpochStartedAt {
+                sawEarlierEpoch = true
+                previous = nil
+                continue
             }
-            return AccountTokenActivityInterval(
+            if sawEarlierEpoch, let accountEpochStartedAt {
+                recordBreak(at: accountEpochStartedAt, reason: .accountChange)
+                sawEarlierEpoch = false
+            }
+            if conflictingTimestamps.contains(reading.observedAt) {
+                recordBreak(
+                    at: reading.observedAt,
+                    reason: .conflictingObservation
+                )
+                previous = nil
+                continue
+            }
+            guard reading.isValid, reading.lifetimeTokens != nil else {
+                recordBreak(at: reading.observedAt, reason: .invalidCounter)
+                previous = nil
+                continue
+            }
+            if reading.comparisonBreak {
+                recordBreak(at: reading.observedAt, reason: .correction)
+                previous = reading
+                continue
+            }
+            guard let start = previous,
+                  let startTokens = start.lifetimeTokens,
+                  let endTokens = reading.lifetimeTokens else {
+                previous = reading
+                continue
+            }
+            defer { previous = reading }
+            guard reading.resetsAt == start.resetsAt else {
+                recordBreak(
+                    at: reading.observedAt,
+                    reason: .allowanceWindowChange
+                )
+                continue
+            }
+            guard endTokens >= startTokens else {
+                recordBreak(
+                    at: reading.observedAt,
+                    reason: .counterDecrease
+                )
+                continue
+            }
+            guard start.observedAt >= range.start,
+                  reading.observedAt <= range.end else { continue }
+            intervals.append(AccountTokenActivityInterval(
                 start: start.observedAt,
-                end: end.observedAt,
+                end: reading.observedAt,
                 tokenDelta: endTokens - startTokens,
                 method: .lifetimeDelta,
                 accountPartitionID: accountPartitionID,
-                limitID: limit.limitId,
-                allowanceReset: limit.window.resetsAt
-            )
+                limitID: account?.mainLimit?.limitId,
+                allowanceReset: reading.resetsAt
+            ))
         }
         guard let first = intervals.first,
               let last = intervals.last else {
             return .unavailable(
                 "No account readings in this range",
-                range: range
+                range: range,
+                breaks: breaks
             )
         }
         var total: Int64 = 0
@@ -1350,7 +1426,8 @@ enum UsageIntelligenceEngine {
             interval: DateInterval(start: first.start, end: last.end),
             reason: nil,
             range: range,
-            intervals: intervals
+            intervals: intervals,
+            breaks: breaks
         )
     }
 
