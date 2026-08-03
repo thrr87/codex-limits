@@ -83,6 +83,256 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertNil(reader.accountTokenActivity.reason)
     }
 
+    func testRollingDayUsesContainedLifetimeIntervals() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-6 * 3_600),
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: now.addingTimeInterval(-4 * 3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_200
+            ),
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 80,
+                resetsAt: reset,
+                lifetimeTokens: 1_500
+            )
+        ]
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let activity = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: readings,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                accountPartitionID: "account-a",
+                analyticsExploration: exploration
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(
+            activity.range,
+            DateInterval(
+                start: now.addingTimeInterval(-86_400),
+                end: now
+            )
+        )
+        XCTAssertEqual(activity.tokens, 500)
+        XCTAssertEqual(activity.method, .lifetimeDelta)
+        XCTAssertEqual(activity.intervals.map(\.tokenDelta), [200, 300])
+        XCTAssertEqual(
+            activity.interval,
+            DateInterval(
+                start: readings[0].observedAt,
+                end: readings[2].observedAt
+            )
+        )
+        XCTAssertNil(activity.reason)
+    }
+
+    func testRollingDayStaysAtNowWhenLatestReadingIsStale() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let observedAt = now.addingTimeInterval(-6 * 3_600)
+        let account = makeSnapshot(remaining: 80, fetchedAt: observedAt)
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: observedAt.addingTimeInterval(-4 * 3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: observedAt,
+                remainingPercent: 80,
+                resetsAt: reset,
+                lifetimeTokens: 1_300
+            )
+        ]
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let activity = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: readings,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                analyticsExploration: exploration
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(activity.range?.end, now)
+        XCTAssertEqual(activity.range?.duration, 86_400)
+        XCTAssertEqual(activity.tokens, 300)
+        XCTAssertEqual(activity.intervals.last?.end, observedAt)
+    }
+
+    func testRollingDayExcludesCrossingIntervalsAndIncludesExactBoundaries() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let start = now.addingTimeInterval(-86_400)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: start.addingTimeInterval(-60),
+                remainingPercent: 95,
+                resetsAt: reset,
+                lifetimeTokens: 900
+            ),
+            UsageSample(
+                observedAt: start,
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: start.addingTimeInterval(3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_200
+            ),
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 80,
+                resetsAt: reset,
+                lifetimeTokens: 1_500
+            )
+        ]
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let activity = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: readings,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                analyticsExploration: exploration
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(activity.tokens, 500)
+        XCTAssertEqual(activity.intervals.count, 2)
+        XCTAssertEqual(activity.intervals.first?.start, start)
+        XCTAssertEqual(activity.intervals.last?.end, now)
+    }
+
+    func testRollingDayKeepsLongAndZeroIntervalsFactual() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-23 * 3_600),
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: now.addingTimeInterval(-3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            )
+        ]
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let activity = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: readings,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                analyticsExploration: exploration
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(activity.tokens, 0)
+        XCTAssertEqual(activity.intervals.count, 1)
+        XCTAssertEqual(activity.intervals.first?.tokenDelta, 0)
+        XCTAssertEqual(activity.intervals.first?.duration, 22 * 3_600)
+    }
+
+    func testRollingDayNamesMissingCompleteIntervals() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let account = makeSnapshot(remaining: 80, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let onlyReading = UsageSample(
+            observedAt: now.addingTimeInterval(-3_600),
+            remainingPercent: 80,
+            resetsAt: reset,
+            lifetimeTokens: 1_000
+        )
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .oneDay
+
+        let beforeRange = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-30 * 3_600),
+                remainingPercent: 90,
+                resetsAt: reset,
+                lifetimeTokens: 800
+            ),
+            UsageSample(
+                observedAt: now.addingTimeInterval(-25 * 3_600),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 900
+            )
+        ]
+        let crossingEnd = [
+            onlyReading,
+            UsageSample(
+                observedAt: now.addingTimeInterval(60),
+                remainingPercent: 75,
+                resetsAt: reset,
+                lifetimeTokens: 1_100
+            )
+        ]
+
+        for samples in [[onlyReading], beforeRange, crossingEnd] {
+            let activity = UsageIntelligenceEngine.evaluate(
+                UsageIntelligenceInput(
+                    account: account,
+                    samples: samples,
+                    safetyBuffer: 3,
+                    sourceState: .available,
+                    now: now,
+                    previousStatus: nil,
+                    analyticsExploration: exploration
+                )
+            ).accountTokenActivity
+
+            XCTAssertNil(activity.tokens)
+            XCTAssertTrue(activity.intervals.isEmpty)
+            XCTAssertEqual(
+                activity.reason,
+                "No account readings in this range"
+            )
+        }
+    }
+
     func testReaderPublishesBoundedCurrentUsagePerTokenFacts() throws {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let account = makeSnapshot(

@@ -277,11 +277,98 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertNil(reader.localTokenActivity.tokens)
     }
 
+    func testRollingTokenActivityViewDistinguishesObservedZeroAndMissing() {
+        let now = Date(timeIntervalSince1970: 10 * 86_400)
+        let account = usageSnapshot(fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        var exploration = AnalyticsExplorationState.initial
+        exploration.graph = .tokenActivity
+        exploration.timeRange = .oneDay
+        let evaluate: ([UsageSample]) -> UsageReaderSnapshot = { samples in
+            UsageIntelligenceEngine.evaluate(
+                UsageIntelligenceInput(
+                    account: account,
+                    samples: samples,
+                    safetyBuffer: 3,
+                    sourceState: .available,
+                    now: now,
+                    previousStatus: nil,
+                    analyticsExploration: exploration
+                )
+            )
+        }
+        let first = UsageSample(
+            observedAt: now.addingTimeInterval(-6 * 3_600),
+            remainingPercent: 80,
+            resetsAt: reset,
+            lifetimeTokens: 1_000
+        )
+        let positive = evaluate([
+            first,
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 75,
+                resetsAt: reset,
+                lifetimeTokens: 1_300
+            )
+        ])
+        let zero = evaluate([
+            first,
+            UsageSample(
+                observedAt: now,
+                remainingPercent: 75,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            )
+        ])
+        let missing = evaluate([first])
+        let store = AnalyticsWorkspaceStore(
+            defaults: UserDefaults(
+                suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
+            )!
+        )
+        store.selectGraph(.tokenActivity)
+        store.selectTimeRange(.oneDay)
+
+        XCTAssertEqual(positive.accountTokenActivity.tokens, 300)
+        XCTAssertTrue(
+            positive.accountTokenActivity.accessibilityValue.contains(
+                "Time without an account reading is empty"
+            )
+        )
+        XCTAssertFalse(
+            positive.accountTokenActivity.accessibilityValue.contains(
+                "Coverage"
+            )
+        )
+        XCTAssertEqual(zero.accountTokenActivity.tokens, 0)
+        XCTAssertTrue(
+            zero.accountTokenActivity.accessibilityValue.contains(
+                "observed zero-token interval"
+            )
+        )
+        XCTAssertEqual(
+            missing.accountTokenActivity.accessibilityValue,
+            "No account readings in this range"
+        )
+        XCTAssertTrue(
+            renders(
+                AnalyticsWorkspaceBody(
+                    reader: positive,
+                    store: store,
+                    assistedInsights: CodexAssistedInsightStore(),
+                    now: now
+                ),
+                size: CGSize(width: 640, height: 780)
+            )
+        )
+    }
+
     func testRollingPresetsEndAtInjectedNowDespiteStaleObservation() throws {
         let now = try date("2026-08-03T09:08:00Z")
         let latestObserved = now.addingTimeInterval(-6 * 3_600)
         let bounds = DateInterval(
-            start: now.addingTimeInterval(-90 * 86_400),
+            start: now.addingTimeInterval(-12 * 3_600),
             end: latestObserved
         )
 

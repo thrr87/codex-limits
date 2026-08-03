@@ -358,9 +358,22 @@ enum AccountTokenActivityState: String, Equatable, Sendable {
     case unavailable
 }
 
-enum AccountTokenActivityMethod: String, Equatable, Sendable {
+enum AccountTokenActivityMethod: String, Equatable, Hashable, Sendable {
     case lifetimeDelta
     case dailyBuckets
+}
+
+struct AccountTokenActivityInterval: Equatable, Hashable, Identifiable, Sendable {
+    let start: Date
+    let end: Date
+    let tokenDelta: Int64
+    let method: AccountTokenActivityMethod
+    let accountPartitionID: String?
+    let limitID: String
+    let allowanceReset: Date
+
+    var id: Self { self }
+    var duration: TimeInterval { end.timeIntervalSince(start) }
 }
 
 struct AccountTokenActivitySnapshot: Equatable, Sendable {
@@ -369,18 +382,50 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
     let method: AccountTokenActivityMethod?
     let interval: DateInterval?
     let reason: String?
+    let range: DateInterval?
+    let intervals: [AccountTokenActivityInterval]
+
+    init(
+        state: AccountTokenActivityState,
+        tokens: Int64?,
+        method: AccountTokenActivityMethod?,
+        interval: DateInterval?,
+        reason: String?,
+        range: DateInterval? = nil,
+        intervals: [AccountTokenActivityInterval] = []
+    ) {
+        self.state = state
+        self.tokens = tokens
+        self.method = method
+        self.interval = interval
+        self.reason = reason
+        self.range = range
+        self.intervals = intervals
+    }
 
     static func unavailable(
         _ reason: String,
-        interval: DateInterval? = nil
+        interval: DateInterval? = nil,
+        range: DateInterval? = nil
     ) -> AccountTokenActivitySnapshot {
         AccountTokenActivitySnapshot(
             state: .unavailable,
             tokens: nil,
             method: nil,
             interval: interval,
-            reason: reason
+            reason: reason,
+            range: range
         )
+    }
+
+    var accessibilityValue: String {
+        guard let tokens else {
+            return reason ?? "No account readings in this range"
+        }
+        let zero = intervals.contains { $0.tokenDelta == 0 }
+            ? " Includes an observed zero-token interval."
+            : ""
+        return "\(tokens) account tokens observed.\(zero) Time without an account reading is empty."
     }
 }
 
@@ -740,14 +785,22 @@ enum UsageIntelligenceEngine {
             sourceState: input.sourceState,
             now: input.now
         )
-        let accountTokenActivity = accountTokenActivity(
+        let weeklyAccountTokenActivity = accountTokenActivity(
             account: input.account,
             samples: currentSamples
         )
+        let accountTokenActivity = input.analyticsExploration.timeRange == .oneDay
+            ? rollingDayAccountTokenActivity(
+                account: input.account,
+                samples: input.samples,
+                now: input.now,
+                accountPartitionID: input.accountPartitionID
+            )
+            : weeklyAccountTokenActivity
         let localTokenActivity: LocalTokenActivitySnapshot
         if let interval = tokenActivityInterval(
             account: input.account,
-            accountActivity: accountTokenActivity,
+            accountActivity: weeklyAccountTokenActivity,
             accountEpochStartedAt: input.accountEpochStartedAt
         ) {
             if let cached = reusableLocalAggregates?.localTokenActivity,
@@ -1201,6 +1254,89 @@ enum UsageIntelligenceEngine {
             account.accountFacts?.lifetimeTokens == nil
                 ? "Lifetime token readings are unavailable"
                 : "No lifetime token reading at the weekly boundary"
+        )
+    }
+
+    private static func rollingDayAccountTokenActivity(
+        account: UsageSnapshot?,
+        samples: [UsageSample],
+        now: Date,
+        accountPartitionID: String?
+    ) -> AccountTokenActivitySnapshot {
+        let range = DateInterval(
+            start: now.addingTimeInterval(-86_400),
+            end: now
+        )
+        guard let limit = account?.mainLimit else {
+            return .unavailable(
+                "No account readings in this range",
+                range: range
+            )
+        }
+        let readings = samples.compactMap { sample -> (Date, Int64)? in
+            guard sample.resetsAt == limit.window.resetsAt,
+                  sample.observedAt <= now,
+                  let tokens = sample.lifetimeTokens,
+                  tokens >= 0 else {
+                return nil
+            }
+            return (sample.observedAt, tokens)
+        }.sorted {
+            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
+        }
+        var unique: [(Date, Int64)] = []
+        for reading in readings {
+            if let last = unique.last,
+               last.0 == reading.0,
+               last.1 == reading.1 {
+                continue
+            }
+            unique.append(reading)
+        }
+        let intervals = zip(unique, unique.dropFirst()).compactMap {
+            start, end -> AccountTokenActivityInterval? in
+            guard end.0 > start.0,
+                  end.1 >= start.1,
+                  start.0 >= range.start,
+                  end.0 <= range.end else {
+                return nil
+            }
+            return AccountTokenActivityInterval(
+                start: start.0,
+                end: end.0,
+                tokenDelta: end.1 - start.1,
+                method: .lifetimeDelta,
+                accountPartitionID: accountPartitionID,
+                limitID: limit.limitId,
+                allowanceReset: limit.window.resetsAt
+            )
+        }
+        guard let first = intervals.first,
+              let last = intervals.last else {
+            return .unavailable(
+                "No account readings in this range",
+                range: range
+            )
+        }
+        var total: Int64 = 0
+        for interval in intervals {
+            let sum = total.addingReportingOverflow(interval.tokenDelta)
+            guard !sum.overflow else {
+                return .unavailable(
+                    "Lifetime token reading is invalid",
+                    range: range
+                )
+            }
+            total = sum.partialValue
+        }
+        return AccountTokenActivitySnapshot(
+            state: .partial,
+            tokens: total,
+            method: .lifetimeDelta,
+            interval: DateInterval(start: first.start, end: last.end),
+            reason: nil,
+            range: range,
+            intervals: intervals
         )
     }
 

@@ -67,7 +67,7 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
         }
         let end = max(now, bounds.start)
         return DateInterval(
-            start: max(bounds.start, end.addingTimeInterval(-duration)),
+            start: end.addingTimeInterval(-duration),
             end: end
         )
     }

@@ -1602,7 +1602,7 @@ private struct TokenActivityWorkspace: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Token activity")
                     .font(.title3.weight(.semibold))
-                Text("Daily token totals from your Codex account.")
+                Text("Observed token activity from your Codex account.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
@@ -1622,7 +1622,23 @@ private struct TokenActivityWorkspace: View {
                     }
                 }
 
-                if range.days.isEmpty {
+                if store.state.timeRange == .oneDay {
+                    if reader.accountTokenActivity.intervals.isEmpty {
+                        WorkspaceMessage(
+                            icon: "chart.xyaxis.line",
+                            title: reader.accountTokenActivity.reason
+                                ?? "No account readings in this range",
+                            message: "Missing time remains empty."
+                        ) {
+                            EmptyView()
+                        }
+                        .frame(minHeight: 170)
+                    } else {
+                        accountIntervalChart(
+                            reader.accountTokenActivity.intervals
+                        )
+                    }
+                } else if range.days.isEmpty {
                     WorkspaceMessage(
                         icon: "chart.xyaxis.line",
                         title: "No complete daily totals",
@@ -1637,7 +1653,9 @@ private struct TokenActivityWorkspace: View {
                     accountChart(range)
                 }
 
-                selectedPointDetail(range)
+                if store.state.timeRange != .oneDay {
+                    selectedPointDetail(range)
+                }
             }
         }
         .onChange(of: visibleRange) { _, range in
@@ -1651,7 +1669,9 @@ private struct TokenActivityWorkspace: View {
 
     private var chartSourceLabel: some View {
         ChartLegendItem(
-            label: "Daily totals · Account",
+            label: store.state.timeRange == .oneDay
+                ? "Observed intervals · Account"
+                : "Daily totals · Account",
             color: .blue
         )
     }
@@ -1667,13 +1687,14 @@ private struct TokenActivityWorkspace: View {
     ) -> some View {
         TokenSourceCard(
             title: "Account",
-            source: store.state.timeRange == .currentWindow
+            source: store.state.timeRange == .oneDay
+                ? accountSource
+                : store.state.timeRange == .currentWindow
                 ? accountSource
                 : "Codex daily token totals",
             value: summaryTokens(in: range).map(compactTokenCount)
                 ?? "Not available",
             detail: summaryDetail(in: range),
-            coverage: summaryCoverage(in: range),
             freshness: reader.fetchedAt,
             freshnessLabel: "Updated",
             color: .blue
@@ -1694,7 +1715,8 @@ private struct TokenActivityWorkspace: View {
     private func summaryTokens(
         in range: AccountTokenActivityRange
     ) -> Int64? {
-        if store.state.timeRange == .currentWindow {
+        if store.state.timeRange == .oneDay
+            || store.state.timeRange == .currentWindow {
             return reader.accountTokenActivity.tokens
         }
         return range.completeTokens
@@ -1703,6 +1725,13 @@ private struct TokenActivityWorkspace: View {
     private func summaryDetail(
         in range: AccountTokenActivityRange
     ) -> String {
+        if store.state.timeRange == .oneDay {
+            guard let observed = reader.accountTokenActivity.interval else {
+                return reader.accountTokenActivity.reason
+                    ?? "No account readings in this range"
+            }
+            return "Observed from \(intervalText(observed))"
+        }
         guard store.state.timeRange == .currentWindow else {
             if range.completeDayCount == 0 {
                 return "No full days in this range"
@@ -1721,21 +1750,6 @@ private struct TokenActivityWorkspace: View {
         case nil:
             return reader.accountTokenActivity.reason
                 ?? "Account token activity is unavailable"
-        }
-    }
-
-    private func summaryCoverage(
-        in range: AccountTokenActivityRange
-    ) -> String {
-        guard store.state.timeRange == .currentWindow else {
-            return range.completeTokens == nil
-                ? "Unavailable"
-                : "Complete days"
-        }
-        switch reader.accountTokenActivity.state {
-        case .exact: return "Complete"
-        case .partial: return "Partial"
-        case .unavailable: return "Unavailable"
         }
     }
 
@@ -1813,6 +1827,55 @@ private struct TokenActivityWorkspace: View {
         .accessibilityHint(
             "Use Previous point and Next point for exact values."
         )
+    }
+
+    private func accountIntervalChart(
+        _ intervals: [AccountTokenActivityInterval]
+    ) -> some View {
+        Chart {
+            ForEach(intervals) { interval in
+                if interval.tokenDelta == 0 {
+                    PointMark(
+                        x: .value("Observed interval", midpoint(of: interval)),
+                        y: .value("Account tokens", 0)
+                    )
+                    .foregroundStyle(Color.blue)
+                    .symbol(.diamond)
+                    .symbolSize(55)
+                } else {
+                    RectangleMark(
+                        xStart: .value("Start", interval.start),
+                        xEnd: .value("End", interval.end),
+                        yStart: .value("Baseline", 0),
+                        yEnd: .value("Account tokens", interval.tokenDelta)
+                    )
+                    .foregroundStyle(Color.blue)
+                }
+            }
+        }
+        .chartXScale(domain: visibleRange.start ... visibleRange.end)
+        .chartYAxis {
+            AxisMarks(position: .leading) { value in
+                AxisGridLine()
+                    .foregroundStyle(Color.secondary.opacity(0.16))
+                AxisValueLabel {
+                    if let tokens = value.as(Int64.self) {
+                        Text(compactTokenCount(tokens))
+                    }
+                }
+            }
+        }
+        .chartLegend(.hidden)
+        .frame(height: 180)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Account token activity")
+        .accessibilityValue(reader.accountTokenActivity.accessibilityValue)
+    }
+
+    private func midpoint(
+        of interval: AccountTokenActivityInterval
+    ) -> Date {
+        interval.start.addingTimeInterval(interval.duration / 2)
     }
 
     @ViewBuilder
@@ -1927,7 +1990,6 @@ private struct TokenSourceCard: View {
     let source: String
     let value: String
     let detail: String
-    let coverage: String
     let freshness: Date?
     let freshnessLabel: String
     let color: Color
@@ -1949,17 +2011,14 @@ private struct TokenSourceCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
-            HStack(spacing: 12) {
-                Text("Coverage \(coverage)")
-                if let freshness {
-                    Text(freshnessLabel + " " + freshness.formatted(
-                        date: .abbreviated,
-                        time: .shortened
-                    ))
-                }
+            if let freshness {
+                Text(freshnessLabel + " " + freshness.formatted(
+                    date: .abbreviated,
+                    time: .shortened
+                ))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 155, alignment: .topLeading)
@@ -1972,7 +2031,7 @@ private struct TokenSourceCard: View {
                 .stroke(color.opacity(0.16))
         }
         .help(
-            "\(title), \(source). \(value) tokens. Coverage \(coverage). \(detail)"
+            "\(title), \(source). \(value) tokens. \(detail)"
         )
     }
 }
