@@ -65,7 +65,11 @@ enum ForecastEngine {
         let expectedRate = recentMovement == nil
             ? 0.75 * currentRate + 0.25 * historicalRate
             : currentRate
-        let safetyRate = max(currentRate, historicalRate) * 1.2
+        let safetyRate = (
+            recentMovement == nil
+                ? max(currentRate, historicalRate)
+                : currentRate
+        ) * 1.2
         let expected = max(latestRemaining - expectedRate * daysLeft, 0)
         let safety = max(latestRemaining - safetyRate * daysLeft, 0)
         let historical = max(latestRemaining - historicalRate * daysLeft, 0)

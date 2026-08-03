@@ -2547,6 +2547,65 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    func testZeroRecentMovementKeepsPrimaryGuidanceConsistentWithFastHistory() {
+        let day: TimeInterval = 86_400
+        let now = Date(timeIntervalSince1970: 6_008_500)
+        let account = makeSnapshot(
+            remaining: 50,
+            fetchedAt: now,
+            tokenHistory: (-33 ... -6).map {
+                TokenDay(
+                    date: now.addingTimeInterval(Double($0) * day),
+                    tokens: 400
+                )
+            } + (-5 ... -1).map {
+                TokenDay(
+                    date: now.addingTimeInterval(Double($0) * day),
+                    tokens: 100
+                )
+            }
+        )
+        let reader = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: now.addingTimeInterval(-3_600),
+                    remainingPercent: 50,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                )
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(reader.guidance?.forecast.currentPercentPerDay, 0)
+        XCTAssertEqual(reader.guidance?.status, .roomToUseMore)
+        XCTAssertEqual(reader.guidance?.runway, .throughReset)
+        XCTAssertEqual(
+            reader.chart.currentProjection.last?.remaining,
+            50
+        )
+    }
+
+    func testPastEstimateRemainsWhenCurrentMovementNeedsAnotherReading() {
+        let now = Date(timeIntervalSince1970: 6_008_750)
+        let account = makeSnapshot(remaining: 70, fetchedAt: now)
+        let priorReset = account.mainLimit!.window.startsAt
+        let history = weeklySamples(
+            start: priorReset.addingTimeInterval(-12 * 3_600),
+            end: priorReset,
+            reset: priorReset,
+            startRemaining: 80,
+            endRemaining: 60,
+            startTokens: 1_000,
+            endTokens: 2_000
+        )
+        let reader = makeReader(account: account, samples: history, now: now)
+
+        XCTAssertNil(reader.guidance)
+        XCTAssertTrue(reader.chart.currentProjection.isEmpty)
+        XCTAssertEqual(reader.chart.historicalProjection.count, 2)
+    }
+
     func testAllowanceBreaksNeedOneThenTwoNewReadings() {
         let now = Date(timeIntervalSince1970: 6_009_000)
         let account = makeSnapshot(

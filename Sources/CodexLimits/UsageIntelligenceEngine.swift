@@ -852,6 +852,7 @@ enum UsageIntelligenceEngine {
             samples: input.samples,
             forecast: forecast,
             recentMovement: recentMovement.movement,
+            sourceState: input.sourceState,
             safetyBuffer: input.safetyBuffer
         )
         let currentFreshness = freshness(
@@ -1676,6 +1677,7 @@ enum UsageIntelligenceEngine {
         samples: [UsageSample],
         forecast: Forecast?,
         recentMovement: RecentAccountMovement?,
+        sourceState: UsageSourceState,
         safetyBuffer: Double
     ) -> UsageChartSnapshot {
         guard let account, let weeklyLimit = account.mainLimit else {
@@ -1698,11 +1700,41 @@ enum UsageIntelligenceEngine {
             account: account,
             samples: samples
         )
+        let historicalReference: UsageForecastReference? = if case .available = sourceState {
+            chartHistoricalReference(
+                samples: samples,
+                excluding: window.resetsAt,
+                remaining: window.remainingPercent,
+                daysLeft: max(
+                    window.resetsAt.timeIntervalSince(account.fetchedAt)
+                        / 86_400,
+                    0
+                )
+            )
+        } else {
+            nil
+        }
         guard let forecast, let recentMovement else {
+            let reference = historicalReference.map {
+                UsageChartReferenceSeries(
+                    source: $0.source,
+                    points: projection(
+                        reading: UsageSample(
+                            observedAt: account.fetchedAt,
+                            remainingPercent: window.remainingPercent,
+                            resetsAt: window.resetsAt
+                        ),
+                        window: window,
+                        rate: $0.percentPerDay,
+                        remainingAtReset: $0.remainingAtReset
+                    )
+                )
+            }
             return UsageChartSnapshot(
                 observedSource: .account,
                 target: target,
                 currentProjection: [],
+                reference: reference,
                 currentAllowanceReset: window.resetsAt,
                 allowanceWindows: allowanceWindows,
                 currentRunsFaster: false,
@@ -1714,16 +1746,7 @@ enum UsageIntelligenceEngine {
             ? forecast.historicalReference
             : nil
         let chartReference = strictAccountReference
-            ?? chartHistoricalReference(
-                samples: samples,
-                excluding: window.resetsAt,
-                remaining: window.remainingPercent,
-                daysLeft: max(
-                    window.resetsAt.timeIntervalSince(account.fetchedAt)
-                        / 86_400,
-                    0
-                )
-            )
+            ?? historicalReference
             ?? forecast.historicalReference
         let reference = chartReference.map {
             UsageChartReferenceSeries(
