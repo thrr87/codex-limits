@@ -646,6 +646,8 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     let freshness: UsageFreshness
     let evidence: UsageEvidence
     let guidance: UsageGuidance?
+    let suggestedPacePercentPerDay: Double?
+    let suggestedPaceUnavailableReason: String?
     let chart: UsageChartSnapshot
     let bankedResets: BankedResetSummary?
     let accountTokenActivity: AccountTokenActivitySnapshot
@@ -680,9 +682,9 @@ struct UsageReaderSnapshot: Equatable, Sendable {
     }
 
     var suggestedPaceText: String {
-        guidance?.suggestedPace
-            ?? (evidence.coverage == .notApplicable ? evidence.reason : nil)
-            ?? "Not enough data"
+        suggestedPacePercentPerDay.map(formattedSuggestedPace)
+            ?? suggestedPaceUnavailableReason
+            ?? "Weekly usage unavailable"
     }
 
     var evidenceText: String {
@@ -788,6 +790,12 @@ enum UsageIntelligenceEngine {
                 previousStatus: input.previousStatus
             )
         }
+        let suggestedPace = suggestedPace(
+            account: input.account,
+            sourceState: input.sourceState,
+            safetyBuffer: input.safetyBuffer,
+            now: input.now
+        )
         let guidance: UsageGuidance? = forecast.flatMap { forecast in
             guard evidence.confidence == .high || evidence.confidence == .medium else {
                 return nil
@@ -803,11 +811,10 @@ enum UsageIntelligenceEngine {
                     safetyBuffer: input.safetyBuffer,
                     now: input.now
                 ),
-                suggestedPace: suggestedPace(
-                    forecast: forecast,
-                    reset: weeklyLimit.window.resetsAt,
-                    now: input.now
-                ),
+                suggestedPace: suggestedPace.percentPerDay
+                    .map(formattedSuggestedPace)
+                    ?? suggestedPace.reason
+                    ?? "Weekly usage unavailable",
                 runway: runway(
                     window: weeklyLimit.window,
                     forecast: forecast,
@@ -1111,6 +1118,8 @@ enum UsageIntelligenceEngine {
             freshness: currentFreshness,
             evidence: evidence,
             guidance: guidance,
+            suggestedPacePercentPerDay: suggestedPace.percentPerDay,
+            suggestedPaceUnavailableReason: suggestedPace.reason,
             chart: chart,
             bankedResets: bankedResetSummary(
                 account: input.account,
@@ -2092,23 +2101,32 @@ enum UsageIntelligenceEngine {
     }
 
     private static func suggestedPace(
-        forecast: Forecast,
-        reset: Date,
+        account: UsageSnapshot?,
+        sourceState: UsageSourceState,
+        safetyBuffer: Double,
         now: Date
-    ) -> String {
-        let value = reset.timeIntervalSince(now) <= 86_400
-            ? forecast.recommendedPercentPerDay / 24
-            : forecast.recommendedPercentPerDay
-        let unit = reset.timeIntervalSince(now) <= 86_400 ? "an hour" : "a day"
-        return "Up to \(oneDecimal(value))% \(unit)"
-    }
-
-    private static func oneDecimal(_ value: Double) -> String {
-        value.formatted(
-            .number
-                .precision(.fractionLength(1))
-                .locale(Locale(identifier: "en_US"))
+    ) -> (percentPerDay: Double?, reason: String?) {
+        if case let .failed(message) = sourceState {
+            return (nil, message)
+        }
+        guard let window = account?.mainLimit?.window, window.isValid else {
+            return (nil, "Weekly usage unavailable")
+        }
+        guard now >= window.startsAt else {
+            return (nil, "Current allowance window has not started")
+        }
+        let secondsToReset = window.resetsAt.timeIntervalSince(now)
+        guard secondsToReset > 0, secondsToReset.isFinite else {
+            return (nil, "Current allowance window unavailable")
+        }
+        let value = max(
+            (window.remainingPercent - safetyBuffer)
+                / (secondsToReset / 86_400),
+            0
         )
+        return value.isFinite
+            ? (value, nil)
+            : (nil, "Current allowance window unavailable")
     }
 
     private static func durationText(_ seconds: TimeInterval) -> String {
@@ -2119,4 +2137,13 @@ enum UsageIntelligenceEngine {
         let hours = max(Int((seconds / 3_600).rounded()), 1)
         return "\(hours) \(hours == 1 ? "hour" : "hours")"
     }
+}
+
+private func formattedSuggestedPace(_ percentPerDay: Double) -> String {
+    let value = percentPerDay.formatted(
+        .number
+            .precision(.fractionLength(1))
+            .locale(Locale(identifier: "en_US"))
+    )
+    return "Up to \(value) percentage points a day"
 }

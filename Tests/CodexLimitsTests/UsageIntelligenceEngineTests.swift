@@ -1781,7 +1781,10 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             reader.guidance?.message,
             "At this pace, your limit may run out 23 hours early."
         )
-        XCTAssertEqual(reader.guidance?.suggestedPace, "Up to 8.5% a day")
+        XCTAssertEqual(
+            reader.guidance?.suggestedPace,
+            "Up to 8.5 percentage points a day"
+        )
         XCTAssertNotNil(reader.guidance?.runway)
         XCTAssertNil(reader.guidance?.remainingAtResetRange)
         XCTAssertNil(reader.guidance?.caveat)
@@ -1892,7 +1895,11 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             reader.guidanceMessage,
             "Couldn’t read Codex usage. Try refreshing again."
         )
-        XCTAssertEqual(reader.suggestedPaceText, "Not enough data")
+        XCTAssertNil(reader.suggestedPacePercentPerDay)
+        XCTAssertEqual(
+            reader.suggestedPaceText,
+            "Couldn’t read Codex usage. Try refreshing again."
+        )
     }
 
     func testReaderFormatsFreshnessFromSuppliedTime() {
@@ -2432,6 +2439,122 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(reader.evidence.confidence, .low)
         XCTAssertEqual(reader.evidence.reason, "Not enough account history")
         XCTAssertNil(reader.guidance)
+    }
+
+    func testSuggestedPaceNeedsOnlyCurrentReadingAndUsesExactFractionalDay() throws {
+        let now = Date(timeIntervalSince1970: 6_010_000)
+        let reader = makeReader(
+            account: makeSnapshot(
+                remaining: 23,
+                fetchedAt: now,
+                resetAfter: 12 * 60 * 60
+            ),
+            now: now
+        )
+
+        let pace = try XCTUnwrap(reader.suggestedPacePercentPerDay)
+        XCTAssertEqual(pace, 40, accuracy: 0.000_001)
+        XCTAssertTrue(pace.isFinite)
+        XCTAssertGreaterThanOrEqual(pace, 0)
+        XCTAssertEqual(
+            reader.suggestedPaceText,
+            "Up to 40.0 percentage points a day"
+        )
+        XCTAssertNil(reader.guidance)
+    }
+
+    func testSuggestedPaceIgnoresLongAccountHistoryGap() throws {
+        let now = Date(timeIntervalSince1970: 6_020_000)
+        let account = makeSnapshot(remaining: 40, fetchedAt: now)
+        let withoutHistory = makeReader(account: account, now: now)
+        let withLongGap = makeReader(
+            account: account,
+            samples: [
+                UsageSample(
+                    observedAt: account.mainLimit!.window.startsAt,
+                    remainingPercent: 100,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                ),
+                UsageSample(
+                    observedAt: now,
+                    remainingPercent: 40,
+                    resetsAt: account.mainLimit!.window.resetsAt
+                )
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(withLongGap.evidence.coverage, .low)
+        XCTAssertEqual(
+            try XCTUnwrap(withLongGap.suggestedPacePercentPerDay),
+            try XCTUnwrap(withoutHistory.suggestedPacePercentPerDay),
+            accuracy: 0.000_001
+        )
+    }
+
+    func testSuggestedPaceClampsAllowanceAtOrBelowBufferToZero() throws {
+        let now = Date(timeIntervalSince1970: 6_030_000)
+        let cases: [(remaining: Double, expected: Double)] = [
+            (100, 48.5),
+            (3, 0),
+            (2, 0),
+            (0, 0)
+        ]
+
+        for testCase in cases {
+            let reader = makeReader(
+                account: makeSnapshot(
+                    remaining: testCase.remaining,
+                    fetchedAt: now
+                ),
+                now: now
+            )
+            let pace = try XCTUnwrap(reader.suggestedPacePercentPerDay)
+
+            XCTAssertEqual(pace, testCase.expected, accuracy: 0.000_001)
+            XCTAssertTrue(pace.isFinite)
+            XCTAssertGreaterThanOrEqual(pace, 0)
+        }
+    }
+
+    func testSuggestedPaceUsesSpecificUnavailableReasons() {
+        let now = Date(timeIntervalSince1970: 6_040_000)
+        let sourceError = "Couldn’t read Codex usage. Try refreshing again."
+        let missing = makeReader(account: nil, now: now)
+        let atReset = makeReader(
+            account: makeSnapshot(
+                remaining: 50,
+                fetchedAt: now.addingTimeInterval(-2 * 86_400)
+            ),
+            now: now
+        )
+        let expired = makeReader(
+            account: makeSnapshot(
+                remaining: 50,
+                fetchedAt: now.addingTimeInterval(-3 * 86_400)
+            ),
+            now: now
+        )
+        let failed = makeReader(
+            account: makeSnapshot(remaining: 50, fetchedAt: now),
+            sourceState: .failed(sourceError),
+            now: now
+        )
+
+        XCTAssertNil(missing.suggestedPacePercentPerDay)
+        XCTAssertEqual(missing.suggestedPaceText, "Weekly usage unavailable")
+        XCTAssertNil(atReset.suggestedPacePercentPerDay)
+        XCTAssertEqual(
+            atReset.suggestedPaceText,
+            "Current allowance window unavailable"
+        )
+        XCTAssertNil(expired.suggestedPacePercentPerDay)
+        XCTAssertEqual(
+            expired.suggestedPaceText,
+            "Current allowance window unavailable"
+        )
+        XCTAssertNil(failed.suggestedPacePercentPerDay)
+        XCTAssertEqual(failed.suggestedPaceText, sourceError)
     }
 
     func testCompleteCoverageNeedsTheWholeWindowWithoutMaterialGaps() {
@@ -3344,6 +3467,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
     private func makeSnapshot(
         remaining: Double,
         fetchedAt: Date,
+        resetAfter: TimeInterval = 2 * 86_400,
         tokenHistory: [TokenDay] = [],
         accountFacts: AccountFacts? = nil,
         emergencyResetCount: Int = 0,
@@ -3352,7 +3476,7 @@ final class UsageIntelligenceEngineTests: XCTestCase {
     ) -> UsageSnapshot {
         let window = UsageWindow(
             remainingPercent: remaining,
-            resetsAt: fetchedAt.addingTimeInterval(2 * 86_400),
+            resetsAt: fetchedAt.addingTimeInterval(resetAfter),
             durationMinutes: 10_080
         )
         return UsageSnapshot(
@@ -3364,6 +3488,25 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             bankedResetDetails: bankedResetDetails,
             fetchedAt: fetchedAt,
             accountFacts: accountFacts
+        )
+    }
+
+    private func makeReader(
+        account: UsageSnapshot?,
+        samples: [UsageSample] = [],
+        safetyBuffer: Double = 3,
+        sourceState: UsageSourceState = .available,
+        now: Date
+    ) -> UsageReaderSnapshot {
+        UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: safetyBuffer,
+                sourceState: sourceState,
+                now: now,
+                previousStatus: nil
+            )
         )
     }
 
