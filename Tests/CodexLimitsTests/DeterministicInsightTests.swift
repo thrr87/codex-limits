@@ -113,7 +113,7 @@ final class DeterministicInsightTests: XCTestCase {
             (AnalyticsTimeRange.oneDay, 86_400.0),
             (.threeDays, 3 * 86_400.0),
             (.fourWeeks, 28 * 86_400.0),
-            (.twelveWeeks, 35 * 86_400.0)
+            (.twelveWeeks, 84 * 86_400.0)
         ] {
             var exploration = AnalyticsExplorationState.initial
             exploration.timeRange = range
@@ -127,7 +127,7 @@ final class DeterministicInsightTests: XCTestCase {
             )
             XCTAssertEqual(
                 resolved.duration,
-                min(duration, 35 * 86_400),
+                duration,
                 accuracy: 0.1
             )
         }

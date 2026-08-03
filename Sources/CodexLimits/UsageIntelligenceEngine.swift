@@ -460,7 +460,10 @@ struct AccountTokenActivitySnapshot: Equatable, Sendable {
         guard let tokens else {
             return reason ?? "No account readings in this range"
         }
-        return "\(tokens) account tokens so far. Future time after the latest account reading has no observation."
+        let zero = intervals.contains { $0.tokenDelta == 0 }
+            ? " Includes an observed zero-token interval."
+            : ""
+        return "\(tokens) account tokens so far.\(zero) Gaps between readings and time since the latest reading are missing, not zero. Time from now until reset is future and has no observation."
     }
 
     var sourceDescription: String {
@@ -1340,15 +1343,45 @@ enum UsageIntelligenceEngine {
         var timeline = samples
         if let account,
            let window = account.mainLimit?.window,
-           let lifetimeTokens = account.accountFacts?.lifetimeTokens {
+           let facts = account.accountFacts,
+           let lifetimeTokens = facts.lifetimeTokens {
+            let observedAt = facts.lifetimeTokensObservedAt ?? account.fetchedAt
+            guard window.startsAt <= observedAt,
+                  observedAt <= window.resetsAt else {
+                return evaluateAccountTokenTimeline(
+                    timeline,
+                    account: account,
+                    range: range,
+                    now: now,
+                    accountPartitionID: accountPartitionID,
+                    accountEpochStartedAt: accountEpochStartedAt
+                )
+            }
             timeline.append(UsageSample(
-                observedAt: account.accountFacts?.lifetimeTokensObservedAt
-                    ?? account.fetchedAt,
+                observedAt: observedAt,
                 remainingPercent: window.remainingPercent,
                 resetsAt: window.resetsAt,
                 lifetimeTokens: lifetimeTokens
             ))
         }
+        return evaluateAccountTokenTimeline(
+            timeline,
+            account: account,
+            range: range,
+            now: now,
+            accountPartitionID: accountPartitionID,
+            accountEpochStartedAt: accountEpochStartedAt
+        )
+    }
+
+    private static func evaluateAccountTokenTimeline(
+        _ timeline: [UsageSample],
+        account: UsageSnapshot?,
+        range: DateInterval,
+        now: Date,
+        accountPartitionID: String?,
+        accountEpochStartedAt: Date?
+    ) -> AccountTokenActivitySnapshot {
         let readings = timeline.filter { $0.observedAt <= now }.sorted {
             if $0.observedAt != $1.observedAt {
                 return $0.observedAt < $1.observedAt
@@ -1370,8 +1403,10 @@ enum UsageIntelligenceEngine {
                last.observedAt == reading.observedAt,
                last.resetsAt == reading.resetsAt,
                last.lifetimeTokens == reading.lifetimeTokens,
-               last.remainingPercent == reading.remainingPercent,
-               last.comparisonBreak == reading.comparisonBreak {
+               last.remainingPercent == reading.remainingPercent {
+                if reading.comparisonBreak {
+                    unique[unique.count - 1] = reading
+                }
                 continue
             }
             unique.append(reading)
@@ -1404,7 +1439,8 @@ enum UsageIntelligenceEngine {
                 previous = nil
                 continue
             }
-            if sawEarlierEpoch, let accountEpochStartedAt {
+            let crossedAccountEpoch = sawEarlierEpoch
+            if crossedAccountEpoch, let accountEpochStartedAt {
                 recordBreak(at: accountEpochStartedAt, reason: .accountChange)
                 sawEarlierEpoch = false
             }
@@ -1416,13 +1452,17 @@ enum UsageIntelligenceEngine {
                 previous = nil
                 continue
             }
-            guard reading.isValid, reading.lifetimeTokens != nil else {
+            guard reading.isValid,
+                  let readingTokens = reading.lifetimeTokens,
+                  readingTokens >= 0 else {
                 recordBreak(at: reading.observedAt, reason: .invalidCounter)
                 previous = nil
                 continue
             }
             if reading.comparisonBreak {
-                recordBreak(at: reading.observedAt, reason: .correction)
+                if !crossedAccountEpoch {
+                    recordBreak(at: reading.observedAt, reason: .correction)
+                }
                 previous = reading
                 continue
             }
@@ -1466,7 +1506,8 @@ enum UsageIntelligenceEngine {
                     account: account,
                     range: range,
                     now: now,
-                    accountPartitionID: accountPartitionID
+                    accountPartitionID: accountPartitionID,
+                    breaks: breaks
                ) {
                 return fallback
             }
@@ -1503,7 +1544,8 @@ enum UsageIntelligenceEngine {
         account: UsageSnapshot,
         range: DateInterval,
         now: Date,
-        accountPartitionID: String?
+        accountPartitionID: String?,
+        breaks: [AccountTokenActivityBreak] = []
     ) -> AccountTokenActivitySnapshot? {
         let intervals = account.tokenHistory.compactMap {
             day -> AccountTokenActivityInterval? in
@@ -1531,16 +1573,19 @@ enum UsageIntelligenceEngine {
             guard !sum.overflow else { return nil }
             total = sum.partialValue
         }
+        let isContinuous = zip(intervals, intervals.dropFirst())
+            .allSatisfy { $0.0.end == $0.1.start }
         return AccountTokenActivitySnapshot(
-            state: intervals.count == 1
-                && first.start == range.start
-                && first.end == range.end ? .exact : .partial,
+            state: first.start == range.start
+                && last.end == range.end
+                && isContinuous ? .exact : .partial,
             tokens: total,
             method: .dailyBuckets,
             interval: DateInterval(start: first.start, end: last.end),
             reason: nil,
             range: range,
-            intervals: intervals
+            intervals: intervals,
+            breaks: breaks
         )
     }
 

@@ -69,12 +69,16 @@ struct UsageSample: Codable, Equatable, Hashable, Sendable {
     let lifetimeTokens: Int64?
     let comparisonBreak: Bool
 
-    var isValid: Bool {
+    var hasValidObservationMetadata: Bool {
         observedAt.isSupportedUsageDate
             && resetsAt.isSupportedUsageDate
             && observedAt <= resetsAt
             && remainingPercent.isFinite
             && (0 ... 100).contains(remainingPercent)
+    }
+
+    var isValid: Bool {
+        hasValidObservationMetadata
             && (lifetimeTokens.map { $0 >= 0 } ?? true)
     }
 

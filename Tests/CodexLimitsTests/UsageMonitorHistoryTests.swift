@@ -410,7 +410,11 @@ final class UsageMonitorHistoryTests: XCTestCase {
         XCTAssertNil(monitor.readerSnapshot.accountTokenActivity.tokens)
         XCTAssertEqual(
             monitor.readerSnapshot.accountTokenActivity.reason,
-            "No lifetime token reading at the weekly boundary"
+            "No account readings in this range"
+        )
+        XCTAssertEqual(
+            monitor.readerSnapshot.accountTokenActivity.breaks.map(\.reason),
+            [.accountChange]
         )
 
         defaults.removeObject(

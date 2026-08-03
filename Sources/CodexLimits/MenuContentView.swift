@@ -277,6 +277,16 @@ struct AnalyticsWorkspaceBody: View {
         .onChange(of: store.insightDispositions) { _, _ in
             analyticsPreferencesChanged()
         }
+        .onChange(of: now) { _, _ in
+            guard store.state.section == .graphs,
+                  store.state.graph == .tokenActivity else { return }
+            switch store.state.timeRange {
+            case .oneDay, .threeDays, .fourWeeks, .twelveWeeks:
+                analyticsPreferencesChanged()
+            case .currentWindow, .selected:
+                break
+            }
+        }
     }
 }
 
@@ -1577,7 +1587,7 @@ func accountTokenDisplayIntervalAccessibilityValue(
         locale: locale
     )
     let aggregation = interval.isAggregated
-        ? " Aggregated from \(interval.sourceIntervals.count) source intervals."
+        ? " Combined from \(interval.sourceIntervals.count) observed periods."
         : ""
     let zero = interval.tokenDelta == 0
         ? " Observed zero-token interval."
@@ -1624,6 +1634,9 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var visibleRange: DateInterval {
+        if let evaluatedRange = reader.accountTokenActivity.range {
+            return evaluatedRange
+        }
         if store.state.timeRange == .currentWindow,
            let currentWindowBounds {
             return currentWindowBounds
@@ -1775,6 +1788,10 @@ private struct TokenActivityWorkspace: View {
                     .foregroundStyle(Color.blue)
                     .symbol(.diamond)
                     .symbolSize(55)
+                    .accessibilityLabel("Account token interval")
+                    .accessibilityValue(
+                        accountTokenDisplayIntervalAccessibilityValue(interval)
+                    )
                 } else {
                     RectangleMark(
                         xStart: .value("Start", interval.start),
@@ -1783,6 +1800,10 @@ private struct TokenActivityWorkspace: View {
                         yEnd: .value("Account tokens", interval.tokenDelta)
                     )
                     .foregroundStyle(Color.blue)
+                    .accessibilityLabel("Account token interval")
+                    .accessibilityValue(
+                        accountTokenDisplayIntervalAccessibilityValue(interval)
+                    )
                 }
             }
 
@@ -1826,7 +1847,7 @@ private struct TokenActivityWorkspace: View {
             }
         }
         .frame(height: 180)
-        .accessibilityElement(children: .ignore)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Account token activity")
         .accessibilityValue(
             store.state.timeRange == .currentWindow
@@ -1857,7 +1878,7 @@ private struct TokenActivityWorkspace: View {
                     .foregroundStyle(.secondary)
                     if selectedInterval.isAggregated {
                         Text(
-                            "Aggregated display interval · \(selectedInterval.sourceIntervals.count) source intervals"
+                            "Combined from \(selectedInterval.sourceIntervals.count) observed periods"
                         )
                         .foregroundStyle(.secondary)
                     }

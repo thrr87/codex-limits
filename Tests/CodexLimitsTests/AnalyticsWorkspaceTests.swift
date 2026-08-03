@@ -425,7 +425,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
         XCTAssertTrue(
             reader.accountTokenActivity.currentWindowAccessibilityValue
-                .contains("Future time after the latest account reading has no observation")
+                .contains("Time from now until reset is future and has no observation")
         )
         XCTAssertTrue(
             renders(
@@ -722,7 +722,7 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
         XCTAssertTrue(
             accountTokenDisplayIntervalAccessibilityValue(selected!)
-                .contains("Aggregated from 3 source intervals")
+                .contains("Combined from 3 observed periods")
         )
         XCTAssertNil(accountTokenDisplayInterval(
             at: range.start.addingTimeInterval(500),

@@ -717,6 +717,69 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         XCTAssertEqual(activity.intervals.map(\.method), [.dailyBuckets])
     }
 
+    func testCompleteContiguousUTCDaysExactlyCoverAThreeDayRange() throws {
+        let now = try date("2026-08-04T00:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [1, 2, 3].map { day in
+                TokenDay(
+                    date: now.addingTimeInterval(TimeInterval(-day * 86_400)),
+                    tokens: Int64(day * 100),
+                    completeness: .complete
+                )
+            }
+        )
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: [],
+            now: now,
+            timeRange: .threeDays
+        )
+
+        XCTAssertEqual(activity.state, .exact)
+        XCTAssertEqual(activity.tokens, 600)
+        XCTAssertEqual(activity.intervals.count, 3)
+    }
+
+    func testUTCFallbackPreservesDetectedCounterBreaks() throws {
+        let now = try date("2026-08-03T00:00:00Z")
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            tokenHistory: [TokenDay(
+                date: now.addingTimeInterval(-86_400),
+                tokens: 900,
+                completeness: .complete
+            )]
+        )
+        let reset = account.mainLimit!.window.resetsAt
+        let readings = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-7_200),
+                remainingPercent: 85,
+                resetsAt: reset,
+                lifetimeTokens: 2_000
+            ),
+            UsageSample(
+                observedAt: now.addingTimeInterval(-3_600),
+                remainingPercent: 80,
+                resetsAt: reset,
+                lifetimeTokens: 1_000
+            )
+        ]
+
+        let activity = rollingDayActivity(
+            account: account,
+            samples: readings,
+            now: now
+        )
+
+        XCTAssertEqual(activity.method, .dailyBuckets)
+        XCTAssertEqual(activity.breaks.map(\.reason), [.counterDecrease])
+    }
+
     func testRollingDayExcludesPartialUTCDailyBuckets() throws {
         let now = try date("2026-08-03T12:00:00Z")
         let account = makeSnapshot(
@@ -1425,6 +1488,57 @@ final class UsageIntelligenceEngineTests: XCTestCase {
             reader.accountTokenActivity.interval,
             DateInterval(start: boundary.observedAt, end: observedAt)
         )
+    }
+
+    func testPreservedLifetimeReadingDoesNotInheritANewerAllowanceReset() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let observedAt = now.addingTimeInterval(-6 * 86_400)
+        let oldReset = now.addingTimeInterval(-4 * 86_400)
+        let account = makeSnapshot(
+            remaining: 80,
+            fetchedAt: now,
+            accountFacts: AccountFacts(
+                lifetimeTokens: 1_200,
+                peakDailyTokens: nil,
+                longestRunningTurnSeconds: nil,
+                currentStreakDays: nil,
+                longestStreakDays: nil,
+                credits: nil,
+                spendControl: nil,
+                lifetimeTokensObservedAt: observedAt
+            )
+        )
+        let samples = [
+            UsageSample(
+                observedAt: now.addingTimeInterval(-7 * 86_400),
+                remainingPercent: 90,
+                resetsAt: oldReset,
+                lifetimeTokens: 1_000
+            ),
+            UsageSample(
+                observedAt: observedAt,
+                remainingPercent: 85,
+                resetsAt: oldReset,
+                lifetimeTokens: 1_200
+            )
+        ]
+        var exploration = AnalyticsExplorationState.initial
+        exploration.timeRange = .twelveWeeks
+
+        let activity = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: samples,
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil,
+                analyticsExploration: exploration
+            )
+        ).accountTokenActivity
+
+        XCTAssertEqual(activity.tokens, 200)
+        XCTAssertTrue(activity.breaks.isEmpty)
     }
 
     func testCompleteDailyBucketsProducePartialAccountTokenActivity() throws {
@@ -2543,12 +2657,23 @@ final class UsageIntelligenceEngineTests: XCTestCase {
 
         XCTAssertEqual(zero.tokens, 0)
         XCTAssertEqual(zero.intervals.first?.tokenDelta, 0)
+        XCTAssertTrue(
+            zero.currentWindowAccessibilityValue
+                .contains("observed zero-token interval")
+        )
+        XCTAssertTrue(
+            zero.currentWindowAccessibilityValue
+                .contains("missing, not zero")
+        )
+        XCTAssertTrue(
+            zero.currentWindowAccessibilityValue
+                .contains("future and has no observation")
+        )
         XCTAssertNil(missing.tokens)
         XCTAssertEqual(missing.reason, "No account readings in this range")
     }
 
     func testExpiredCurrentWindowIsUnavailableButKeepsHistoricalSamples() throws {
-        let start = try date("2026-08-01T12:13:00Z")
         let reset = try date("2026-08-08T12:13:00Z")
         let historicalObservation = try date("2026-08-03T12:13:00Z")
         let account = UsageSnapshot(
