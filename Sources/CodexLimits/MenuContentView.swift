@@ -6,6 +6,7 @@ struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
     @StateObject private var workspace: AnalyticsWorkspaceStore
     @StateObject private var assistedInsights: CodexAssistedInsightStore
+    @StateObject private var updater = AppUpdater()
     @Environment(\.openSettings) private var openSettings
 
     init(
@@ -38,6 +39,8 @@ struct MenuContentView: View {
                         await monitor.setResetReminderEnabled(isEnabled)
                     }
                 },
+                availableUpdateVersion: updater.availableVersion,
+                showAvailableUpdate: updater.showAvailableUpdate,
                 settings: showSettings
             )
             .padding(.horizontal, 20)
@@ -75,6 +78,9 @@ struct MenuContentView: View {
                 .padding(.vertical, 12)
         }
         .frame(width: layout.width, height: layout.height)
+        .task {
+            updater.start()
+        }
         .task(id: workspace.state) {
             let state = workspace.state
             await monitor.setLocalAnalyticsVisible(
@@ -297,6 +303,8 @@ private struct WorkspaceHeader: View {
     let resetReminderState: ResetReminderState
     let refresh: () -> Void
     let setResetReminderEnabled: (Bool) -> Void
+    let availableUpdateVersion: String?
+    let showAvailableUpdate: () -> Void
     let settings: () -> Void
 
     var body: some View {
@@ -329,6 +337,18 @@ private struct WorkspaceHeader: View {
                 .buttonStyle(.borderless)
                 .help("Refresh")
                 .accessibilityLabel("Refresh usage")
+
+                if let availableUpdateVersion {
+                    Button(action: showAvailableUpdate) {
+                        Image(systemName: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Upgrade to \(availableUpdateVersion)")
+                    .accessibilityLabel("Upgrade Codex Limits")
+                    .accessibilityValue(
+                        "Version \(availableUpdateVersion) is available"
+                    )
+                }
 
                 Button(action: settings) {
                     Image(systemName: "gearshape")

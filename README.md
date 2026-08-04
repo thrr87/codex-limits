@@ -76,7 +76,7 @@ The app keeps weak estimates out of guidance and Insights. The Usage remaining c
 - Copies account usage samples to a private folder that you choose.
 - Deletes all Codex Limits analytics history on this Mac and in the selected sync folder when you choose `Delete analytics history`.
 - Refreshes on launch, after wake, when you open the menu, every ten minutes, or on request.
-- Runs as a native SwiftUI menu-bar app with no third-party runtime dependencies.
+- Runs as a native SwiftUI menu-bar app and uses Sparkle to verify and install signed updates.
 - Does not redeem resets, change Codex settings, or control Tasks.
 
 ## How it works
@@ -131,7 +131,7 @@ The script creates an ad-hoc signed app at `.build/release/Codex Limits.app`. La
 open ".build/release/Codex Limits.app"
 ```
 
-This project offers no prebuilt or notarized app. Open `Package.swift` in Xcode to work on the source.
+Stable releases include a universal app for Apple Silicon and Intel. The app is not Developer ID signed or notarized, so the first manual installation remains subject to macOS Gatekeeper. After that, the app can detect and install EdDSA-signed stable updates. Open `Package.swift` in Xcode to work on the source.
 
 ## Test
 
@@ -143,7 +143,7 @@ The tests use made-up usage data. Do not commit exported account data or local a
 
 ## Current limitations
 
-- You must build the app from source.
+- Existing 0.2.6 and older installations require one final manual update to a version that includes the in-app updater.
 - Account and local values can differ because this Mac may not observe every Codex Task.
 - Estimates need account readings near both ends of a time range and enough similar local work.
 - `Analyze with Codex` appears only when Codex offers GPT-5.6 Luna with Medium reasoning.

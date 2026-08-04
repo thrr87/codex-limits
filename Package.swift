@@ -8,8 +8,17 @@ let package = Package(
     products: [
         .executable(name: "CodexLimits", targets: ["CodexLimits"])
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle",
+            exact: "2.9.5"
+        )
+    ],
     targets: [
-        .executableTarget(name: "CodexLimits"),
+        .executableTarget(
+            name: "CodexLimits",
+            dependencies: ["Sparkle"]
+        ),
         .testTarget(
             name: "CodexLimitsTests",
             dependencies: ["CodexLimits"],
