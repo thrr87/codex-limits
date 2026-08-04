@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version without the v prefix, for example 0.2.7
+        required: true
+        type: string
+      dry_run:
+        description: Build and validate without creating a GitHub Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build signed update
+    runs-on: macos-15
+    timeout-minutes: 20
+    environment: release
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version
+        run: Scripts/validate-release.sh '${{ inputs.version }}'
+
+      - name: Build universal app
+        env:
+          CODEX_LIMITS_UNIVERSAL: 1
+        run: Scripts/build-app.sh
+
+      - name: Prepare release notes and archive
+        env:
+          GH_TOKEN: '${{ github.token }}'
+          VERSION: '${{ inputs.version }}'
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/release-artifacts"
+          archive="Codex-Limits-$VERSION.zip"
+          mkdir -p "$artifacts"
+          previous_tag=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="v$VERSION" \
+            -f target_commitish="$GITHUB_SHA" \
+            -f previous_tag_name="$previous_tag" \
+            --jq .body > "$artifacts/Codex-Limits-$VERSION.md"
+          ditto -c -k --sequesterRsrc --keepParent \
+            '.build/release/Codex Limits.app' \
+            "$artifacts/$archive"
+          echo "ARTIFACTS=$artifacts" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Sign archive and feed
+        env:
+          SPARKLE_PRIVATE_KEY: '${{ secrets.SPARKLE_PRIVATE_KEY }}'
+          VERSION: '${{ inputs.version }}'
+        run: |
+          set -euo pipefail
+          test -n "$SPARKLE_PRIVATE_KEY"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+            .build/universal-arm64/artifacts/sparkle/Sparkle/bin/generate_appcast \
+              --ed-key-file - \
+              --download-url-prefix \
+                "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/" \
+              --embed-release-notes \
+              --maximum-deltas 0 \
+              --critical-update-version '' \
+              "$ARTIFACTS"
+
+      - name: Validate update artifacts
+        run: |
+          set -euo pipefail
+          app='.build/release/Codex Limits.app'
+          codesign --verify --deep --strict "$app"
+          archs=$(lipo -archs "$app/Contents/MacOS/CodexLimits")
+          test "$archs" = 'x86_64 arm64' -o "$archs" = 'arm64 x86_64'
+          xmllint --noout "$ARTIFACTS/appcast.xml"
+          grep -q 'sparkle:edSignature' "$ARTIFACTS/appcast.xml"
+          grep -q 'sparkle:criticalUpdate' "$ARTIFACTS/appcast.xml"
+
+      - name: Upload dry-run artifacts
+        if: inputs.dry_run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Codex-Limits-${{ inputs.version }}
+          path: |
+            ${{ env.ARTIFACTS }}/${{ env.ARCHIVE }}
+            ${{ env.ARTIFACTS }}/appcast.xml
+            ${{ env.ARTIFACTS }}/Codex-Limits-${{ inputs.version }}.md
+          if-no-files-found: error
+
+      - name: Create draft release
+        if: inputs.dry_run == false
+        env:
+          GH_TOKEN: '${{ github.token }}'
+          VERSION: '${{ inputs.version }}'
+        run: |
+          gh release create "v$VERSION" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Codex Limits $VERSION" \
+            --notes-file "$ARTIFACTS/Codex-Limits-$VERSION.md" \
+            "$ARTIFACTS/$ARCHIVE" \
+            "$ARTIFACTS/appcast.xml"

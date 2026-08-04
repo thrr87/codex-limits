@@ -155,6 +155,17 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertEqual(sandbox["type"] as? String, "readOnly")
         XCTAssertEqual(sandbox["networkAccess"] as? Bool, false)
         XCTAssertNil(turnParams["multiAgentMode"])
+        let schema = try XCTUnwrap(
+            turnParams["outputSchema"] as? [String: Any]
+        )
+        let properties = try XCTUnwrap(
+            schema["properties"] as? [String: Any]
+        )
+        XCTAssertNotNil(properties["finding"])
+        XCTAssertNotNil(properties["whyItMatters"])
+        XCTAssertNotNil(properties["recommendation"])
+        XCTAssertNotNil(properties["evidenceFields"])
+        XCTAssertNil(properties["insightKind"])
     }
 
     func testMetadataPayloadIsBoundedAndContainsNoSourceContent() throws {
@@ -184,6 +195,7 @@ final class CodexAssistedInsightTests: XCTestCase {
                 "usageRemaining",
                 "weeklyResetAt",
                 "evidence",
+                "paceGuidance",
                 "accountTokenActivity",
                 "localTokenActivity",
                 "activity",
@@ -230,6 +242,61 @@ final class CodexAssistedInsightTests: XCTestCase {
         }
     }
 
+    func testMetadataPayloadReusesLowCoveragePaceGuidance() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let reset = now.addingTimeInterval(5 * 86_400)
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: UsageSnapshot(
+                    mainLimit: LimitReading(
+                        limitId: "weekly",
+                        name: "Weekly",
+                        window: UsageWindow(
+                            remainingPercent: 37,
+                            resetsAt: reset,
+                            durationMinutes: 10_080
+                        )
+                    ),
+                    otherLimits: [],
+                    tokenHistory: [],
+                    emergencyResetCount: 0,
+                    fetchedAt: now
+                ),
+                samples: [
+                    UsageSample(
+                        observedAt: now.addingTimeInterval(-86_400),
+                        remainingPercent: 39,
+                        resetsAt: reset
+                    ),
+                    UsageSample(
+                        observedAt: now.addingTimeInterval(-43_200),
+                        remainingPercent: 38,
+                        resetsAt: reset
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        let payload = CodexMetadataAnalysisPayload.make(
+            reader: reader,
+            exploration: .initial,
+            now: now
+        )
+        let guidance = try XCTUnwrap(payload.paceGuidance)
+
+        XCTAssertEqual(reader.evidence.coverage, .low)
+        XCTAssertEqual(guidance.status, "roomToUseMore")
+        XCTAssertEqual(guidance.coverage, "low")
+        XCTAssertEqual(guidance.confidence, "low")
+        XCTAssertTrue(
+            CodexAssistedEvidenceResolver.canAnalyze(payload: payload)
+        )
+    }
+
     func testInformationTipNamesCodexAndAllowanceUse() {
         XCTAssertEqual(
             CodexAssistedCopy.informationTip,
@@ -250,6 +317,45 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertTrue(store.showsAnalyzeAction)
         XCTAssertEqual(calls.catalogCalls, 1)
         XCTAssertEqual(calls.analysisCalls, 0)
+    }
+
+    func testLocalUsefulnessGateAvoidsAnAllowanceRequest() async {
+        let service = AssistedServiceFixture(
+            catalogResult: .success(eligibleProfile()),
+            analysisResult: .succeeded(analysisResult())
+        )
+        let store = CodexAssistedInsightStore(service: service)
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: nil,
+                samples: [],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: Date(timeIntervalSince1970: 2_000),
+                previousStatus: nil
+            )
+        )
+        let payload = CodexMetadataAnalysisPayload.make(
+            reader: reader,
+            exploration: .initial,
+            now: Date(timeIntervalSince1970: 2_000)
+        )
+        await store.checkAvailability()
+
+        XCTAssertFalse(
+            CodexAssistedEvidenceResolver.canAnalyze(payload: payload)
+        )
+        store.startAnalysis(
+            payload: payload,
+            scope: CodexAssistedAnalysisScope(
+                exploration: .initial,
+                payload: payload
+            )
+        )
+
+        let calls = await service.snapshot()
+        XCTAssertEqual(calls.analysisCalls, 0)
+        XCTAssertFalse(store.isRunning)
     }
 
     func testMissingProfileAndCatalogFailureHideTheAction() async {
@@ -337,7 +443,17 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertNil(
             store.result(
                 for: analysisScope(
-                    payload: metadataPayload(generatedAt: 2_001)
+                    payload: metadataPayload(weeklyResetAt: 4_000)
+                )
+            )
+        )
+        XCTAssertNotNil(
+            store.result(
+                for: analysisScope(
+                    payload: metadataPayload(
+                        generatedAt: 2_001,
+                        remainingPercent: 36
+                    )
                 )
             )
         )
@@ -495,6 +611,14 @@ final class CodexAssistedInsightTests: XCTestCase {
             accountPartitionID: "account-a"
         )
         XCTAssertNotNil(restoredStore.result(for: scope))
+        XCTAssertNotNil(
+            restoredStore.result(
+                for: analysisScope(
+                    accountPartitionID: "account-a",
+                    payload: metadataPayload(remainingPercent: 36)
+                )
+            )
+        )
         var filteredExploration = AnalyticsExplorationState.initial
         filteredExploration.filters.projectID = "another-project"
         let filteredScope = CodexAssistedAnalysisScope(
@@ -842,26 +966,70 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertFalse(store.wasCancelled)
     }
 
-    func testResultDecoderRejectsWeakOrUnboundedOutput() throws {
+    func testResultDecoderAcceptsAnalysisAndRejectsWeakOrUnsafeOutput() throws {
+        let decoded = try CodexAssistedResultDecoder.decode(
+            """
+            {
+              "status":"insight",
+              "title":"Allowance intensity increased",
+              "finding":"Usage per token is higher while local activity remains well covered.",
+              "whyItMatters":"The selected work may reach the reset with less useful capacity than the reference period.",
+              "recommendation":"Try a smaller task scope and compare the next bounded period with the same reference.",
+              "evidenceFields":["usage_per_token","local_token_activity"]
+            }
+            """
+        )
+        XCTAssertEqual(decoded.status, .insight)
+        XCTAssertEqual(
+            decoded.evidenceFields,
+            [.usagePerToken, .localTokenActivity]
+        )
         XCTAssertEqual(
             try CodexAssistedResultDecoder.decode(
+                """
+                {
+                  "status":"insufficient_evidence",
+                  "title":"Not enough evidence",
+                  "finding":"A comparable reference period is missing.",
+                  "whyItMatters":"",
+                  "recommendation":"",
+                  "evidenceFields":[]
+                }
+                """
+            ).status,
+            .insufficientEvidence
+        )
+        XCTAssertThrowsError(
+            try CodexAssistedResultDecoder.decode(
                 #"{"insightKind":"usage_per_token_change"}"#
-            ),
-            .usagePerToken
-        )
-        XCTAssertThrowsError(
-            try CodexAssistedResultDecoder.decode(
-                #"{"insightKind":"unknown"}"#
             )
         )
         XCTAssertThrowsError(
             try CodexAssistedResultDecoder.decode(
-                #"{"insightKind":"activity_summary","summary":"Unsupported free text"}"#
+                """
+                {
+                  "status":"insight",
+                  "title":"Unsupported cause",
+                  "finding":"Usage changed because the tasks were inefficient.",
+                  "whyItMatters":"Useful capacity may be lower.",
+                  "recommendation":"Try a smaller scope.",
+                  "evidenceFields":["usage_per_token","local_token_activity"]
+                }
+                """
             )
         )
         XCTAssertThrowsError(
             try CodexAssistedResultDecoder.decode(
-                #"{"title":"Pattern","summary":"A weak guess","evidenceFields":["usage_per_token"]}"#
+                """
+                {
+                  "status":"insight",
+                  "title":"One visible fact",
+                  "finding":"Usage remaining is available.",
+                  "whyItMatters":"The weekly window is active.",
+                  "recommendation":"Try checking it later.",
+                  "evidenceFields":["usage_remaining"]
+                }
+                """
             )
         )
     }
@@ -875,6 +1043,7 @@ final class CodexAssistedInsightTests: XCTestCase {
             usageRemaining: weak.usageRemaining,
             weeklyResetAt: weak.weeklyResetAt,
             evidence: weak.evidence,
+            paceGuidance: weak.paceGuidance,
             accountTokenActivity: weak.accountTokenActivity,
             localTokenActivity: .init(
                 tokens: weak.localTokenActivity.tokens,
@@ -888,19 +1057,64 @@ final class CodexAssistedInsightTests: XCTestCase {
         )
         XCTAssertNil(
             CodexAssistedEvidenceResolver.resolve(
-                kind: .localTokenActivity,
+                selection: metadataSelection(
+                    evidenceFields: [
+                        .localTokenActivity,
+                        .usageRemaining
+                    ]
+                ),
                 payload: weak
             )
         )
         let resolved = CodexAssistedEvidenceResolver.resolve(
-            kind: .usagePerToken,
+            selection: metadataSelection(
+                evidenceFields: [.usagePerToken, .usageRemaining]
+            ),
             payload: metadataPayload()
         )
-        XCTAssertEqual(resolved?.title, "Usage per token")
+        XCTAssertEqual(resolved?.title, "Allowance intensity increased")
         XCTAssertEqual(
             resolved?.summary,
-            "Usage per token is 1.25× the reference for this period."
+            "Usage per token is higher than the reference while usage remains available."
         )
+        XCTAssertEqual(resolved?.evidence.count, 4)
+        XCTAssertEqual(resolved?.confidence, .high)
+        let withheld = CodexAssistedEvidenceResolver.resolve(
+            selection: CodexMetadataInsightSelection(
+                status: .insufficientEvidence,
+                title: "Not enough evidence",
+                finding: "A comparable reference period is missing.",
+                whyItMatters: "",
+                recommendation: "",
+                evidenceFields: []
+            ),
+            payload: metadataPayload()
+        )
+        XCTAssertEqual(withheld?.title, "Not enough evidence")
+        XCTAssertEqual(withheld?.confidence, .unavailable)
+    }
+
+    func testLowCoveragePaceGuidanceStillProducesCautiousAction() {
+        let payload = lowCoveragePacePayload()
+        let resolved = CodexAssistedEvidenceResolver.resolve(
+            selection: CodexMetadataInsightSelection(
+                status: .insight,
+                title: "Use available headroom",
+                finding: "The observed pace is below the sustainable pace for this window.",
+                whyItMatters: "Unused headroom may remain when the allowance resets.",
+                recommendation: "Try moving closer to the recommended pace, then compare the refreshed forecast.",
+                evidenceFields: [.paceGuidance, .usageRemaining]
+            ),
+            payload: payload
+        )
+
+        XCTAssertTrue(
+            CodexAssistedEvidenceResolver.canAnalyze(payload: payload)
+        )
+        XCTAssertEqual(resolved?.title, "Use available headroom")
+        XCTAssertEqual(resolved?.coverage, .low)
+        XCTAssertEqual(resolved?.confidence, .low)
+        XCTAssertEqual(resolved?.evidence.count, 4)
     }
 
     func testLiveClientReadsCatalogAndRunsOneEphemeralAnalysis() async throws {
@@ -922,7 +1136,7 @@ final class CodexAssistedInsightTests: XCTestCase {
         let requests = fixture.snapshot()
 
         XCTAssertEqual(result.source, "Codex-assisted")
-        XCTAssertEqual(result.title, "Usage per token")
+        XCTAssertEqual(result.title, "Allowance intensity increased")
         XCTAssertEqual(result.overhead.durationSeconds, 12)
         XCTAssertEqual(
             result.overhead.accountMovement,
@@ -971,7 +1185,7 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertEqual(requests.rateLimitReads, 2)
     }
 
-    func testLiveClientRejectsUnknownEnabledFeatureBeforeThreadStart() async {
+    func testLiveClientDisablesUnknownEnabledFeature() async {
         let fixture = CodexAssistedProtocolFixture(
             addsUnknownEnabledFeature: true
         )
@@ -986,12 +1200,40 @@ final class CodexAssistedInsightTests: XCTestCase {
             profile: eligibleProfile()
         )
 
-        guard case .failed = outcome else {
-            return XCTFail("Expected an unknown feature to fail closed")
+        guard case .succeeded = outcome else {
+            return XCTFail("Expected the advertised feature to be disabled")
         }
         let requests = fixture.snapshot()
-        XCTAssertEqual(requests.threadStartCount, 0)
-        XCTAssertEqual(requests.turnStartCount, 0)
+        XCTAssertEqual(requests.threadStartCount, 1)
+        XCTAssertEqual(requests.turnStartCount, 1)
+        XCTAssertTrue(requests.isolationVerified)
+    }
+
+    func testLiveClientRejectsUntrustedFeatureLists() async {
+        for featureList in [
+            FeatureListFixture.malformed,
+            .failed
+        ] {
+            let fixture = CodexAssistedProtocolFixture(
+                featureList: featureList
+            )
+            let client = CodexAssistedClient(
+                makeConnection: { try fixture.makeConnection() },
+                timeout: 1,
+                now: { fixture.now() }
+            )
+
+            let outcome = await client.analyze(
+                payload: metadataPayload(),
+                profile: eligibleProfile()
+            )
+
+            guard case .failed = outcome else {
+                XCTFail("Expected the untrusted feature list to fail closed")
+                continue
+            }
+            XCTAssertEqual(fixture.snapshot().threadStartCount, 0)
+        }
     }
 
     func testLiveClientRequiresAnExplicitEmptyInstructionSourceList() async throws {
@@ -1250,19 +1492,32 @@ final class CodexAssistedInsightTests: XCTestCase {
     }
 
     private func metadataPayload(
-        generatedAt: Int64 = 2_000
+        generatedAt: Int64 = 2_000,
+        remainingPercent: Double = 37,
+        weeklyResetAt: Int64 = 3_000
     ) -> CodexMetadataAnalysisPayload {
         CodexMetadataAnalysisPayload(
             schemaVersion: 1,
             generatedAt: generatedAt,
             range: .init(start: 1_000, end: 2_000),
             usageRemaining: .init(
-                percent: 37,
-                interval: .init(start: 1_000, end: 3_000)
+                percent: remainingPercent,
+                interval: .init(start: 1_000, end: weeklyResetAt)
             ),
-            weeklyResetAt: 3_000,
+            weeklyResetAt: weeklyResetAt,
             evidence: .init(
                 freshness: "fresh",
+                coverage: "high",
+                confidence: "high"
+            ),
+            paceGuidance: .init(
+                status: "roomToUseMore",
+                expectedRemainingAtReset: 14,
+                safetyRemainingAtReset: 10,
+                recommendedPercentPerDay: 8,
+                currentPercentPerDay: 5,
+                historicalPercentPerDay: 6,
+                historicalReferenceSource: "Account history",
                 coverage: "high",
                 confidence: "high"
             ),
@@ -1306,6 +1561,77 @@ final class CodexAssistedInsightTests: XCTestCase {
                     reasoning: false
                 )
             )
+        )
+    }
+
+    private func metadataSelection(
+        evidenceFields: [CodexMetadataEvidenceField]
+    ) -> CodexMetadataInsightSelection {
+        CodexMetadataInsightSelection(
+            status: .insight,
+            title: "Allowance intensity increased",
+            finding: "Usage per token is higher than the reference while usage remains available.",
+            whyItMatters: "The selected work may reach the reset with less useful capacity than the reference period.",
+            recommendation: "Try a smaller task scope and compare the next bounded period with the same reference.",
+            evidenceFields: evidenceFields
+        )
+    }
+
+    private func lowCoveragePacePayload() -> CodexMetadataAnalysisPayload {
+        let base = metadataPayload()
+        return CodexMetadataAnalysisPayload(
+            schemaVersion: base.schemaVersion,
+            generatedAt: base.generatedAt,
+            range: base.range,
+            usageRemaining: base.usageRemaining,
+            weeklyResetAt: base.weeklyResetAt,
+            evidence: .init(
+                freshness: "fresh",
+                coverage: "low",
+                confidence: "low"
+            ),
+            paceGuidance: .init(
+                status: "roomToUseMore",
+                expectedRemainingAtReset: 14,
+                safetyRemainingAtReset: 10,
+                recommendedPercentPerDay: 8,
+                currentPercentPerDay: 5,
+                historicalPercentPerDay: nil,
+                historicalReferenceSource: nil,
+                coverage: "low",
+                confidence: "low"
+            ),
+            accountTokenActivity: .init(
+                tokens: nil,
+                state: "unavailable",
+                interval: nil
+            ),
+            localTokenActivity: .init(
+                tokens: nil,
+                coverage: "unavailable",
+                interval: nil
+            ),
+            activity: .init(
+                activeSeconds: nil,
+                peakConcurrentTasks: nil,
+                coverage: "unavailable",
+                interval: nil
+            ),
+            usagePerToken: .init(
+                multiplier: nil,
+                coverage: "unavailable",
+                confidence: "unavailable",
+                currentInterval: nil,
+                referenceInterval: nil
+            ),
+            activeTimeAvailable: .init(
+                lowerSeconds: nil,
+                upperSeconds: nil,
+                coverage: "unavailable",
+                confidence: "unavailable",
+                observedInterval: nil
+            ),
+            scope: base.scope
         )
     }
 
@@ -1524,12 +1850,19 @@ private enum InstructionSourcesFixture {
     case malformed
 }
 
+private enum FeatureListFixture {
+    case valid
+    case malformed
+    case failed
+}
+
 private final class CodexAssistedProtocolFixture: @unchecked Sendable {
     private let lock = NSLock()
     private let sendsToolCall: Bool
     private let sendsUnknownItem: Bool
     private let dropsCatalogConnection: Bool
     private let addsUnknownEnabledFeature: Bool
+    private let featureList: FeatureListFixture
     private let delaysThreadResponse: Bool
     private let accountIsMissing: Bool
     private let instructionSources: InstructionSourcesFixture
@@ -1553,6 +1886,7 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
         sendsUnknownItem: Bool = false,
         dropsCatalogConnection: Bool = false,
         addsUnknownEnabledFeature: Bool = false,
+        featureList: FeatureListFixture = .valid,
         delaysThreadResponse: Bool = false,
         accountIsMissing: Bool = false,
         instructionSources: InstructionSourcesFixture = .empty,
@@ -1563,6 +1897,7 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
         self.sendsUnknownItem = sendsUnknownItem
         self.dropsCatalogConnection = dropsCatalogConnection
         self.addsUnknownEnabledFeature = addsUnknownEnabledFeature
+        self.featureList = featureList
         self.delaysThreadResponse = delaysThreadResponse
         self.accountIsMissing = accountIsMissing
         self.instructionSources = instructionSources
@@ -1649,7 +1984,14 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
                     let unknown = addsUnknownEnabledFeature
                         ? #",{"name":"future_tool","stage":"stable","enabled":true,"defaultEnabled":true}"#
                         : ""
-                    response = #"{"id":\#(id),"result":{"data":[{"name":"apps","stage":"stable","enabled":true,"defaultEnabled":true},{"name":"multi_agent","stage":"stable","enabled":true,"defaultEnabled":true},{"name":"fast_mode","stage":"stable","enabled":true,"defaultEnabled":true}\#(unknown)],"nextCursor":null}}"#
+                    response = switch featureList {
+                    case .valid:
+                        #"{"id":\#(id),"result":{"data":[{"name":"apps","stage":"stable","enabled":true,"defaultEnabled":true},{"name":"multi_agent","stage":"stable","enabled":true,"defaultEnabled":true},{"name":"fast_mode","stage":"stable","enabled":true,"defaultEnabled":true}\#(unknown)],"nextCursor":null}}"#
+                    case .malformed:
+                        #"{"id":\#(id),"result":{"data":[{"name":"apps"}],"nextCursor":null}}"#
+                    case .failed:
+                        #"{"id":\#(id),"error":{"code":-32603,"message":"feature list unavailable"}}"#
+                    }
                 case "config/read":
                     lock.withLock { configReads += 1 }
                     response = #"{"id":\#(id),"result":{"config":{"mcp_servers":{"local-server":{"enabled":true}}},"origins":{}}}"#
@@ -1661,11 +2003,16 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
                             as? [String: Bool]
                         let servers = config?["mcp_servers"]
                             as? [String: [String: Bool]]
+                        let expectedFeatures = Dictionary(
+                            uniqueKeysWithValues: (
+                                ["apps", "multi_agent", "fast_mode"]
+                                    + (addsUnknownEnabledFeature
+                                        ? ["future_tool"]
+                                        : [])
+                            ).map { ($0, false) }
+                        )
                         isolationVerified =
-                            features == [
-                                "apps": false,
-                                "multi_agent": false
-                            ]
+                            features == expectedFeatures
                             && servers == [
                                 "local-server": ["enabled": false]
                             ]
@@ -1707,7 +2054,7 @@ private final class CodexAssistedProtocolFixture: @unchecked Sendable {
                                     "item": [
                                         "id": "message-1",
                                         "type": "agentMessage",
-                                        "text": #"{"insightKind":"usage_per_token_change"}"#
+                                        "text": #"{"status":"insight","title":"Allowance intensity increased","finding":"Usage per token is higher than the reference while local activity remains well covered.","whyItMatters":"The selected work may reach the reset with less useful capacity than the reference period.","recommendation":"Try a smaller task scope and compare the next bounded period with the same reference.","evidenceFields":["usage_per_token","local_token_activity"]}"#
                                     ]
                                 ]
                             ],

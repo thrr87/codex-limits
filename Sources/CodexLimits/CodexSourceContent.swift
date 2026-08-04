@@ -194,47 +194,28 @@ struct CodexSourceAnalysisPayload: Codable, Equatable, Sendable {
     }
 }
 
-enum CodexSourceInsightKind: String, Codable, CaseIterable, Sendable {
-    case repeatedWork = "repeated_work"
-    case verificationGap = "verification_gap"
-    case repeatedToolSteps = "repeated_tool_steps"
-    case longExchanges = "long_exchanges"
-    case checksAfterChanges = "checks_after_changes"
-
-    var title: String {
-        switch self {
-        case .repeatedWork: "Repeated work"
-        case .verificationGap: "Verification gap"
-        case .repeatedToolSteps: "Repeated tool steps"
-        case .longExchanges: "Long exchanges"
-        case .checksAfterChanges: "Checks followed changes"
-        }
-    }
-
-    var summary: String {
-        switch self {
-        case .repeatedWork:
-            "Codex found the same work in more than one selected item."
-        case .verificationGap:
-            "Codex found changes or completion claims without matching checks in the selected items."
-        case .repeatedToolSteps:
-            "Codex found tool or command steps that needed more than one attempt."
-        case .longExchanges:
-            "Codex found long or repeated exchanges that may work better as a smaller task."
-        case .checksAfterChanges:
-            "Codex found checks that followed changes in the selected items."
-        }
-    }
-}
-
 struct CodexSourceEvidenceReference: Codable, Equatable, Sendable {
     let category: CodexSourceContentCategory
     let itemNumbers: [Int]
 }
 
 struct CodexSourceInsightSelection: Codable, Equatable, Sendable {
-    let sourceInsightKind: CodexSourceInsightKind
+    let status: CodexAssistedResponseStatus
+    let title: String
+    let finding: String
+    let whyItMatters: String
+    let recommendation: String
     let evidence: [CodexSourceEvidenceReference]
+
+    var narrative: CodexAssistedNarrative {
+        CodexAssistedNarrative(
+            status: status,
+            title: title,
+            finding: finding,
+            whyItMatters: whyItMatters,
+            recommendation: recommendation
+        )
+    }
 }
 
 enum CodexSourceResultDecoder {
@@ -247,13 +228,39 @@ enum CodexSourceResultDecoder {
         guard let object = try JSONSerialization.jsonObject(
             with: data
         ) as? [String: Any],
-              Set(object.keys) == ["sourceInsightKind", "evidence"] else {
+              Set(object.keys) == [
+                  "status", "title", "finding", "whyItMatters",
+                  "recommendation", "evidence"
+              ] else {
             throw CodexAssistedRequestError.invalidResult
         }
         let decoded = try JSONDecoder().decode(
             CodexSourceInsightSelection.self,
             from: data
         )
+        guard decoded.narrative.isValid,
+              !exposesSourceContent(
+                  decoded.narrative,
+                  payload: payload
+              ) else {
+            throw CodexAssistedRequestError.invalidResult
+        }
+        if decoded.status == .insufficientEvidence {
+            guard decoded.evidence.isEmpty else {
+                throw CodexAssistedRequestError.invalidResult
+            }
+            return CodexAssistedEvidenceEnvelope(
+                title: decoded.title,
+                summary: decoded.finding,
+                evidence: [],
+                intervals: [],
+                freshness: UsageFreshness(
+                    rawValue: metadata.evidence.freshness
+                ) ?? .unavailable,
+                coverage: .unavailable,
+                confidence: .unavailable
+            )
+        }
         guard decoded.evidence.count >= 2,
               decoded.evidence.count <= 6 else {
             throw CodexAssistedRequestError.invalidResult
@@ -301,9 +308,12 @@ enum CodexSourceResultDecoder {
             throw CodexAssistedRequestError.invalidResult
         }
         return CodexAssistedEvidenceEnvelope(
-            title: decoded.sourceInsightKind.title,
-            summary: decoded.sourceInsightKind.summary,
-            evidence: labels,
+            title: decoded.title,
+            summary: decoded.finding,
+            evidence: [
+                "Why it matters: \(decoded.whyItMatters)",
+                "Try next: \(decoded.recommendation)"
+            ] + labels,
             intervals: [interval],
             freshness: UsageFreshness(
                 rawValue: metadata.evidence.freshness
@@ -311,6 +321,47 @@ enum CodexSourceResultDecoder {
             coverage: .high,
             confidence: .high
         )
+    }
+
+    private static func exposesSourceContent(
+        _ narrative: CodexAssistedNarrative,
+        payload: CodexSourceAnalysisPayload
+    ) -> Bool {
+        let outputWords = words(
+            [
+                narrative.title, narrative.finding,
+                narrative.whyItMatters, narrative.recommendation
+            ].joined(separator: " ")
+        )
+        let outputPhrases = Set(phrases(outputWords))
+        for value in payload.sourceContent.values.flatMap({ $0 }) {
+            let sourceWords = words(value)
+            if sourceWords.count >= 4,
+               !outputPhrases.isDisjoint(with: phrases(sourceWords)) {
+                return true
+            }
+            let source = sourceWords.joined(separator: " ")
+            if !source.isEmpty,
+               source.count >= 8,
+               sourceWords.count < 4,
+               outputWords.joined(separator: " ").contains(source) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func words(_ text: String) -> [String] {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+    }
+
+    private static func phrases(_ words: [String]) -> Set<String> {
+        guard words.count >= 4 else { return [] }
+        return Set((0 ... words.count - 4).map {
+            words[$0 ..< $0 + 4].joined(separator: " ")
+        })
     }
 }
 
