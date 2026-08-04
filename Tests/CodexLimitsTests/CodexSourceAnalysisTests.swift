@@ -142,7 +142,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
         )
     }
 
-    func testSourceResultUsesOnlyValidatedReferencesAndDerivedCopy() throws {
+    func testSourceResultUsesValidatedReferencesWithoutExposingContent() throws {
         let draft = CodexSourceContentDraft(
             selection: sourceSelection(),
             values: [
@@ -158,7 +158,11 @@ final class CodexSourceAnalysisTests: XCTestCase {
         let result = try CodexSourceResultDecoder.decode(
             """
             {
-              "sourceInsightKind":"repeated_work",
+              "status":"insight",
+              "title":"Repeated effort",
+              "finding":"Several selected exchanges revisit the same requested outcome.",
+              "whyItMatters":"Repeated exchanges can make the task harder to verify.",
+              "recommendation":"Try stating the acceptance check before the next similar task.",
               "evidence":[
                 {"category":"prompts","itemNumbers":[1,2]},
                 {"category":"commands","itemNumbers":[1]}
@@ -169,14 +173,39 @@ final class CodexSourceAnalysisTests: XCTestCase {
             metadata: metadataPayload()
         )
 
-        XCTAssertEqual(result.title, "Repeated work")
+        XCTAssertEqual(result.title, "Repeated effort")
         XCTAssertEqual(
             result.evidence,
-            ["Prompts · items 1, 2", "Commands · item 1"]
+            [
+                "Why it matters: Repeated exchanges can make the task harder to verify.",
+                "Try next: Try stating the acceptance check before the next similar task.",
+                "Prompts · items 1, 2",
+                "Commands · item 1"
+            ]
         )
         XCTAssertEqual(result.confidence, .high)
         XCTAssertFalse(result.summary.contains("Private prompt"))
         XCTAssertFalse(result.evidence.joined().contains("swift test"))
+
+        XCTAssertThrowsError(
+            try CodexSourceResultDecoder.decode(
+                """
+                {
+                  "status":"insight",
+                  "title":"Repeated effort",
+                  "finding":"Private prompt Follow-up appears again.",
+                  "whyItMatters":"Repeated exchanges can hide the acceptance check.",
+                  "recommendation":"Try stating the check before the next task.",
+                  "evidence":[
+                    {"category":"prompts","itemNumbers":[1,2]},
+                    {"category":"commands","itemNumbers":[1]}
+                  ]
+                }
+                """,
+                payload: payload,
+                metadata: metadataPayload()
+            )
+        )
     }
 
     func testSourceResultRejectsMissingOrOutOfRangeEvidence() throws {
@@ -192,11 +221,60 @@ final class CodexSourceAnalysisTests: XCTestCase {
             try CodexSourceResultDecoder.decode(
                 """
                 {
-                  "sourceInsightKind":"repeated_work",
+                  "status":"insight",
+                  "title":"Repeated effort",
+                  "finding":"Several selected exchanges revisit the same requested outcome.",
+                  "whyItMatters":"Repeated exchanges can make the task harder to verify.",
+                  "recommendation":"Try stating the acceptance check before the next similar task.",
                   "evidence":[
                     {"category":"prompts","itemNumbers":[1]},
                     {"category":"prompts","itemNumbers":[2]}
                   ]
+                }
+                """,
+                payload: payload,
+                metadata: metadataPayload()
+            )
+        )
+    }
+
+    func testSourceResultWithholdsWhenEvidenceIsInsufficient() throws {
+        let payload = try CodexSourceAnalysisPayload(
+            draft: CodexSourceContentDraft(
+                selection: sourceSelection(),
+                values: [.prompts: ["Only item"]]
+            ),
+            categories: [.prompts]
+        )
+
+        let result = try CodexSourceResultDecoder.decode(
+            """
+            {
+              "status":"insufficient_evidence",
+              "title":"Not enough evidence",
+              "finding":"The selected content does not contain a repeated supported pattern.",
+              "whyItMatters":"",
+              "recommendation":"",
+              "evidence":[]
+            }
+            """,
+            payload: payload,
+            metadata: metadataPayload()
+        )
+
+        XCTAssertEqual(result.title, "Not enough evidence")
+        XCTAssertEqual(result.confidence, .unavailable)
+        XCTAssertTrue(result.evidence.isEmpty)
+        XCTAssertThrowsError(
+            try CodexSourceResultDecoder.decode(
+                """
+                {
+                  "status":"insufficient_evidence",
+                  "title":"Not enough evidence",
+                  "finding":"Only item does not show a repeated supported pattern.",
+                  "whyItMatters":"",
+                  "recommendation":"",
+                  "evidence":[]
                 }
                 """,
                 payload: payload,
@@ -797,7 +875,10 @@ final class CodexSourceAnalysisTests: XCTestCase {
         XCTAssertFalse(text.contains("\"responses\""))
         XCTAssertFalse(text.contains("\"paths\""))
         XCTAssertFalse(text.contains("\"metadata\""))
-        XCTAssertNotNil(properties["sourceInsightKind"])
+        XCTAssertNotNil(properties["status"])
+        XCTAssertNotNil(properties["finding"])
+        XCTAssertNotNil(properties["whyItMatters"])
+        XCTAssertNotNil(properties["recommendation"])
         XCTAssertNotNil(properties["evidence"])
         XCTAssertNil(properties["insightKind"])
     }
@@ -968,6 +1049,17 @@ final class CodexSourceAnalysisTests: XCTestCase {
             weeklyResetAt: 2_000,
             evidence: .init(
                 freshness: "fresh",
+                coverage: "high",
+                confidence: "high"
+            ),
+            paceGuidance: .init(
+                status: "roomToUseMore",
+                expectedRemainingAtReset: 14,
+                safetyRemainingAtReset: 10,
+                recommendedPercentPerDay: 8,
+                currentPercentPerDay: 5,
+                historicalPercentPerDay: 6,
+                historicalReferenceSource: "Account history",
                 coverage: "high",
                 confidence: "high"
             ),

@@ -3999,6 +3999,13 @@ struct InsightsWorkspace: View {
                     } else if assistedInsights.wasCancelled {
                         Text("Analysis stopped.")
                             .foregroundStyle(.secondary)
+                    } else if !CodexAssistedEvidenceResolver.canAnalyze(
+                        payload: assistedPayload
+                    ) {
+                        Text(
+                            "More usage history is needed before metadata analysis can add useful guidance."
+                        )
+                        .foregroundStyle(.secondary)
                     } else {
                         Text("Ask Codex to analyze the metadata shown here.")
                             .foregroundStyle(.secondary)
@@ -4012,19 +4019,25 @@ struct InsightsWorkspace: View {
                 if assistedInsights.showsAnalyzeAction,
                    !assistedInsights.isRunning {
                     HStack(spacing: 10) {
-                        Button(
-                            assistedInsights.result(for: assistedScope) == nil
-                                ? "Analyze metadata"
-                                : "Analyze metadata again"
+                        if CodexAssistedEvidenceResolver.canAnalyze(
+                            payload: assistedPayload
                         ) {
-                            assistedInsights.startAnalysis(
-                                payload: assistedPayload,
-                                scope: assistedScope
+                            Button(
+                                assistedInsights.result(
+                                    for: assistedScope
+                                ) == nil
+                                    ? "Analyze metadata"
+                                    : "Analyze metadata again"
+                            ) {
+                                assistedInsights.startAnalysis(
+                                    payload: assistedPayload,
+                                    scope: assistedScope
+                                )
+                            }
+                            .accessibilityHint(
+                                "Sends bounded metadata to Codex and uses your allowance"
                             )
                         }
-                        .accessibilityHint(
-                            "Sends bounded metadata to Codex and uses your allowance"
-                        )
 
                         if let sourceSelection {
                             Button("Analyze Source Content") {

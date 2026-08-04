@@ -61,6 +61,7 @@ enum CodexAssistedModelCatalog {
 
 enum CodexMetadataEvidenceField: String, Codable, CaseIterable, Sendable {
     case usageRemaining = "usage_remaining"
+    case paceGuidance = "pace_guidance"
     case accountTokenActivity = "account_token_activity"
     case localTokenActivity = "local_token_activity"
     case activity
@@ -68,23 +69,60 @@ enum CodexMetadataEvidenceField: String, Codable, CaseIterable, Sendable {
     case activeTimeAvailable = "active_time_available"
 }
 
-enum CodexAssistedInsightKind: String, Codable, CaseIterable, Sendable {
-    case usageRemaining = "usage_remaining_status"
-    case accountTokenActivity = "account_token_activity"
-    case localTokenActivity = "local_token_activity"
-    case activity = "activity_summary"
-    case usagePerToken = "usage_per_token_change"
-    case activeTimeAvailable = "active_time_available"
+enum CodexAssistedResponseStatus: String, Codable, Sendable {
+    case insight
+    case insufficientEvidence = "insufficient_evidence"
+}
 
-    var evidenceField: CodexMetadataEvidenceField {
-        switch self {
-        case .usageRemaining: .usageRemaining
-        case .accountTokenActivity: .accountTokenActivity
-        case .localTokenActivity: .localTokenActivity
-        case .activity: .activity
-        case .usagePerToken: .usagePerToken
-        case .activeTimeAvailable: .activeTimeAvailable
+struct CodexAssistedNarrative: Codable, Equatable, Sendable {
+    let status: CodexAssistedResponseStatus
+    let title: String
+    let finding: String
+    let whyItMatters: String
+    let recommendation: String
+
+    var isValid: Bool {
+        switch status {
+        case .insight:
+            return Self.isText(title, maximumLength: 80)
+                && Self.isText(finding, maximumLength: 360)
+                && Self.isText(whyItMatters, maximumLength: 360)
+                && Self.isText(recommendation, maximumLength: 360)
+                && !containsUnsupportedClaim
+        case .insufficientEvidence:
+            return title == "Not enough evidence"
+                && Self.isText(finding, maximumLength: 360)
+                && whyItMatters.isEmpty
+                && recommendation.isEmpty
         }
+    }
+
+    private var containsUnsupportedClaim: Bool {
+        let words = Set(
+            [title, finding, whyItMatters, recommendation]
+                .joined(separator: " ")
+                .lowercased()
+                .split { !$0.isLetter }
+                .map(String.init)
+        )
+        return !words.isDisjoint(with: [
+            "because", "billing", "caused", "causes", "cost",
+            "efficiency", "efficient", "price", "pricing", "proves",
+            "quality", "waste", "will"
+        ])
+    }
+
+    private static func isText(
+        _ text: String,
+        maximumLength: Int
+    ) -> Bool {
+        !text.isEmpty
+            && text.count <= maximumLength
+            && text == text.trimmingCharacters(in: .whitespacesAndNewlines)
+            && text.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+                    && !CharacterSet.decimalDigits.contains($0)
+            }
     }
 }
 
@@ -140,6 +178,18 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
         let observedInterval: EpochRange?
     }
 
+    struct PaceGuidance: Codable, Equatable, Sendable {
+        let status: String
+        let expectedRemainingAtReset: Double
+        let safetyRemainingAtReset: Double
+        let recommendedPercentPerDay: Double
+        let currentPercentPerDay: Double
+        let historicalPercentPerDay: Double?
+        let historicalReferenceSource: String?
+        let coverage: String
+        let confidence: String
+    }
+
     struct AppliedFilters: Codable, Equatable, Sendable {
         let project: Bool
         let taskTree: Bool
@@ -159,6 +209,7 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
     let usageRemaining: UsageRemaining
     let weeklyResetAt: Int64?
     let evidence: Evidence
+    let paceGuidance: PaceGuidance?
     let accountTokenActivity: AccountTokens
     let localTokenActivity: LocalTokens
     let activity: Activity
@@ -240,6 +291,33 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
                 coverage: reader.evidence.coverage.rawValue,
                 confidence: reader.evidence.confidence.rawValue
             ),
+            paceGuidance: reader.guidance.flatMap { guidance in
+                let forecast = guidance.forecast
+                let values = [
+                    forecast.expectedRemainingAtReset,
+                    forecast.safetyRemainingAtReset,
+                    forecast.recommendedPercentPerDay,
+                    forecast.currentPercentPerDay
+                ]
+                guard values.allSatisfy(\.isFinite),
+                      forecast.historicalReference?.percentPerDay.isFinite
+                        ?? true else {
+                    return nil
+                }
+                return PaceGuidance(
+                    status: forecast.status.rawValue,
+                    expectedRemainingAtReset: forecast.expectedRemainingAtReset,
+                    safetyRemainingAtReset: forecast.safetyRemainingAtReset,
+                    recommendedPercentPerDay: forecast.recommendedPercentPerDay,
+                    currentPercentPerDay: forecast.currentPercentPerDay,
+                    historicalPercentPerDay: forecast
+                        .historicalReference?.percentPerDay,
+                    historicalReferenceSource: forecast
+                        .historicalReferenceSource?.rawValue,
+                    coverage: reader.evidence.coverage.rawValue,
+                    confidence: reader.evidence.confidence.rawValue
+                )
+            },
             accountTokenActivity: AccountTokens(
                 tokens: reader.accountTokenActivity.tokens,
                 state: reader.accountTokenActivity.state.rawValue,
@@ -330,57 +408,6 @@ enum CodexAssistedRequestError: Error {
 enum CodexAssistedRequestFactory {
     static let maximumMetadataBytes = 8_192
     static let maximumSourceBytes = 65_536
-    static let toolProvidingFeatures: Set<String> = [
-        "apps",
-        "artifact",
-        "auth_elicitation",
-        "browser_use",
-        "browser_use_external",
-        "browser_use_full_cdp_access",
-        "code_mode",
-        "code_mode_buffered_exec",
-        "code_mode_host",
-        "code_mode_only",
-        "computer_use",
-        "default_mode_request_user_input",
-        "deferred_executor",
-        "enable_mcp_apps",
-        "executor_capability_discovery",
-        "goals",
-        "guardian_approval",
-        "hooks",
-        "image_generation",
-        "in_app_browser",
-        "multi_agent",
-        "multi_agent_v2",
-        "plugins",
-        "plugin_sharing",
-        "remote_plugin",
-        "request_permissions_tool",
-        "shell_snapshot",
-        "shell_tool",
-        "skill_mcp_dependency_install",
-        "skill_search",
-        "standalone_web_search",
-        "tool_call_mcp_elicitation",
-        "tool_suggest",
-        "unified_exec",
-        "workspace_dependencies"
-    ]
-    static let benignEnabledFeatures: Set<String> = [
-        "collaboration_modes",
-        "enable_request_compression",
-        "fast_mode",
-        "mentions_v2",
-        "personality",
-        "remote_compaction_v2",
-        "resize_all_images",
-        "sqlite",
-        "steer",
-        "terminal_resize_reflow",
-        "tool_search_always_defer_mcp_tools",
-        "tui_app_server"
-    ]
 
     static func modelList(id: Int, cursor: String? = nil) -> [String: Any] {
         return [
@@ -586,8 +613,9 @@ enum CodexAssistedRequestFactory {
     private static let baseInstructions =
         "Analyze only the JSON supplied in the user message. Do not use tools, files, commands, network access, other tasks, or outside knowledge."
 
-    private static let developerInstructions =
-        "Return only the current output schema. For metadata, choose the single most useful supported insight kind. For Source Content, choose only a High-confidence pattern supported by at least two exact category and one-based item references. Never quote or reproduce Source Content. If the evidence does not meet that bar, return an error."
+    private static let developerInstructions = """
+        Return only the current output schema. For Metadata analysis, the app preflights metadata for usefulness. When pace_guidance and usage_remaining are available, return insight with exactly those two evidence fields; explain what the current pace implies, why that matters before reset, and one concrete conditional adjustment, calibrated to their confidence even when coverage is Low or Partial. Otherwise, produce a Metadata insight only when at least two available High- or Complete-coverage evidence fields support a useful relationship. Keep title, finding, whyItMatters, and recommendation free of digits and the words because, billing, caused, causes, cost, efficiency, efficient, price, pricing, proves, quality, waste, will. Do not merely restate visible values or dates in prose, invent facts, claim causality, judge task quality or efficiency, or make billing, pricing, cost, or exact per-task allowance claims. If Metadata evidence cannot support a useful conclusion, return insufficient_evidence with title \"Not enough evidence\", explain what evidence is missing in finding, and leave the other prose and references empty. For Source Content analysis, require a High-confidence pattern supported by at least two exact category and one-based item references. Never quote or reproduce Source Content.
+        """
 
     private static func requestText(metadata: String) -> String {
         """
@@ -600,11 +628,30 @@ enum CodexAssistedRequestFactory {
     private static let metadataOutputSchema: [String: Any] = [
         "type": "object",
         "additionalProperties": false,
-        "required": ["insightKind"],
+        "required": [
+            "status", "title", "finding", "whyItMatters",
+            "recommendation", "evidenceFields"
+        ],
         "properties": [
-            "insightKind": [
+            "status": [
                 "type": "string",
-                "enum": CodexAssistedInsightKind.allCases.map(\.rawValue)
+                "enum": [
+                    CodexAssistedResponseStatus.insight.rawValue,
+                    CodexAssistedResponseStatus.insufficientEvidence.rawValue
+                ]
+            ],
+            "title": ["type": "string", "maxLength": 80],
+            "finding": ["type": "string", "maxLength": 360],
+            "whyItMatters": ["type": "string", "maxLength": 360],
+            "recommendation": ["type": "string", "maxLength": 360],
+            "evidenceFields": [
+                "type": "array",
+                "maxItems": 4,
+                "items": [
+                    "type": "string",
+                    "enum": CodexMetadataEvidenceField.allCases
+                        .map(\.rawValue)
+                ]
             ]
         ]
     ]
@@ -612,15 +659,24 @@ enum CodexAssistedRequestFactory {
     private static let sourceOutputSchema: [String: Any] = [
         "type": "object",
         "additionalProperties": false,
-        "required": ["sourceInsightKind", "evidence"],
+        "required": [
+            "status", "title", "finding", "whyItMatters",
+            "recommendation", "evidence"
+        ],
         "properties": [
-            "sourceInsightKind": [
+            "status": [
                 "type": "string",
-                "enum": CodexSourceInsightKind.allCases.map(\.rawValue)
+                "enum": [
+                    CodexAssistedResponseStatus.insight.rawValue,
+                    CodexAssistedResponseStatus.insufficientEvidence.rawValue
+                ]
             ],
+            "title": ["type": "string", "maxLength": 80],
+            "finding": ["type": "string", "maxLength": 360],
+            "whyItMatters": ["type": "string", "maxLength": 360],
+            "recommendation": ["type": "string", "maxLength": 360],
             "evidence": [
                 "type": "array",
-                "minItems": 2,
                 "maxItems": 6,
                 "items": [
                     "type": "object",
@@ -636,7 +692,6 @@ enum CodexAssistedRequestFactory {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 4,
-                            "uniqueItems": true,
                             "items": [
                                 "type": "integer",
                                 "minimum": 1
@@ -717,8 +772,11 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
 
     var fingerprint: String {
         let identity = Identity(
+            analysisContractVersion: 2,
             accountPartitionID: accountPartitionID,
-            payloadFingerprint: payload.fingerprint,
+            currentWindowResetAt: timeRange == .currentWindow
+                ? payload.weeklyResetAt
+                : nil,
             sourceSelectionFingerprint: sourceSelectionFingerprint,
             sourceCategories: sourceCategories,
             timeRange: timeRange,
@@ -780,8 +838,9 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
     }
 
     private struct Identity: Codable {
+        let analysisContractVersion: Int
         let accountPartitionID: String?
-        let payloadFingerprint: String
+        let currentWindowResetAt: Int64?
         let sourceSelectionFingerprint: String?
         let sourceCategories: [String]?
         let timeRange: AnalyticsTimeRange
@@ -792,26 +851,52 @@ struct CodexAssistedAnalysisScope: Equatable, Sendable {
     }
 }
 
-private struct DecodedCodexAssistedResult: Decodable {
-    let insightKind: CodexAssistedInsightKind
+struct CodexMetadataInsightSelection: Decodable, Equatable, Sendable {
+    let status: CodexAssistedResponseStatus
+    let title: String
+    let finding: String
+    let whyItMatters: String
+    let recommendation: String
+    let evidenceFields: [CodexMetadataEvidenceField]
+
+    var narrative: CodexAssistedNarrative {
+        CodexAssistedNarrative(
+            status: status,
+            title: title,
+            finding: finding,
+            whyItMatters: whyItMatters,
+            recommendation: recommendation
+        )
+    }
 }
 
 enum CodexAssistedResultDecoder {
     static func decode(
         _ text: String
-    ) throws -> CodexAssistedInsightKind {
+    ) throws -> CodexMetadataInsightSelection {
         let data = Data(text.utf8)
         guard let object = try JSONSerialization.jsonObject(
             with: data
         ) as? [String: Any],
-              Set(object.keys) == ["insightKind"] else {
+              Set(object.keys) == [
+                  "status", "title", "finding", "whyItMatters",
+                  "recommendation", "evidenceFields"
+              ] else {
             throw CodexAssistedRequestError.invalidResult
         }
         let decoded = try JSONDecoder().decode(
-            DecodedCodexAssistedResult.self,
+            CodexMetadataInsightSelection.self,
             from: data
         )
-        return decoded.insightKind
+        guard decoded.narrative.isValid,
+              decoded.status == .insufficientEvidence
+                ? decoded.evidenceFields.isEmpty
+                : (2 ... 4).contains(decoded.evidenceFields.count),
+              Set(decoded.evidenceFields).count
+                == decoded.evidenceFields.count else {
+            throw CodexAssistedRequestError.invalidResult
+        }
+        return decoded
     }
 }
 
@@ -827,33 +912,89 @@ struct CodexAssistedEvidenceEnvelope: Equatable, Sendable {
 
 enum CodexAssistedEvidenceResolver {
     private struct Item {
-        let title: String
-        let summary: String
         let evidence: String
         let intervals: [DateInterval]
         let coverage: CoverageLevel
     }
 
+    static func canAnalyze(
+        payload: CodexMetadataAnalysisPayload
+    ) -> Bool {
+        guard UsageFreshness(rawValue: payload.evidence.freshness) == .fresh else {
+            return false
+        }
+        let available = Dictionary(
+            uniqueKeysWithValues: CodexMetadataEvidenceField.allCases.compactMap {
+                field in item(for: field, payload: payload).map { (field, $0) }
+            }
+        )
+        if available[.paceGuidance] != nil,
+           available[.usageRemaining] != nil {
+            return true
+        }
+        return available.values.filter {
+            $0.coverage == .complete || $0.coverage == .high
+        }.count >= 2
+    }
+
     static func resolve(
-        kind: CodexAssistedInsightKind,
+        selection: CodexMetadataInsightSelection,
         payload: CodexMetadataAnalysisPayload
     ) -> CodexAssistedEvidenceEnvelope? {
+        if selection.status == .insufficientEvidence {
+            return CodexAssistedEvidenceEnvelope(
+                title: selection.title,
+                summary: selection.finding,
+                evidence: [],
+                intervals: [],
+                freshness: UsageFreshness(
+                    rawValue: payload.evidence.freshness
+                ) ?? .unavailable,
+                coverage: .unavailable,
+                confidence: .unavailable
+            )
+        }
         guard UsageFreshness(rawValue: payload.evidence.freshness) == .fresh,
-              let item = item(
-                  for: kind.evidenceField,
-                  payload: payload
-              ),
-              item.coverage == .complete || item.coverage == .high else {
+              selection.narrative.isValid else {
             return nil
         }
+        let items = selection.evidenceFields.compactMap {
+            item(for: $0, payload: payload)
+        }
+        let usesPaceGuidance = selection.evidenceFields.contains(.paceGuidance)
+            && selection.evidenceFields.contains(.usageRemaining)
+        guard items.count == selection.evidenceFields.count,
+              usesPaceGuidance || items.allSatisfy({
+                  $0.coverage == .complete || $0.coverage == .high
+              }) else {
+            return nil
+        }
+        let intervals = items.flatMap(\.intervals).reduce(
+            into: [DateInterval]()
+        ) {
+            if !$0.contains($1) { $0.append($1) }
+        }
         return CodexAssistedEvidenceEnvelope(
-            title: item.title,
-            summary: item.summary,
-            evidence: [item.evidence],
-            intervals: item.intervals,
+            title: selection.title,
+            summary: selection.finding,
+            evidence: [
+                "Why it matters: \(selection.whyItMatters)",
+                "Try next: \(selection.recommendation)"
+            ] + items.map(\.evidence),
+            intervals: intervals,
             freshness: .fresh,
-            coverage: item.coverage,
-            confidence: .high
+            coverage: usesPaceGuidance
+                ? CoverageLevel(
+                    rawValue: payload.paceGuidance?.coverage ?? ""
+                ) ?? .unavailable
+                : items.allSatisfy({ $0.coverage == .complete })
+                    ? .complete
+                    : .high,
+            confidence: usesPaceGuidance
+                ? ConfidenceLevel(
+                    rawValue: payload.paceGuidance?.confidence ?? ""
+                ) ?? .unavailable
+                : .high
         )
     }
 
@@ -870,11 +1011,38 @@ enum CodexAssistedEvidenceResolver {
                 return nil
             }
             return Item(
-                title: "Usage remaining",
-                summary: "You have \(number(percent))% usage remaining in this weekly window.",
                 evidence: "Usage remaining: \(number(percent))%.",
                 intervals: [interval],
                 coverage: .complete
+            )
+        case .paceGuidance:
+            guard let guidance = payload.paceGuidance,
+                  let status = PaceStatus(rawValue: guidance.status),
+                  let coverage = CoverageLevel(rawValue: guidance.coverage),
+                  let confidence = ConfidenceLevel(
+                      rawValue: guidance.confidence
+                  ),
+                  coverage != .unavailable,
+                  coverage != .notApplicable,
+                  confidence != .unavailable,
+                  let interval = dateInterval(payload.usageRemaining.interval),
+                  [
+                      guidance.expectedRemainingAtReset,
+                      guidance.safetyRemainingAtReset,
+                      guidance.recommendedPercentPerDay,
+                      guidance.currentPercentPerDay
+                  ].allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                return nil
+            }
+            guard guidance.historicalPercentPerDay.map({
+                $0.isFinite && $0 >= 0
+            }) ?? true else {
+                return nil
+            }
+            return Item(
+                evidence: "Pace guidance: \(paceTitle(status)); current \(number(guidance.currentPercentPerDay))% per day, recommended up to \(number(guidance.recommendedPercentPerDay))% per day, expected \(number(guidance.expectedRemainingAtReset))% left at reset.",
+                intervals: [interval],
+                coverage: coverage
             )
         case .accountTokenActivity:
             guard payload.accountTokenActivity.state == "exact",
@@ -885,8 +1053,6 @@ enum CodexAssistedEvidenceResolver {
                 return nil
             }
             return Item(
-                title: "Account Token Activity",
-                summary: "Account Token Activity is \(tokens.formatted()) tokens for this period.",
                 evidence: "Account Token Activity: \(tokens.formatted()) tokens.",
                 intervals: [interval],
                 coverage: .complete
@@ -902,8 +1068,6 @@ enum CodexAssistedEvidenceResolver {
                 return nil
             }
             return Item(
-                title: "Local Token Activity",
-                summary: "Local Token Activity is \(tokens.formatted()) tokens for this period.",
                 evidence: "Local Token Activity: \(tokens.formatted()) tokens.",
                 intervals: [interval],
                 coverage: coverage
@@ -919,12 +1083,7 @@ enum CodexAssistedEvidenceResolver {
             let peak = payload.activity.peakConcurrentTasks.map {
                 " Peak concurrent Tasks: \($0)."
             } ?? ""
-            let peakSummary = payload.activity.peakConcurrentTasks.map {
-                " Peak concurrent Tasks reached \($0)."
-            } ?? ""
             return Item(
-                title: "Activity",
-                summary: "Active time is \(Int(activeSeconds.rounded()).formatted()) seconds for this period.\(peakSummary)",
                 evidence: "Active time: \(Int(activeSeconds.rounded()).formatted()) seconds.\(peak)",
                 intervals: [interval],
                 coverage: coverage
@@ -945,8 +1104,6 @@ enum CodexAssistedEvidenceResolver {
                 return nil
             }
             return Item(
-                title: "Usage per token",
-                summary: "Usage per token is \(number(multiplier))× the reference for this period.",
                 evidence: "Usage per token: \(number(multiplier))× the reference.",
                 intervals: [current, reference],
                 coverage: coverage
@@ -965,12 +1122,18 @@ enum CodexAssistedEvidenceResolver {
                 return nil
             }
             return Item(
-                title: "Estimated active time available",
-                summary: "Estimated active time available is \(Int(lower.rounded()).formatted())–\(Int(upper.rounded()).formatted()) seconds.",
                 evidence: "Estimated active time available: \(Int(lower.rounded()).formatted())–\(Int(upper.rounded()).formatted()) seconds.",
                 intervals: [interval],
                 coverage: coverage
             )
+        }
+    }
+
+    private static func paceTitle(_ status: PaceStatus) -> String {
+        switch status {
+        case .slowDown: "above the sustainable pace"
+        case .onTrack: "on track"
+        case .roomToUseMore: "below the available pace"
         }
     }
 
@@ -1185,7 +1348,7 @@ final class CodexAssistedInsightStore: ObservableObject {
     func result(
         for scope: CodexAssistedAnalysisScope
     ) -> CodexAssistedAnalysisResult? {
-        if resultScope == scope, let result {
+        if resultScope?.fingerprint == scope.fingerprint, let result {
             return result
         }
         return persistedResults.last {
@@ -1200,7 +1363,7 @@ final class CodexAssistedInsightStore: ObservableObject {
         let selectionFingerprint = sourceSelection?.fingerprint
         var candidates: [CodexAssistedAnalysisResult] = []
         if let result,
-           resultScope == scope
+           resultScope?.fingerprint == scope.fingerprint
             || (
                 selectionFingerprint != nil
                     && resultScope?.sourceSelectionFingerprint
@@ -1277,7 +1440,8 @@ final class CodexAssistedInsightStore: ObservableObject {
     ) {
         guard analysisTask == nil,
               let profile,
-              showsAnalyzeAction else {
+              showsAnalyzeAction,
+              CodexAssistedEvidenceResolver.canAnalyze(payload: payload) else {
             return
         }
         lastSourceRequest = nil
@@ -1832,7 +1996,7 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
                     responseText
                 )
                 guard let resolved = CodexAssistedEvidenceResolver.resolve(
-                    kind: decoded,
+                    selection: decoded,
                     payload: evidencePayload
                 ) else {
                     throw CodexAssistedRequestError.invalidResult
@@ -1985,17 +2149,10 @@ actor CodexAssistedClient: CodexAssistedInsightServicing {
             }
             for item in page {
                 guard let name = item["name"] as? String,
-                      let enabled = item["enabled"] as? Bool else {
+                      item["enabled"] is Bool else {
                     throw CodexAssistedClientError.invalidResponse
                 }
-                if CodexAssistedRequestFactory.toolProvidingFeatures
-                    .contains(name) {
-                    featureNames.append(name)
-                } else if enabled,
-                          !CodexAssistedRequestFactory
-                            .benignEnabledFeatures.contains(name) {
-                    throw CodexAssistedClientError.toolUseBlocked
-                }
+                featureNames.append(name)
             }
             cursor = result["nextCursor"] as? String
             if cursor == nil { break }
