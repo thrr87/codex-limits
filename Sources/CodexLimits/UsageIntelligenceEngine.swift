@@ -745,9 +745,13 @@ private enum RecentMovementBreak {
 
 enum UsageIntelligenceEngine {
     static func evaluate(_ input: UsageIntelligenceInput) -> UsageReaderSnapshot {
+        let samples = UsageHistoryPolicy.aligningWindowResets(
+            input.samples,
+            currentReset: input.account?.mainLimit?.window.resetsAt
+        )
         let currentSamples = input.account.flatMap { account in
             account.mainLimit.map { weeklyLimit in
-            input.samples
+            samples
                 .filter { sample in
                     sample.resetsAt == weeklyLimit.window.resetsAt
                         && sample.observedAt >= weeklyLimit.window.startsAt
@@ -792,7 +796,7 @@ enum UsageIntelligenceEngine {
         )
         let recentMovement = recentAccountMovement(
             account: input.account,
-            samples: input.samples,
+            samples: samples,
             sourceState: input.sourceState,
             now: input.now,
             accountEpochStartedAt: input.accountEpochStartedAt
@@ -802,7 +806,7 @@ enum UsageIntelligenceEngine {
                   let weeklyLimit = account.mainLimit else { return nil }
             return ForecastEngine.evaluate(
                 window: weeklyLimit.window,
-                samples: input.samples,
+                samples: samples,
                 tokenHistory: account.tokenHistory,
                 safetyBuffer: input.safetyBuffer,
                 now: input.now,
@@ -849,7 +853,7 @@ enum UsageIntelligenceEngine {
         }
         let chart = chart(
             account: input.account,
-            samples: input.samples,
+            samples: samples,
             forecast: forecast,
             recentMovement: recentMovement.movement,
             sourceState: input.sourceState,
@@ -888,7 +892,7 @@ enum UsageIntelligenceEngine {
         let accountTokenActivity = if let selectedTokenRange {
             selectedRangeAccountTokenActivity(
                 account: input.account,
-                samples: input.samples,
+                samples: samples,
                 range: selectedTokenRange,
                 now: input.now,
                 accountPartitionID: input.accountPartitionID,
@@ -979,7 +983,7 @@ enum UsageIntelligenceEngine {
             let evidence: WeeklyUsageEvidenceSet
             if let reusableLocalHistory,
                reusableLocalHistory.matches(
-                   samples: input.samples,
+                   samples: samples,
                    observation: input.localActivityObservation,
                    accountPartitionID: partitionID,
                    limitID: weekly.limitId,
@@ -990,7 +994,7 @@ enum UsageIntelligenceEngine {
                 reusedWeeklyEvidence = true
             } else {
                 evidence = WeeklyUsageEvidenceBuilder.build(
-                    samples: input.samples,
+                    samples: samples,
                     localFacts: input.localActivityHistoryFacts,
                     localObservation: input.localActivityObservation,
                     accountPartitionID: partitionID,
@@ -1068,7 +1072,7 @@ enum UsageIntelligenceEngine {
                   let weekly = input.account?.mainLimit {
             localHistoryCache = LocalHistoryAggregateCache(
                 factIndex: localHistoryFactIndex,
-                samples: input.samples,
+                samples: samples,
                 observation: input.localActivityObservation,
                 accountPartitionID: partitionID,
                 limitID: weekly.limitId,
