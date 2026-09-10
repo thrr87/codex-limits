@@ -28,8 +28,6 @@ final class LocalTokenActivityTests: XCTestCase {
         XCTAssertEqual(activity.sourceVersion, "0.145.0")
         XCTAssertEqual(activity.observedAt, Date(timeIntervalSince1970: 2_000))
         XCTAssertEqual(activity.points.map(\.tokens), [100, 350])
-        XCTAssertNil(activity.accountComparison.numericPercent)
-        XCTAssertFalse(activity.accountComparison.comparable)
     }
 
     func testReadsFractionalSecondTimestampsFromRealRollouts() {
@@ -294,8 +292,6 @@ final class LocalTokenActivityTests: XCTestCase {
             reader.localTokenActivity.interval,
             reader.accountTokenActivity.interval
         )
-        XCTAssertFalse(reader.localTokenActivity.accountComparison.comparable)
-        XCTAssertNil(reader.localTokenActivity.accountComparison.numericPercent)
     }
 
     func testOffDeviceActivityDoesNotTurnTheAccountLocalGapIntoCoverage() {
@@ -334,8 +330,6 @@ final class LocalTokenActivityTests: XCTestCase {
 
         XCTAssertEqual(reader.accountTokenActivity.tokens, 1_000)
         XCTAssertEqual(reader.localTokenActivity.tokens, 100)
-        XCTAssertNil(reader.localTokenActivity.accountComparison.numericPercent)
-        XCTAssertFalse(reader.localTokenActivity.accountComparison.comparable)
     }
 
     func testZeroAccountAndLocalActivityRemainFactual() {

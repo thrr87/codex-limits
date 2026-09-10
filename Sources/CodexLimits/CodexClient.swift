@@ -69,7 +69,7 @@ enum CodexClientError: LocalizedError {
 }
 
 final class CodexAppServerConnection: @unchecked Sendable {
-    private static let defaultMaximumLineBytes = 16 * 1_024 * 1_024
+    private static let defaultMaximumLineBytes = 8 * 1_024 * 1_024
 
     let input: FileHandle
     let isRunning: () -> Bool
@@ -264,6 +264,19 @@ private final class CodexAppServerProcessOwner: @unchecked Sendable {
     }
 }
 
+private final class CodexExecutableSelection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var url: URL?
+
+    func get() -> URL? {
+        lock.withLock { url }
+    }
+
+    func set(_ url: URL?) {
+        lock.withLock { self.url = url }
+    }
+}
+
 actor CodexClient {
     static let shared = CodexClient(
         makeConnection: CodexClient.liveConnection,
@@ -272,14 +285,20 @@ actor CodexClient {
 
     private static let weeklyWindowDurationMinutes = 10_080
     private static let executablePaths = [
-        "/opt/homebrew/bin/codex",
-        "/usr/local/bin/codex"
+        URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+        URL(fileURLWithPath: "/usr/local/bin/codex"),
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/codex")
     ]
+    private static let executableSelection = CodexExecutableSelection()
     private let makeConnection: () throws -> CodexAppServerConnection
     private let executableIdentity: () -> String?
     private let protocolGate = CodexProtocolGate()
     private let timeoutNanoseconds: UInt64
+    private let connectionIdleNanoseconds: UInt64
     private var connection: CodexAppServerConnection?
+    private var connectionIdleTask: Task<Void, Never>?
+    private var connectionIdleGeneration: UInt64 = 0
     private var initialized = false
     private var serverCLIVersion: String?
     private var connectionExecutableIdentity: String?
@@ -308,15 +327,33 @@ actor CodexClient {
     init(
         makeConnection: @escaping () throws -> CodexAppServerConnection = CodexClient.liveConnection,
         executableIdentity: @escaping () -> String? = { nil },
-        timeout: TimeInterval = 15
+        timeout: TimeInterval = 10,
+        connectionIdleTimeout: TimeInterval = 5
     ) {
         self.makeConnection = makeConnection
         self.executableIdentity = executableIdentity
         timeoutNanoseconds = UInt64(max(timeout, 0.001) * 1_000_000_000)
+        connectionIdleNanoseconds = UInt64(
+            max(connectionIdleTimeout, 0.001) * 1_000_000_000
+        )
     }
 
     static func fetch() async throws -> CodexFetchResult {
         try await shared.fetch(fetchedAt: Date())
+    }
+
+    static func cancelFetch() async {
+        await shared.cancelInFlightFetch()
+    }
+
+    static func selectExecutable(_ url: URL?) -> Bool {
+        guard let url else {
+            executableSelection.set(nil)
+            return true
+        }
+        guard isExecutable(url) else { return false }
+        executableSelection.set(url.standardizedFileURL)
+        return true
     }
 
     func fetch(fetchedAt: Date) async throws -> CodexFetchResult {
@@ -331,6 +368,11 @@ actor CodexClient {
         inFlightFetch = task
         defer { inFlightFetch = nil }
         return try await task.value
+    }
+
+    private func cancelInFlightFetch() {
+        inFlightFetch?.cancel()
+        invalidateConnection()
     }
 
     func threadProjectionResponse(
@@ -353,15 +395,43 @@ actor CodexClient {
         _ operation: () async throws -> T
     ) async throws -> T {
         await protocolGate.enter()
+        cancelScheduledConnectionRelease()
         do {
             try Task.checkCancellation()
             let result = try await operation()
+            scheduleConnectionRelease()
             await protocolGate.leave()
             return result
         } catch {
+            scheduleConnectionRelease()
             await protocolGate.leave()
             throw error
         }
+    }
+
+    private func cancelScheduledConnectionRelease() {
+        connectionIdleGeneration &+= 1
+        connectionIdleTask?.cancel()
+        connectionIdleTask = nil
+    }
+
+    private func scheduleConnectionRelease() {
+        cancelScheduledConnectionRelease()
+        let generation = connectionIdleGeneration
+        connectionIdleTask = Task { [weak self, connectionIdleNanoseconds] in
+            do {
+                try await Task.sleep(nanoseconds: connectionIdleNanoseconds)
+            } catch {
+                return
+            }
+            await self?.releaseConnectionIfIdle(generation: generation)
+        }
+    }
+
+    private func releaseConnectionIfIdle(generation: UInt64) {
+        guard generation == connectionIdleGeneration else { return }
+        connectionIdleTask = nil
+        invalidateConnection()
     }
 
     private func fetchWithReconnect(
@@ -628,12 +698,18 @@ actor CodexClient {
     }
 
     private static func liveExecutableURL() -> URL? {
-        executablePaths.lazy.compactMap { path -> URL? in
-            guard FileManager.default.isExecutableFile(atPath: path) else {
-                return nil
-            }
-            return URL(fileURLWithPath: path).resolvingSymlinksInPath()
-        }.first
+        let selected = executableSelection.get().map { [$0] } ?? []
+        return (selected + executablePaths).first(where: isExecutable)?
+            .resolvingSymlinksInPath()
+    }
+
+    private static func isExecutable(_ url: URL) -> Bool {
+        let resolved = url.resolvingSymlinksInPath()
+        let values = try? resolved.resourceValues(
+            forKeys: [.isRegularFileKey]
+        )
+        return values?.isRegularFile == true
+            && FileManager.default.isExecutableFile(atPath: resolved.path)
     }
 
     private static func liveExecutableIdentity() -> String? {
@@ -731,6 +807,7 @@ actor CodexClient {
     }
 
     deinit {
+        connectionIdleTask?.cancel()
         connection?.stop()
     }
 

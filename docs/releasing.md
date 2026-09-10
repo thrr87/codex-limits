@@ -14,9 +14,9 @@ Losing the EdDSA private key prevents ad-hoc-signed installations from trusting 
 ## Release flow
 
 1. Ask Codex to prepare a release and provide the stable version number.
-2. Codex runs tests and QA, then updates `CFBundleShortVersionString` and increments `CFBundleVersion`.
+2. Codex confirms that the multi-integration PRD is `Accepted for v1 implementation` and that `All-enabled idle comparison` and `Eight-hour mixed lifecycle soak` are recorded as `Passed` or explicitly `Waived for VERSION` for that release, runs the Release tests and QA, then updates `CFBundleShortVersionString` and increments `CFBundleVersion`. The eligible Claude account observation is waived for the experimental release, and both performance checks are waived specifically for 0.3.0 by [ADR-0015](adr/0015-ship-claude-as-experimental.md). No unperformed check is recorded as passed. The validator checks the status and both required rows; it does not block development while they remain pending. The historical Codex-plus-Claude idle comparison does not cover the restored Grok scope or the new provider-local history readers. QA includes history persistence, old-cache seeding, reset and forecast boundaries, and separate Claude/Grok data deletion.
 3. Run `Scripts/validate-release.sh VERSION` and the `Release` workflow with `dry_run` enabled.
-4. Inspect the universal app archive, signed `appcast.xml`, generated notes, and workflow result.
+4. Inspect the universal app archive, both universal app/helper executables, signed `appcast.xml`, generated notes, and workflow result.
 5. Run the workflow with `dry_run` disabled. It creates a Draft Release only.
 6. Inspect the draft and explicitly tell Codex to publish it.
 

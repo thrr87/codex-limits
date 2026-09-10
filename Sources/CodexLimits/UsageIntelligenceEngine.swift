@@ -864,9 +864,10 @@ enum UsageIntelligenceEngine {
             sourceState: input.sourceState,
             now: input.now
         )
-        let weeklyAccountTokenActivity = accountTokenActivity(
+        let localActivityInterval = tokenActivityInterval(
             account: input.account,
-            samples: currentSamples
+            samples: currentSamples,
+            accountEpochStartedAt: input.accountEpochStartedAt
         )
         let selectedTokenRange: DateInterval?
         switch input.analyticsExploration.timeRange {
@@ -906,11 +907,7 @@ enum UsageIntelligenceEngine {
             )
         }
         let localTokenActivity: LocalTokenActivitySnapshot
-        if let interval = tokenActivityInterval(
-            account: input.account,
-            accountActivity: weeklyAccountTokenActivity,
-            accountEpochStartedAt: input.accountEpochStartedAt
-        ) {
+        if let interval = localActivityInterval {
             if let cached = reusableLocalAggregates?.localTokenActivity,
                cached.interval.start == interval.start,
                !tokenFactsAffectIntervalChange(
@@ -1137,7 +1134,9 @@ enum UsageIntelligenceEngine {
             account: input.account,
             accountSource: .account,
             interval: observedInterval,
-            menuBarText: input.account?.mainLimit.map {
+            menuBarText: observedInterval.flatMap { _ in
+                input.account?.mainLimit
+            }.map {
                 "\(Int($0.window.remainingPercent.rounded()))%"
             } ?? "—",
             sourceState: input.sourceState,
@@ -1260,50 +1259,17 @@ enum UsageIntelligenceEngine {
         samples: [UsageSample],
         accountEpochStartedAt: Date? = nil
     ) -> DateInterval? {
-        tokenActivityInterval(
-            account: account,
-            accountActivity: accountTokenActivity(
-                account: account,
-                samples: samples
-            ),
-            accountEpochStartedAt: accountEpochStartedAt
-        )
-    }
-
-    private static func tokenActivityInterval(
-        account: UsageSnapshot?,
-        accountActivity: AccountTokenActivitySnapshot,
-        accountEpochStartedAt: Date?
-    ) -> DateInterval? {
-        if let interval = accountActivity.interval {
-            let start = max(
-                interval.start,
-                accountEpochStartedAt ?? interval.start
-            )
-            guard interval.end >= start else { return nil }
-            return DateInterval(start: start, end: interval.end)
-        }
         guard let account,
               let window = account.mainLimit?.window else {
             return nil
         }
-        let start = max(
-            window.startsAt,
-            accountEpochStartedAt ?? window.startsAt
+        let fallbackEnd = min(account.fetchedAt, window.resetsAt)
+        guard fallbackEnd >= window.startsAt else { return nil }
+        let fallback = DateInterval(
+            start: window.startsAt,
+            end: fallbackEnd
         )
-        let end = min(account.fetchedAt, window.resetsAt)
-        guard end >= start else { return nil }
-        return DateInterval(start: start, end: end)
-    }
-
-    private static func accountTokenActivity(
-        account: UsageSnapshot?,
-        samples: [UsageSample]
-    ) -> AccountTokenActivitySnapshot {
-        guard let account, let weeklyLimit = account.mainLimit else {
-            return .unavailable("Account token readings are unavailable")
-        }
-        let start = weeklyLimit.window.startsAt
+        let start = window.startsAt
         let boundary = samples
             .filter {
                 $0.lifetimeTokens != nil
@@ -1314,58 +1280,55 @@ enum UsageIntelligenceEngine {
                 abs($0.observedAt.timeIntervalSince(start))
                     < abs($1.observedAt.timeIntervalSince(start))
             }
+        let interval: DateInterval
         if let currentTokens = account.accountFacts?.lifetimeTokens,
            let boundary,
-           let boundaryTokens = boundary.lifetimeTokens {
+           let boundaryTokens = boundary.lifetimeTokens,
+           currentTokens >= 0,
+           boundaryTokens >= 0 {
             let currentObservedAt = account.accountFacts?
                 .lifetimeTokensObservedAt ?? account.fetchedAt
-            guard currentObservedAt >= boundary.observedAt else {
-                return .unavailable(
-                    "No lifetime token reading after the weekly boundary"
-                )
-            }
-            guard currentTokens >= 0, boundaryTokens >= 0 else {
-                return .unavailable("Lifetime token reading is invalid")
-            }
-            guard currentTokens >= boundaryTokens else {
-                return .unavailable(
-                    "Lifetime token counter decreased",
-                    interval: DateInterval(
-                        start: boundary.observedAt,
-                        end: currentObservedAt
-                    )
-                )
-            }
-            let delta = currentTokens.subtractingReportingOverflow(
-                boundaryTokens
-            )
-            guard !delta.overflow else {
-                return .unavailable("Lifetime token reading is invalid")
-            }
-            return AccountTokenActivitySnapshot(
-                state: .exact,
-                tokens: delta.partialValue,
-                method: .lifetimeDelta,
-                interval: DateInterval(
+            if currentObservedAt >= boundary.observedAt {
+                interval = DateInterval(
                     start: boundary.observedAt,
                     end: currentObservedAt
-                ),
-                reason: nil
-            )
+                )
+            } else {
+                interval = fallback
+            }
+        } else {
+            let completeDays = account.tokenHistory
+                .filter { day in
+                    let end = day.date.addingTimeInterval(86_400)
+                    return day.completeness == .complete
+                        && day.tokens >= 0
+                        && day.date >= window.startsAt
+                        && end <= fallbackEnd
+                }
+                .sorted { $0.date < $1.date }
+            var total: Int64 = 0
+            let hasValidTotal = completeDays.allSatisfy { day in
+                let sum = total.addingReportingOverflow(day.tokens)
+                total = sum.partialValue
+                return !sum.overflow
+            }
+            if let first = completeDays.first,
+               let last = completeDays.last,
+               hasValidTotal {
+                interval = DateInterval(
+                    start: first.date,
+                    end: last.date.addingTimeInterval(86_400)
+                )
+            } else {
+                interval = fallback
+            }
         }
-
-        if let dailyActivity = dailyTokenActivity(
-            account: account,
-            window: weeklyLimit.window
-        ) {
-            return dailyActivity
-        }
-
-        return .unavailable(
-            account.accountFacts?.lifetimeTokens == nil
-                ? "Lifetime token readings are unavailable"
-                : "No lifetime token reading at the weekly boundary"
+        let clampedStart = max(
+            interval.start,
+            accountEpochStartedAt ?? interval.start
         )
+        guard interval.end >= clampedStart else { return nil }
+        return DateInterval(start: clampedStart, end: interval.end)
     }
 
     private static func selectedRangeAccountTokenActivity(
@@ -1625,57 +1588,6 @@ enum UsageIntelligenceEngine {
         )
     }
 
-    private static func dailyTokenActivity(
-        account: UsageSnapshot,
-        window: UsageWindow
-    ) -> AccountTokenActivitySnapshot? {
-        let intervalEnd = min(
-            account.fetchedAt,
-            window.resetsAt
-        )
-        let completeDays = account.tokenHistory
-            .filter { day in
-                let end = day.date.addingTimeInterval(24 * 60 * 60)
-                return day.completeness == .complete
-                    && day.tokens >= 0
-                    && day.date >= window.startsAt
-                    && end <= intervalEnd
-            }
-            .sorted { $0.date < $1.date }
-        guard let first = completeDays.first,
-              let last = completeDays.last else {
-            return nil
-        }
-        var total: Int64 = 0
-        for day in completeDays {
-            let result = total.addingReportingOverflow(day.tokens)
-            guard !result.overflow else { return nil }
-            total = result.partialValue
-        }
-        let lastDayEnd = last.date.addingTimeInterval(24 * 60 * 60)
-        let isContiguous = zip(
-            completeDays,
-            completeDays.dropFirst()
-        ).allSatisfy { previous, next in
-            next.date == previous.date.addingTimeInterval(24 * 60 * 60)
-        }
-        let exactlyMatchesInterval = isContiguous
-            && first.date == window.startsAt
-            && lastDayEnd == intervalEnd
-        return AccountTokenActivitySnapshot(
-            state: exactlyMatchesInterval ? .exact : .partial,
-            tokens: total,
-            method: .dailyBuckets,
-            interval: DateInterval(
-                start: first.date,
-                end: lastDayEnd
-            ),
-            reason: exactlyMatchesInterval
-                ? nil
-                : "Only complete daily token totals are available"
-        )
-    }
-
     private static func chart(
         account: UsageSnapshot?,
         samples: [UsageSample],
@@ -1880,7 +1792,7 @@ enum UsageIntelligenceEngine {
         .sorted { $0.resetsAt < $1.resetsAt }
     }
 
-    private static func projection(
+    static func projection(
         reading: UsageSample,
         window: UsageWindow,
         rate: Double,
@@ -1935,7 +1847,11 @@ enum UsageIntelligenceEngine {
         sourceState: UsageSourceState,
         now: Date
     ) -> UsageFreshness {
-        guard let account else { return .unavailable }
+        guard let account,
+              let reset = account.mainLimit?.window.resetsAt,
+              reset > now else {
+            return .unavailable
+        }
         if case .failed = sourceState { return .stale }
         return now.timeIntervalSince(account.fetchedAt) > CurrentUsagePolicy.tightBoundary
             ? .stale

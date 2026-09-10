@@ -1,0 +1,3 @@
+# Local-only analytics
+
+Codex Limits may analyze Codex information already accessible on the user’s machine without a separate analytics opt-in, but Codex-derived data, computation, and derived history remain on-device and are not transmitted as product telemetry. Raw prompts, responses, code, paths, commands, and tool output may be read locally when needed, but are not duplicated into the analytics store; only compact derived records are retained. This preserves complete cross-task analytics without introducing a cloud data boundary; unrelated operating-system permissions, such as notification authorization, remain explicit.

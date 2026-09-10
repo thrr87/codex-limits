@@ -16,12 +16,12 @@ enum AnalyticsGraph: String, CaseIterable, Codable, Identifiable, Sendable {
     case usagePerToken = "Usage per token"
     case concurrency = "Concurrency"
 
-    var id: String { rawValue }
-
-    static let coreCases: [AnalyticsGraph] = [
+    static let coreCases: [Self] = [
         .usageRemaining,
-        .tokenActivity
+        .tokenActivity,
     ]
+
+    var id: String { rawValue }
 
     var usesAccountScope: Bool {
         self == .usageRemaining
@@ -71,46 +71,6 @@ enum AnalyticsTimeRange: String, CaseIterable, Codable, Identifiable, Sendable {
             end: end
         )
     }
-}
-
-func accountTokenInterval(
-    at date: Date,
-    in intervals: [AccountTokenActivityInterval],
-    within range: DateInterval
-) -> AccountTokenActivityInterval? {
-    intervals.first {
-        $0.start >= range.start
-            && $0.end <= range.end
-            && $0.start <= date
-            && date <= $0.end
-    }
-}
-
-func steppedAccountTokenInterval(
-    in intervals: [AccountTokenActivityInterval],
-    from selected: AccountTokenActivityInterval?,
-    by offset: Int
-) -> AccountTokenActivityInterval? {
-    let ordered = intervals.sorted {
-        $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
-    }
-    guard !ordered.isEmpty else { return nil }
-    guard let selected,
-          let index = ordered.firstIndex(of: selected) else {
-        return offset < 0 ? ordered.last : ordered.first
-    }
-    return ordered[min(max(index + offset, 0), ordered.count - 1)]
-}
-
-func retainedAccountTokenInterval(
-    _ selected: AccountTokenActivityInterval?,
-    in intervals: [AccountTokenActivityInterval],
-    range: DateInterval
-) -> AccountTokenActivityInterval? {
-    guard let selected,
-          selected.start >= range.start,
-          selected.end <= range.end else { return nil }
-    return intervals.first { $0 == selected }
 }
 
 struct AccountTokenActivityDisplayInterval: Equatable, Hashable, Identifiable,
@@ -240,7 +200,7 @@ struct AnalyticsExplorationState: Codable, Equatable, Sendable {
     )
 
     var usesLocalAnalytics: Bool {
-        section == .graphs && graph.usesLocalAnalytics
+        section != .graphs || graph.usesLocalAnalytics
     }
 }
 
@@ -255,39 +215,39 @@ final class AnalyticsWorkspaceStore: ObservableObject {
         [String: InsightDisposition]
 
     private let defaults: UserDefaults
+    private let keyPrefix: String
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, keyPrefix: String = "") {
         self.defaults = defaults
-        state = Self.restoredState(from: defaults)
+        self.keyPrefix = keyPrefix
+        state = Self.restoredState(from: defaults, keyPrefix: keyPrefix)
         insightDispositions = Self.restoredInsightDispositions(
-            from: defaults
+            from: defaults, keyPrefix: keyPrefix
         )
     }
 
     static func restoredState(
-        from defaults: UserDefaults
+        from defaults: UserDefaults, keyPrefix: String = ""
     ) -> AnalyticsExplorationState {
-        guard let data = defaults.data(forKey: Self.persistenceKey),
+        guard let data = defaults.data(forKey: keyPrefix + Self.persistenceKey),
               let restored = try? JSONDecoder().decode(
                 AnalyticsExplorationState.self,
                 from: data
               ) else {
             return .initial
         }
-        guard AnalyticsGraph.coreCases.contains(restored.graph) else {
-            var core = restored
-            core.graph = .usageRemaining
-            core.filters = .all
-            return core
+        var state = restored
+        if !AnalyticsGraph.coreCases.contains(state.graph) {
+            state.graph = .usageRemaining
         }
-        return restored
+        return state
     }
 
     static func restoredInsightDispositions(
-        from defaults: UserDefaults
+        from defaults: UserDefaults, keyPrefix: String = ""
     ) -> [String: InsightDisposition] {
         guard let data = defaults.data(
-            forKey: Self.insightDispositionsPersistenceKey
+            forKey: keyPrefix + Self.insightDispositionsPersistenceKey
         ), let restored = try? JSONDecoder().decode(
             [String: InsightDisposition].self,
             from: data
@@ -344,7 +304,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
         if let data = try? JSONEncoder().encode(next) {
             defaults.set(
                 data,
-                forKey: Self.insightDispositionsPersistenceKey
+                forKey: keyPrefix + Self.insightDispositionsPersistenceKey
             )
         }
     }
@@ -408,7 +368,7 @@ final class AnalyticsWorkspaceStore: ObservableObject {
         guard next != state else { return }
         state = next
         if let data = try? JSONEncoder().encode(next) {
-            defaults.set(data, forKey: Self.persistenceKey)
+            defaults.set(data, forKey: keyPrefix + Self.persistenceKey)
         }
     }
 }
@@ -480,7 +440,7 @@ enum UsageChartPointSource: Equatable, Sendable {
         case .derivedEstimate: UsageValueSource.derivedEstimate.rawValue
         case .accountHistory: UsageForecastReferenceSource.accountHistory.rawValue
         case .tokenEstimate: UsageForecastReferenceSource.tokenEstimate.rawValue
-        case .weeklyTarget: "Weekly target"
+        case .weeklyTarget: "Target"
         }
     }
 }
@@ -500,48 +460,11 @@ struct UsageChartSelection: Equatable, Sendable {
         in chart: UsageChartSnapshot,
         within visibleRange: DateInterval? = nil
     ) -> UsageChartSelection? {
-        [
-            nearestCandidate(
-                in: chart.allObserved,
-                series: .observed,
-                priority: 0,
-                source: .account,
-                to: date,
-                within: visibleRange
-            ),
-            nearestCandidate(
-                in: chart.currentProjection,
-                series: .currentEstimate,
-                priority: 1,
-                source: .derivedEstimate,
-                to: date,
-                within: visibleRange
-            ),
-            nearestCandidate(
-                in: chart.historicalProjection,
-                series: .pastEstimate,
-                priority: 2,
-                source: .accountHistory,
-                to: date,
-                within: visibleRange
-            ),
-            nearestCandidate(
-                in: chart.estimatedBackfill,
-                series: .estimatedBackfill,
-                priority: 3,
-                source: .tokenEstimate,
-                to: date,
-                within: visibleRange
-            ),
-            nearestCandidate(
-                in: chart.target,
-                series: .target,
-                priority: 4,
-                source: .weeklyTarget,
-                to: date,
-                within: visibleRange
-            )
-        ].compactMap { $0 }.min {
+        candidates(in: chart)
+            .filter {
+                visibleRange?.contains($0.point.date) ?? true
+            }
+            .min {
                 let leftDistance = abs($0.point.date.timeIntervalSince(date))
                 let rightDistance = abs($1.point.date.timeIntervalSince(date))
                 if leftDistance == rightDistance {
@@ -556,30 +479,6 @@ struct UsageChartSelection: Equatable, Sendable {
                     source: $0.source
                 )
             }
-    }
-
-    private static func nearestCandidate(
-        in points: [UsageChartPoint],
-        series: UsageChartSeries,
-        priority: Int,
-        source: UsageChartPointSource,
-        to date: Date,
-        within visibleRange: DateInterval?
-    ) -> Candidate? {
-        guard let point = nearestPoint(
-            in: points,
-            to: date,
-            date: \.date,
-            within: visibleRange
-        ) else {
-            return nil
-        }
-        return Candidate(
-            series: series,
-            point: point,
-            priority: priority,
-            source: source
-        )
     }
 
     private static func candidates(

@@ -6,7 +6,11 @@ let package = Package(
     name: "CodexLimits",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "CodexLimits", targets: ["CodexLimits"])
+        .executable(name: "CodexLimits", targets: ["CodexLimits"]),
+        .executable(
+            name: "CodexLimitsClaudeRelay",
+            targets: ["CodexLimitsClaudeRelay"]
+        )
     ],
     dependencies: [
         .package(
@@ -17,11 +21,16 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CodexLimits",
-            dependencies: ["Sparkle"]
+            dependencies: ["ClaudeIntegrationCore", "Sparkle"]
+        ),
+        .target(name: "ClaudeIntegrationCore"),
+        .executableTarget(
+            name: "CodexLimitsClaudeRelay",
+            dependencies: ["ClaudeIntegrationCore"]
         ),
         .testTarget(
             name: "CodexLimitsTests",
-            dependencies: ["CodexLimits"],
+            dependencies: ["ClaudeIntegrationCore", "CodexLimits"],
             resources: [.copy("Fixtures")]
         )
     ]

@@ -217,26 +217,6 @@ struct CodexMetadataAnalysisPayload: Codable, Equatable, Sendable {
     let activeTimeAvailable: ActiveTimeAvailable
     let scope: Scope
 
-    var fingerprint: String {
-        let encoder = JSONEncoder()
-        guard let data = try? encoder.encode(self),
-              var object = try? JSONSerialization.jsonObject(
-                  with: data
-              ) as? [String: Any] else {
-            return ""
-        }
-        object.removeValue(forKey: "generatedAt")
-        guard let stableData = try? JSONSerialization.data(
-            withJSONObject: object,
-            options: [.sortedKeys]
-        ) else {
-            return ""
-        }
-        return SHA256.hash(data: stableData)
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
-
     static func make(
         reader: UsageReaderSnapshot,
         exploration: AnalyticsExplorationState,
@@ -1318,23 +1298,9 @@ final class CodexAssistedInsightStore: ObservableObject {
         }
     }
 
-    var showsCard: Bool {
-        showsAnalyzeAction
-            || isRunning
-            || overhead != nil
-            || !persistedResults.isEmpty
-    }
-
-    func showsCard(for scope: CodexAssistedAnalysisScope) -> Bool {
-        showsAnalyzeAction
-            || isRunning
-            || overhead != nil
-            || result(for: scope) != nil
-    }
-
     func showsCard(
         for scope: CodexAssistedAnalysisScope,
-        sourceSelection: CodexSourceSelection?
+        sourceSelection: CodexSourceSelection? = nil
     ) -> Bool {
         showsAnalyzeAction
             || isRunning
@@ -1346,19 +1312,8 @@ final class CodexAssistedInsightStore: ObservableObject {
     }
 
     func result(
-        for scope: CodexAssistedAnalysisScope
-    ) -> CodexAssistedAnalysisResult? {
-        if resultScope?.fingerprint == scope.fingerprint, let result {
-            return result
-        }
-        return persistedResults.last {
-            $0.scopeFingerprint == scope.fingerprint
-        }?.result
-    }
-
-    func result(
         for scope: CodexAssistedAnalysisScope,
-        sourceSelection: CodexSourceSelection?
+        sourceSelection: CodexSourceSelection? = nil
     ) -> CodexAssistedAnalysisResult? {
         let selectionFingerprint = sourceSelection?.fingerprint
         var candidates: [CodexAssistedAnalysisResult] = []

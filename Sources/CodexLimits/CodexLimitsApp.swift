@@ -3,6 +3,9 @@ import SwiftUI
 @main
 struct CodexLimitsApp: App {
     @StateObject private var monitor: UsageMonitor
+    @StateObject private var integrations: IntegrationPreferences
+    @StateObject private var claudeCode: ClaudeCodeIntegrationStore
+    @StateObject private var grok: GrokIntegrationStore
     #if CODEX_LIMITS_QA
     @StateObject private var assistedInsights: CodexAssistedInsightStore
     #endif
@@ -10,20 +13,48 @@ struct CodexLimitsApp: App {
 
     init() {
         #if CODEX_LIMITS_QA
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.github.thrr87.CodexLimits.QA"
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first?
             .appendingPathComponent(
-                "com.github.thrr87.CodexLimits.QA",
+                bundleID,
                 isDirectory: true
             ) ?? FileManager.default.temporaryDirectory.appendingPathComponent(
-            "com.github.thrr87.CodexLimits.QA",
+            bundleID,
             isDirectory: true
         )
         let defaults = UserDefaults(
-            suiteName: "com.github.thrr87.CodexLimits.QA.defaults"
+            suiteName: bundleID + ".defaults"
         ) ?? .standard
+        let integrations = IntegrationPreferences(defaults: defaults)
+        _ = CodexClient.selectExecutable(integrations.codexExecutableURL)
+        let integrationWorkCoordinator = IntegrationWorkCoordinator()
+        let claudePaths = ClaudeCodeIntegrationPaths.isolatedQA(
+            base: base,
+            bundleURL: Bundle.main.bundleURL
+        )
+        _integrations = StateObject(wrappedValue: integrations)
+        _grok = StateObject(wrappedValue: GrokIntegrationStore(
+            isEnabled: integrations.isEnabled(.grok),
+            menuBarSourceActive: integrations.menuBarMetric == .grokCurrentPeriodUsageRemaining,
+            selectedExecutableURL: integrations.grokExecutableURL,
+            cacheURL: base.appendingPathComponent("Integrations/Grok/snapshot.json"),
+            integrationWorkCoordinator: integrationWorkCoordinator
+        ))
+        _claudeCode = StateObject(
+            wrappedValue: ClaudeCodeIntegrationStore(
+                isEnabled: integrations.isEnabled(.claudeCode),
+                menuBarSourceActive: integrations.menuBarMetric
+                    == .claudeSevenDayUsageRemaining,
+                service: ClaudeCodeSetupService(
+                    paths: claudePaths,
+                    selectedExecutableURL: integrations.claudeExecutableURL
+                ),
+                integrationWorkCoordinator: integrationWorkCoordinator
+            )
+        )
         analyticsDefaults = defaults
         let collector = LocalActivityCollector(
             stateDirectory: base.appendingPathComponent(
@@ -46,7 +77,11 @@ struct CodexLimitsApp: App {
                     "History",
                     isDirectory: true
                 ),
-                localActivityCollector: collector
+                isEnabled: integrations.isEnabled(.codex),
+                menuBarSourceActive: integrations.menuBarMetric
+                    == .codexWeeklyUsageRemaining,
+                localActivityCollector: collector,
+                integrationWorkCoordinator: integrationWorkCoordinator
             )
         )
         _assistedInsights = StateObject(
@@ -58,7 +93,35 @@ struct CodexLimitsApp: App {
         #else
         LoginItem.enableByDefault()
         analyticsDefaults = .standard
-        _monitor = StateObject(wrappedValue: UsageMonitor())
+        let integrations = IntegrationPreferences()
+        _ = CodexClient.selectExecutable(integrations.codexExecutableURL)
+        let integrationWorkCoordinator = IntegrationWorkCoordinator()
+        _integrations = StateObject(wrappedValue: integrations)
+        _grok = StateObject(wrappedValue: GrokIntegrationStore(
+            isEnabled: integrations.isEnabled(.grok),
+            menuBarSourceActive: integrations.menuBarMetric == .grokCurrentPeriodUsageRemaining,
+            selectedExecutableURL: integrations.grokExecutableURL,
+            integrationWorkCoordinator: integrationWorkCoordinator
+        ))
+        _claudeCode = StateObject(
+            wrappedValue: ClaudeCodeIntegrationStore(
+                isEnabled: integrations.isEnabled(.claudeCode),
+                menuBarSourceActive: integrations.menuBarMetric
+                    == .claudeSevenDayUsageRemaining,
+                service: ClaudeCodeSetupService(
+                    selectedExecutableURL: integrations.claudeExecutableURL
+                ),
+                integrationWorkCoordinator: integrationWorkCoordinator
+            )
+        )
+        _monitor = StateObject(
+            wrappedValue: UsageMonitor(
+                isEnabled: integrations.isEnabled(.codex),
+                menuBarSourceActive: integrations.menuBarMetric
+                    == .codexWeeklyUsageRemaining,
+                integrationWorkCoordinator: integrationWorkCoordinator
+            )
+        )
         #endif
     }
 
@@ -68,6 +131,9 @@ struct CodexLimitsApp: App {
         Window("Codex Limits QA", id: "qa-window") {
             MenuContentView(
                 monitor: monitor,
+                integrations: integrations,
+                claudeCode: claudeCode,
+                grok: grok,
                 defaults: analyticsDefaults,
                 assistedInsights: assistedInsights
             )
@@ -77,20 +143,101 @@ struct CodexLimitsApp: App {
         MenuBarExtra {
             MenuContentView(
                 monitor: monitor,
+                integrations: integrations,
+                claudeCode: claudeCode,
+                grok: grok,
                 defaults: analyticsDefaults
             )
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "gauge.with.dots.needle.50percent")
-                Text(monitor.readerSnapshot.menuBarText)
-                    .monospacedDigit()
+                if integrations.menuBarMetric != .none {
+                    Text(menuBarText)
+                        .monospacedDigit()
+                    if selectedMenuMetricIsStale {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .accessibilityHidden(true)
+                    }
+                }
             }
+            .accessibilityLabel(menuBarAccessibilityLabel)
         }
         .menuBarExtraStyle(.window)
         #endif
 
         Settings {
-            SettingsView(monitor: monitor)
+            SettingsView(
+                monitor: monitor,
+                integrations: integrations,
+                claudeCode: claudeCode,
+                grok: grok
+            )
+            .defaultAppStorage(analyticsDefaults)
+        }
+    }
+
+    private var menuBarText: String {
+        switch integrations.menuBarMetric {
+        case .none:
+            ""
+        case .codexWeeklyUsageRemaining:
+            monitor.readerSnapshot.menuBarText
+        case .claudeSevenDayUsageRemaining:
+            claudeCode.snapshot?.sevenDayMenuBarText(
+                now: claudeCode.displayNow
+            ) ?? "—"
+        case .grokCurrentPeriodUsageRemaining:
+            grok.menuBarText
+        }
+    }
+
+    private var menuBarAccessibilityLabel: String {
+        switch integrations.menuBarMetric {
+        case .none:
+            return "Codex Limits"
+        case .codexWeeklyUsageRemaining:
+            let value = monitor.readerSnapshot.weeklyUsageRemaining.map {
+                $0.window.remainingPercent.formatted(
+                    .number.precision(.fractionLength(0 ... 2))
+                ) + " percent remaining"
+            } ?? "unavailable"
+            return "\(integrations.menuBarMetric.displayName), \(value), \(monitor.readerSnapshot.freshness.rawValue)"
+        case .claudeSevenDayUsageRemaining:
+            let freshness = claudeCode.displayFreshness.map {
+                switch $0 {
+                case .fresh: "fresh"
+                case .stale: "stale"
+                case .expired: "new usage observation needed"
+                }
+            } ?? "unavailable"
+            let value = claudeCode.snapshot?.sevenDay.flatMap {
+                $0.resetsAt > claudeCode.displayNow ? $0 : nil
+            }.map {
+                $0.remainingPercent.formatted(
+                    .number.precision(.fractionLength(0 ... 2))
+                ) + " percent remaining"
+            } ?? "unavailable"
+            return "\(integrations.menuBarMetric.displayName), \(value), \(freshness)"
+        case .grokCurrentPeriodUsageRemaining:
+            let value = grok.currentSnapshot.map {
+                $0.remainingPercent.formatted(.number.precision(.fractionLength(0 ... 2)))
+                    + " percent remaining, \($0.period.rawValue)"
+            } ?? "unavailable"
+            let freshness = grok.currentSnapshot == nil ? "unavailable" : (grok.isStale ? "stale" : "fresh")
+            return "\(integrations.menuBarMetric.displayName), \(value), \(freshness)"
+        }
+    }
+
+    private var selectedMenuMetricIsStale: Bool {
+        switch integrations.menuBarMetric {
+        case .codexWeeklyUsageRemaining:
+            return monitor.readerSnapshot.freshness == .stale
+        case .claudeSevenDayUsageRemaining:
+            return claudeCode.displayFreshness == .stale
+        case .grokCurrentPeriodUsageRemaining:
+            return grok.isStale
+        case .none:
+            return false
         }
     }
 }

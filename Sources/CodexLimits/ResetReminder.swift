@@ -34,14 +34,13 @@ enum ResetReminderDelivery: Equatable {
     case permissionRequired
     case permissionDenied
     case scheduled(Date)
-    case reminderTimePassed(Date)
+    case reminderTimePassed
     case failed
 }
 
 struct ResetReminderState: Equatable {
     let isEnabled: Bool
     let leadTime: ResetReminderLeadTime
-    let authorization: ResetReminderAuthorization
     let delivery: ResetReminderDelivery
 
     var statusText: String {
@@ -77,9 +76,7 @@ struct ResetReminderTarget: Equatable, Sendable {
 }
 
 struct ResetReminderRequest: Equatable, Sendable {
-    let resetID: String
     let firesAt: Date
-    let expiresAt: Date
     let title: String
     let body: String
 }
@@ -125,7 +122,6 @@ final class ResetReminderCoordinator {
         state = ResetReminderState(
             isEnabled: isEnabled,
             leadTime: leadTime,
-            authorization: .unknown,
             delivery: isEnabled
                 ? scheduledRecord.map { .scheduled($0.firesAt) } ?? .waitingForExpiry
                 : .off
@@ -208,23 +204,18 @@ final class ResetReminderCoordinator {
         guard await continueIfCurrent(version) else { return }
         if authorization == .notDetermined || authorization == .unknown {
             guard mayRequestPermission else {
-                update(
-                    authorization: authorization,
-                    delivery: .permissionRequired
-                )
+                update(delivery: .permissionRequired)
                 return
             }
             do {
                 authorization = try await scheduler.requestAuthorization()
             } catch {
                 guard await continueIfCurrent(version) else { return }
-                update(authorization: authorization, delivery: .failed)
+                update(delivery: .failed)
                 return
             }
             guard await continueIfCurrent(version) else { return }
         }
-        update(authorization: authorization)
-
         guard authorization == .authorized else {
             await scheduler.cancel()
             guard await continueIfCurrent(version) else { return }
@@ -259,11 +250,7 @@ final class ResetReminderCoordinator {
                     return
                 }
             }
-            update(
-                delivery: .reminderTimePassed(
-                    existingRecord.firesAt
-                )
-            )
+            update(delivery: .reminderTimePassed)
             return
         }
 
@@ -286,9 +273,7 @@ final class ResetReminderCoordinator {
             ? state.leadTime.displayName
             : Self.shortDuration(target.expiresAt.timeIntervalSince(currentTime))
         let request = ResetReminderRequest(
-            resetID: target.id,
             firesAt: firesAt,
-            expiresAt: target.expiresAt,
             title: "Banked reset expires soon",
             body: "A banked reset expires in \(bodyTime)."
         )
@@ -324,13 +309,11 @@ final class ResetReminderCoordinator {
     private func update(
         isEnabled: Bool? = nil,
         leadTime: ResetReminderLeadTime? = nil,
-        authorization: ResetReminderAuthorization? = nil,
         delivery: ResetReminderDelivery? = nil
     ) {
         state = ResetReminderState(
             isEnabled: isEnabled ?? state.isEnabled,
             leadTime: leadTime ?? state.leadTime,
-            authorization: authorization ?? state.authorization,
             delivery: delivery ?? state.delivery
         )
     }

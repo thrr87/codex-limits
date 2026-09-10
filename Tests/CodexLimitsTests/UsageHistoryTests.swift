@@ -1407,13 +1407,21 @@ final class UsageHistoryTests: XCTestCase {
         _ = await receiver.load()
         _ = await receiver.connect(to: shared)
 
-        let corruptWriter = shared
-            .appendingPathComponent("installations", isDirectory: true)
-            .appendingPathComponent("a-corrupt", isDirectory: true)
-        try FileManager.default.createDirectory(at: corruptWriter, withIntermediateDirectories: true)
-        try Data("broken".utf8).write(
-            to: corruptWriter.appendingPathComponent("0000-broken.json")
+        let corruptWriter = UsageHistory(
+            localDirectory: root.appendingPathComponent("corrupt", isDirectory: true),
+            installationID: "a-corrupt"
         )
+        _ = await corruptWriter.load()
+        _ = await corruptWriter.connect(to: shared)
+        _ = await corruptWriter.record(UsageSample(
+            observedAt: now.addingTimeInterval(-60),
+            remainingPercent: 81,
+            resetsAt: now.addingTimeInterval(86_400)
+        ))
+        let corruptFile = try XCTUnwrap(
+            jsonFiles(for: "a-corrupt", in: shared).first
+        )
+        try Data("broken".utf8).write(to: corruptFile)
 
         let sample = UsageSample(
             observedAt: now,
@@ -1463,6 +1471,349 @@ final class UsageHistoryTests: XCTestCase {
         XCTAssertEqual(jsonFiles(for: "writer-a", in: root).count, 1)
     }
 
+    func testTenYearRetentionPublishesABoundedWorkingSet() async throws {
+        let root = temporaryDirectory()
+        let start = Date(timeIntervalSince1970: 1_600_000_000)
+        let dayCount = 10 * 365
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+        for day in 0 ..< dayCount {
+            let observedAt = start.addingTimeInterval(Double(day) * 86_400)
+            _ = await history.record(UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(100 - day % 100),
+                resetsAt: observedAt.addingTimeInterval(7 * 86_400)
+            ))
+        }
+
+        let reloaded = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        let loadStartedAt = ProcessInfo.processInfo.systemUptime
+        let state = await reloaded.load()
+        let loadMilliseconds = (
+            ProcessInfo.processInfo.systemUptime - loadStartedAt
+        ) * 1_000
+
+        XCTAssertEqual(jsonFiles(for: "writer-a", in: root).count, dayCount)
+        XCTAssertLessThanOrEqual(state.samples.count, 90)
+        XCTAssertEqual(
+            state.samples.last?.observedAt,
+            start.addingTimeInterval(Double(dayCount - 1) * 86_400)
+        )
+        let newestFile = try XCTUnwrap(
+            jsonFiles(for: "writer-a", in: root).max {
+                $0.lastPathComponent < $1.lastPathComponent
+            }
+        )
+        try Data("broken".utf8).write(to: newestFile)
+        let refreshStartedAt = ProcessInfo.processInfo.systemUptime
+        let automatic = await reloaded.synchronizeIfDue()
+        let refreshMilliseconds = (
+            ProcessInfo.processInfo.systemUptime - refreshStartedAt
+        ) * 1_000
+        XCTAssertNil(automatic.errorMessage)
+        XCTAssertEqual(automatic.samples, state.samples)
+        let explicit = await reloaded.synchronize()
+        XCTAssertEqual(
+            explicit.errorMessage,
+            "Some usage history couldn’t be read."
+        )
+        print(
+            String(
+                format: "BOUNDED_HISTORY days=%d samples=%d cold_load_ms=%.3f automatic_refresh_ms=%.3f",
+                dayCount,
+                state.samples.count,
+                loadMilliseconds,
+                refreshMilliseconds
+            )
+        )
+    }
+
+    func testDenseHistoryCannotExceedTheHardWorkingSetCap() async throws {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let samples = (0 ..< 14_400).map { minute in
+            let observedAt = start.addingTimeInterval(Double(minute) * 60)
+            return UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(100 - minute % 100),
+                resetsAt: observedAt.addingTimeInterval(7 * 86_400)
+            )
+        }
+        let state = await UsageHistory(
+            localDirectory: temporaryDirectory(),
+            installationID: "writer-a"
+        ).load(legacySamples: samples)
+
+        XCTAssertEqual(state.samples.count, 6_000)
+        XCTAssertEqual(state.samples.last?.observedAt, samples.last?.observedAt)
+    }
+
+    func testColdWorkingSetReadCapsInstallationFanOut() async {
+        let root = temporaryDirectory()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        for index in 0 ..< 33 {
+            let history = UsageHistory(
+                localDirectory: root,
+                installationID: String(format: "writer-%02d", index)
+            )
+            _ = await history.load()
+            _ = await history.record(UsageSample(
+                observedAt: start.addingTimeInterval(Double(index)),
+                remainingPercent: Double(index),
+                resetsAt: start.addingTimeInterval(86_400)
+            ))
+        }
+
+        let state = await UsageHistory(
+            localDirectory: root,
+            installationID: "writer-00"
+        ).load()
+
+        XCTAssertEqual(
+            state.errorMessage,
+            "Some usage history couldn’t be read."
+        )
+        XCTAssertLessThan(state.samples.count, 33)
+    }
+
+    func testOlderRangeLoadsASeparateBoundedView() async throws {
+        let root = temporaryDirectory()
+        let start = Date(timeIntervalSince1970: 1_600_000_000)
+        let samples = (0 ..< 200).map { day in
+            let observedAt = start.addingTimeInterval(Double(day) * 86_400)
+            return UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(100 - day % 100),
+                resetsAt: observedAt.addingTimeInterval(7 * 86_400)
+            )
+        }
+        let history = UsageHistory(
+            localDirectory: root,
+            installationID: "writer-a"
+        )
+        let defaultState = await history.load(legacySamples: samples)
+        let requested = DateInterval(
+            start: samples[20].observedAt,
+            end: samples[103].observedAt.addingTimeInterval(1)
+        )
+        let loadedView = await history.rangeView(for: requested)
+        let view = try XCTUnwrap(loadedView)
+
+        XCTAssertGreaterThan(defaultState.samples.first!.observedAt, requested.end)
+        XCTAssertEqual(
+            view.samples,
+            samples.filter { requested.contains($0.observedAt) }
+        )
+        XCTAssertEqual(view.resolution, .exact)
+        XCTAssertFalse(view.hadReadError)
+        XCTAssertEqual(view.coveredInterval, requested)
+        XCTAssertLessThanOrEqual(
+            view.retainedBounds!.start,
+            samples.first!.observedAt
+        )
+        XCTAssertGreaterThan(
+            view.retainedBounds!.end,
+            samples.last!.observedAt
+        )
+    }
+
+    func testDenseOlderRangeIsDownsampledAndRejectsAnUnboundedRequest() async throws {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let samples = (0 ..< 7_000).map { minute in
+            let observedAt = start.addingTimeInterval(Double(minute) * 60)
+            return UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(100 - minute % 100),
+                resetsAt: start.addingTimeInterval(7 * 86_400)
+            )
+        }
+        let history = UsageHistory(
+            localDirectory: temporaryDirectory(),
+            installationID: "writer-a"
+        )
+        _ = await history.load(legacySamples: samples)
+        let requested = DateInterval(
+            start: start,
+            end: samples.last!.observedAt.addingTimeInterval(1)
+        )
+        let loadedView = await history.rangeView(for: requested)
+        let view = try XCTUnwrap(loadedView)
+
+        XCTAssertEqual(view.resolution, .downsampled)
+        XCTAssertLessThanOrEqual(view.samples.count, 6_000)
+        XCTAssertEqual(view.samples.first?.observedAt, samples.first?.observedAt)
+        XCTAssertEqual(view.samples.last?.observedAt, samples.last?.observedAt)
+        let unboundedView = await history.rangeView(for: DateInterval(
+            start: start,
+            end: start.addingTimeInterval(85 * 86_400)
+        ))
+        XCTAssertNil(unboundedView)
+    }
+
+    func testExplicitAndAutomaticSyncBoundAndPersistOfflineBackfill() async throws {
+        let root = temporaryDirectory()
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let senderRoot = root.appendingPathComponent("sender", isDirectory: true)
+        let receiverRoot = root.appendingPathComponent("receiver", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shared,
+            withIntermediateDirectories: true
+        )
+        let receiver = UsageHistory(
+            localDirectory: receiverRoot,
+            installationID: "receiver"
+        )
+        _ = await receiver.load()
+        _ = await receiver.connect(to: shared)
+
+        let sender = UsageHistory(
+            localDirectory: senderRoot,
+            installationID: "sender"
+        )
+        _ = await sender.load()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        for day in 0 ..< 100 {
+            let observedAt = start.addingTimeInterval(Double(day) * 86_400)
+            _ = await sender.record(UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(100 - day % 100),
+                resetsAt: observedAt.addingTimeInterval(7 * 86_400)
+            ))
+        }
+        _ = await sender.connect(to: shared)
+
+        _ = await receiver.synchronize()
+        var importedCount = jsonFiles(
+            for: "sender",
+            in: receiverRoot
+        ).count
+        XCTAssertLessThanOrEqual(importedCount, 32)
+        let newestSharedFile = try XCTUnwrap(
+            jsonFiles(for: "sender", in: shared)
+                .map(\.lastPathComponent)
+                .max()
+        )
+        XCTAssertTrue(
+            jsonFiles(for: "sender", in: receiverRoot).contains {
+                $0.lastPathComponent == newestSharedFile
+            }
+        )
+
+        let reloaded = UsageHistory(
+            localDirectory: receiverRoot,
+            installationID: "receiver"
+        )
+        _ = await reloaded.load()
+        _ = await reloaded.connect(
+            to: shared,
+            performFullReconciliation: false
+        )
+        var nextCount = jsonFiles(for: "sender", in: receiverRoot).count
+        XCTAssertLessThanOrEqual(nextCount - importedCount, 32)
+        importedCount = nextCount
+
+        for pass in 2 ... 6 where importedCount < 100 {
+            _ = await reloaded.synchronizeIfDue(
+                at: Date().addingTimeInterval(Double(pass) * 3_600)
+            )
+            nextCount = jsonFiles(for: "sender", in: receiverRoot).count
+            XCTAssertLessThanOrEqual(nextCount - importedCount, 32)
+            importedCount = nextCount
+        }
+        XCTAssertEqual(importedCount, 100)
+    }
+
+    func testAutomaticSyncDoesNotRewriteUnchangedDailyFiles() async throws {
+        let root = temporaryDirectory()
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shared,
+            withIntermediateDirectories: true
+        )
+        let history = UsageHistory(
+            localDirectory: root.appendingPathComponent("local", isDirectory: true),
+            installationID: "writer-a"
+        )
+        _ = await history.load()
+        _ = await history.record(UsageSample(
+            observedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            remainingPercent: 75,
+            resetsAt: Date(timeIntervalSince1970: 1_700_604_800)
+        ))
+        _ = await history.connect(to: shared)
+        let before = try writerManifestRevision(for: "writer-a", in: shared)
+
+        _ = await history.synchronizeIfDue(
+            at: Date().addingTimeInterval(3_600)
+        )
+
+        XCTAssertEqual(
+            try writerManifestRevision(for: "writer-a", in: shared),
+            before
+        )
+    }
+
+    func testAutomaticSyncContinuesPastMalformedHistoryAndRevisitsItAfterRepair() async throws {
+        let root = temporaryDirectory()
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        let receiverRoot = root.appendingPathComponent("receiver", isDirectory: true)
+        let senderRoot = root.appendingPathComponent("sender", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: shared,
+            withIntermediateDirectories: true
+        )
+        let receiver = UsageHistory(
+            localDirectory: receiverRoot,
+            installationID: "receiver"
+        )
+        _ = await receiver.load()
+        _ = await receiver.connect(to: shared)
+
+        let sender = UsageHistory(
+            localDirectory: senderRoot,
+            installationID: "sender"
+        )
+        _ = await sender.load()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        for day in 0 ..< 3 {
+            let observedAt = start.addingTimeInterval(Double(day) * 86_400)
+            _ = await sender.record(UsageSample(
+                observedAt: observedAt,
+                remainingPercent: Double(80 - day),
+                resetsAt: observedAt.addingTimeInterval(7 * 86_400)
+            ))
+        }
+        _ = await sender.connect(to: shared)
+        let damaged = try XCTUnwrap(
+            jsonFiles(for: "sender", in: shared).min {
+                $0.lastPathComponent < $1.lastPathComponent
+            }
+        )
+        let original = try Data(contentsOf: damaged)
+        try Data("broken".utf8).write(to: damaged)
+
+        let first = await receiver.synchronizeIfDue(
+            at: Date().addingTimeInterval(3_600)
+        )
+        XCTAssertEqual(
+            first.errorMessage,
+            "Some synced history couldn’t be read."
+        )
+        XCTAssertEqual(jsonFiles(for: "sender", in: receiverRoot).count, 2)
+
+        try original.write(to: damaged, options: .atomic)
+        let second = await receiver.synchronizeIfDue(
+            at: Date().addingTimeInterval(7_200)
+        )
+        XCTAssertNil(second.errorMessage)
+        XCTAssertEqual(jsonFiles(for: "sender", in: receiverRoot).count, 3)
+    }
+
     func testMalformedFileKeepsValidHistoryAndReportsWarning() async throws {
         let root = temporaryDirectory()
         let now = Date(timeIntervalSince1970: 1_900_000)
@@ -1471,18 +1822,24 @@ final class UsageHistoryTests: XCTestCase {
             remainingPercent: 80,
             resetsAt: now.addingTimeInterval(86_400)
         )
+        let validLaterSample = UsageSample(
+            observedAt: now.addingTimeInterval(86_400),
+            remainingPercent: 70,
+            resetsAt: now.addingTimeInterval(2 * 86_400)
+        )
         let history = UsageHistory(
             localDirectory: root,
             installationID: "writer-a"
         )
         _ = await history.load()
         _ = await history.record(sample)
-        let writerDirectory = try XCTUnwrap(
-            writerDirectories(for: "writer-a", in: root).first
+        _ = await history.record(validLaterSample)
+        let storedFile = try XCTUnwrap(
+            jsonFiles(for: "writer-a", in: root).min {
+                $0.lastPathComponent < $1.lastPathComponent
+            }
         )
-        try Data("broken".utf8).write(
-            to: writerDirectory.appendingPathComponent("broken.json")
-        )
+        try Data("broken".utf8).write(to: storedFile)
 
         let reloaded = UsageHistory(
             localDirectory: root,
@@ -1490,7 +1847,7 @@ final class UsageHistoryTests: XCTestCase {
         )
         let state = await reloaded.load()
 
-        XCTAssertEqual(state.samples, [sample])
+        XCTAssertEqual(state.samples, [validLaterSample])
         XCTAssertEqual(state.errorMessage, "Some usage history couldn’t be read.")
     }
 
@@ -1641,6 +1998,22 @@ final class UsageHistoryTests: XCTestCase {
                 && (isDirectWriter || isGenerationWriter)
                 && (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
         }
+    }
+
+    private func writerManifestRevision(
+        for installationID: String,
+        in root: URL
+    ) throws -> UInt64 {
+        let writer = try XCTUnwrap(
+            writerDirectories(for: installationID, in: root).first
+        )
+        let data = try Data(
+            contentsOf: writer.appendingPathComponent(".codex-limits-writer")
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        return try XCTUnwrap((object["revision"] as? NSNumber)?.uint64Value)
     }
 
     private func markerData(generation: Int, syncTarget: String) throws -> Data {

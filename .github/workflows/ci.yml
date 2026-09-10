@@ -21,4 +21,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run tests
-        run: swift test
+        run: swift test -c release
+      - name: Check release validation and process cleanup
+        run: |
+          Scripts/validate-release.sh --self-test
+          python3 Scripts/check-grok-exit.py

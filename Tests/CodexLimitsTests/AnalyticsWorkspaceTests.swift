@@ -116,11 +116,16 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         XCTAssertFalse(AnalyticsGraph.concurrency.usesAccountScope)
     }
 
-    func testLightweightCoreOffersOnlyAccountGraphs() {
-        XCTAssertEqual(
-            AnalyticsGraph.coreCases,
-            [.usageRemaining, .tokenActivity]
-        )
+    func testLocalAnalyticsVisibilityMatchesTheSelectedSurface() {
+        var state = AnalyticsExplorationState.initial
+        XCTAssertFalse(state.usesLocalAnalytics)
+
+        state.graph = .usagePerToken
+        XCTAssertTrue(state.usesLocalAnalytics)
+
+        state.section = .facts
+        state.graph = .usageRemaining
+        XCTAssertTrue(state.usesLocalAnalytics)
     }
 
     func testRestoredLocalGraphFallsBackToUsageRemaining() throws {
@@ -438,152 +443,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
                 size: CGSize(width: 640, height: 780)
             )
         )
-    }
-
-    func testAccountTokenIntervalSelectionPreservesFactualIdentity() {
-        let range = DateInterval(
-            start: Date(timeIntervalSince1970: 1_000),
-            end: Date(timeIntervalSince1970: 10_000)
-        )
-        let positive = AccountTokenActivityInterval(
-            start: Date(timeIntervalSince1970: 2_000),
-            end: Date(timeIntervalSince1970: 3_000),
-            tokenDelta: 300,
-            method: .lifetimeDelta,
-            accountPartitionID: "account-a",
-            limitID: "weekly",
-            allowanceReset: range.end
-        )
-        let zero = AccountTokenActivityInterval(
-            start: Date(timeIntervalSince1970: 5_000),
-            end: Date(timeIntervalSince1970: 6_000),
-            tokenDelta: 0,
-            method: .lifetimeDelta,
-            accountPartitionID: "account-a",
-            limitID: "weekly",
-            allowanceReset: range.end
-        )
-        let daily = AccountTokenActivityInterval(
-            start: Date(timeIntervalSince1970: 7_000),
-            end: Date(timeIntervalSince1970: 8_000),
-            tokenDelta: 900,
-            method: .dailyBuckets,
-            accountPartitionID: "account-a",
-            limitID: "weekly",
-            allowanceReset: nil
-        )
-        let intervals = [daily, zero, positive]
-
-        XCTAssertEqual(
-            accountTokenInterval(
-                at: Date(timeIntervalSince1970: 2_500),
-                in: intervals,
-                within: range
-            ),
-            positive
-        )
-        XCTAssertEqual(
-            accountTokenInterval(
-                at: Date(timeIntervalSince1970: 5_500),
-                in: intervals,
-                within: range
-            ),
-            zero
-        )
-        XCTAssertNil(accountTokenInterval(
-            at: Date(timeIntervalSince1970: 4_000),
-            in: intervals,
-            within: range
-        ))
-        XCTAssertNil(accountTokenInterval(
-            at: Date(timeIntervalSince1970: 9_000),
-            in: intervals,
-            within: range
-        ))
-        XCTAssertEqual(
-            steppedAccountTokenInterval(
-                in: intervals,
-                from: nil,
-                by: 1
-            ),
-            positive
-        )
-        XCTAssertEqual(
-            steppedAccountTokenInterval(
-                in: intervals,
-                from: positive,
-                by: 1
-            ),
-            zero
-        )
-        XCTAssertEqual(
-            steppedAccountTokenInterval(
-                in: intervals,
-                from: zero,
-                by: 1
-            ),
-            daily
-        )
-        XCTAssertEqual(
-            retainedAccountTokenInterval(
-                daily,
-                in: intervals,
-                range: range
-            ),
-            daily
-        )
-        XCTAssertNil(retainedAccountTokenInterval(
-            daily,
-            in: [positive, zero],
-            range: range
-        ))
-        XCTAssertNil(retainedAccountTokenInterval(
-            daily,
-            in: intervals,
-            range: DateInterval(start: range.start, end: daily.start)
-        ))
-        XCTAssertEqual(zero.method.displayName, "Lifetime counter interval")
-        XCTAssertEqual(daily.method.displayName, "UTC daily bucket")
-        XCTAssertTrue(
-            accountTokenIntervalAccessibilityValue(zero)
-                .contains("0 account tokens. Account.")
-        )
-        XCTAssertTrue(
-            accountTokenIntervalAccessibilityValue(daily)
-                .contains("UTC daily bucket")
-        )
-    }
-
-    func testSelectedTokenIntervalFormattingDoesNotChangeIdentity() throws {
-        let formatter = ISO8601DateFormatter()
-        let interval = AccountTokenActivityInterval(
-            start: try XCTUnwrap(formatter.date(from: "2026-07-01T00:00:00Z")),
-            end: try XCTUnwrap(formatter.date(from: "2026-07-02T00:00:00Z")),
-            tokenDelta: 900,
-            method: .dailyBuckets,
-            accountPartitionID: "account-a",
-            limitID: "weekly",
-            allowanceReset: nil
-        )
-        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
-        let berlin = try XCTUnwrap(TimeZone(identifier: "Europe/Berlin"))
-        let locale = Locale(identifier: "en_US_POSIX")
-        let dateInterval = DateInterval(start: interval.start, end: interval.end)
-
-        XCTAssertNotEqual(
-            accountTokenIntervalText(
-                dateInterval,
-                timeZone: utc,
-                locale: locale
-            ),
-            accountTokenIntervalText(
-                dateInterval,
-                timeZone: berlin,
-                locale: locale
-            )
-        )
-        XCTAssertEqual(interval.tokenDelta, 900)
-        XCTAssertEqual(interval.id, interval)
     }
 
     func testTokenDisplayAggregationPreservesTotalsGapsAndBreaks() {
@@ -1566,76 +1425,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
-    func testPresentationViewsRenderEveryStateAtLargeAndSmallSizes() {
-        let presentations: [AnalyticsWorkspacePresentation] = [
-            .loading,
-            .valid,
-            .stale("Showing the last update."),
-            .empty,
-            .sourceError("Couldn’t read Codex usage.")
-        ]
-        let sizes = [
-            CGSize(width: 390, height: 430),
-            CGSize(width: 640, height: 780)
-        ]
-
-        for presentation in presentations {
-            for size in sizes {
-                XCTAssertTrue(
-                    renders(
-                        AnalyticsWorkspacePresentationView(
-                            presentation: presentation,
-                            refresh: {}
-                        ) {
-                            Text("Workspace content")
-                        },
-                        size: size
-                    ),
-                    "\(presentation) did not render at \(size)"
-                )
-            }
-        }
-    }
-
-    func testWorkspaceBodyRendersGraphsFactsAndInsights() {
-        let defaults = UserDefaults(
-            suiteName: "AnalyticsWorkspaceTests-\(UUID().uuidString)"
-        )!
-        let store = AnalyticsWorkspaceStore(defaults: defaults)
-        let reader = reader(fetchedAt: Date(timeIntervalSince1970: 10_000))
-
-        for section in AnalyticsSection.allCases {
-            store.selectSection(section)
-            XCTAssertTrue(
-                renders(
-                    AnalyticsWorkspaceBody(
-                        reader: reader,
-                        store: store,
-                        assistedInsights: CodexAssistedInsightStore()
-                    ),
-                    size: CGSize(width: 640, height: 620)
-                ),
-                "\(section.rawValue) did not render"
-            )
-        }
-
-        store.selectSection(.graphs)
-        for graph in AnalyticsGraph.allCases {
-            store.selectGraph(graph)
-            XCTAssertTrue(
-                renders(
-                    AnalyticsWorkspaceBody(
-                        reader: reader,
-                        store: store,
-                        assistedInsights: CodexAssistedInsightStore()
-                    ),
-                    size: CGSize(width: 640, height: 620)
-                ),
-                "\(graph.rawValue) did not render"
-            )
-        }
-    }
-
     func testExpiredCurrentWindowRendersUnavailableAndHistoricalUsage() throws {
         let start = try date("2026-08-01T12:13:00Z")
         let reset = try date("2026-08-08T12:13:00Z")
@@ -1701,48 +1490,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
         )
     }
 
-    func testUsagePerTokenComparisonRendersAtSmallAndLargeSizes() {
-        let suiteName =
-            "AnalyticsWorkspaceTests-usage-per-token-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let store = AnalyticsWorkspaceStore(defaults: defaults)
-        store.selectTimeRange(.fourWeeks)
-        let current = comparisonWeek(
-            index: 5,
-            movement: 40,
-            tokens: 10_000_000
-        )
-        let history = (0 ... 3).map {
-            comparisonWeek(
-                index: $0,
-                movement: Double(($0 + 1) * 10),
-                tokens: 10_000_000
-            )
-        }
-        let snapshot = UsagePerTokenEngine.evaluate(
-            current: current,
-            history: history,
-            pinnedBaselineID: nil
-        )
-
-        for size in [
-            CGSize(width: 390, height: 430),
-            CGSize(width: 640, height: 780)
-        ] {
-            XCTAssertTrue(
-                renders(
-                    UsagePerTokenWorkspace(
-                        sourceSnapshot: snapshot,
-                        store: store
-                    ),
-                    size: size
-                ),
-                "Usage per token comparison did not render at \(size)"
-            )
-        }
-    }
-
     private func date(_ value: String) throws -> Date {
         try XCTUnwrap(ISO8601DateFormatter().date(from: value))
     }
@@ -1798,44 +1545,6 @@ final class AnalyticsWorkspaceTests: XCTestCase {
             tokenHistory: [],
             emergencyResetCount: 2,
             fetchedAt: fetchedAt
-        )
-    }
-
-    private func comparisonWeek(
-        index: Int,
-        movement: Double,
-        tokens: Int64
-    ) -> WeeklyUsageEvidence {
-        let start = Date(timeIntervalSince1970: 10_000)
-            .addingTimeInterval(Double(index) * 7 * 86_400)
-        return WeeklyUsageEvidence(
-            id: "week-\(index)",
-            accountPartitionID: "account-a",
-            limitID: "weekly",
-            windowDurationMinutes: 10_080,
-            allowanceResetsAt: start.addingTimeInterval(7 * 86_400),
-            interval: DateInterval(start: start, duration: 7 * 86_400),
-            isComplete: index < 5,
-            accountMovementPoints: movement,
-            accountTokenActivity: tokens,
-            localTokenActivity: Int64(Double(tokens) * 0.9),
-            localCoveragePercent: 90,
-            boundaryQuality: .tight,
-            maximumAccountGap: 15 * 60,
-            modelShares: [
-                "gpt-5.6-sol": 0.8,
-                "gpt-5.6-luna": 0.2
-            ],
-            modelAttributionPercent: 100,
-            reasoningShares: ["high": 0.8, "medium": 0.2],
-            reasoningAttributionPercent: 100,
-            cachedInputShare: 0.4,
-            containsUnknownCorrection: false,
-            containsAccountChange: false,
-            containsCounterDecrease: false,
-            tokenDefinitionsAlign: true,
-            localSourceContinuous: true,
-            localSourceReason: nil
         )
     }
 

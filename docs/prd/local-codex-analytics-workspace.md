@@ -170,7 +170,7 @@ The account-control boundary remains read-only. The app reads, calculates, shows
 - Keep reset notifications neutral and private. Include only the banked-reset fact and time to expiry; do not include Project names, account identifiers, token details, or Source Content.
 - Keep Derived Records without automatic expiry. Add an explicit destructive `Delete analytics history` action with confirmation. It removes all Codex Limits Derived Records on this Mac and every supported account usage record in the selected sync folder, including files from other installations.
 - Deletion advances an empty sync generation so another Mac cannot republish older history. If the sync folder is unavailable, keep deletion pending, block older imports, and do not claim completion. Do not rebuild deleted history automatically; a separate explicit rebuild action may read only sources that still exist.
-- Continue using versioned, account-partitioned local records and atomic writes so the app remains lightweight. Remove the current 90-day cutoff. Migrate existing usage history without losing valid samples.
+- Continue using versioned, account-partitioned local records and atomic writes so the app remains lightweight. Remove the current 90-day cutoff. Migrate existing usage history without losing valid samples. Unlimited on-disk retention must use a Bounded Working Set: ordinary refresh, sync, reader snapshots, and charts may load only the requested range or bounded summaries, never the entire retained history.
 - Keep the existing user-selected folder limited to account usage samples. Do not copy Task Tree, agent, model, Source Content-derived, or Codex-assisted records into that folder in this PRD.
 - Do not store copied prompts, responses, code, paths, commands, or tool output in Analytics History. Persist only compact facts, aggregates, classifications, fingerprints, source state, Coverage, and Confidence.
 - Do not send Codex-derived product telemetry. The only external data path added by this PRD is the user-requested `Analyze with Codex` request described above.
@@ -178,7 +178,7 @@ The account-control boundary remains read-only. The app reads, calculates, shows
 - Keep all visible UI free of debug text, internal reasoning, test notes, implementation notes, and unsupported claims.
 - Preserve graceful degradation. If one source fails, keep valid data from other sources, mark missing Coverage, and withhold only the affected conclusions.
 - Keep refresh work off the main actor except for publishing the final reader snapshot. Batch disk reads and UI updates to avoid churn while Codex is active.
-- Preserve the menu-bar quick percentage, wake refresh, panel-open refresh, manual refresh, and periodic refresh. Persistent notifications may add lower-latency updates but do not remove full reconciliation reads.
+- Preserve the menu-bar quick percentage, wake refresh, panel-open refresh, manual refresh, and periodic refresh. Persistent notifications may add lower-latency updates but do not remove bounded reconciliation reads.
 
 ## Testing Decisions
 
@@ -210,7 +210,7 @@ The account-control boundary remains read-only. The app reads, calculates, shows
 - Test source isolation: failure of account reads must not erase Local Activity; failure of local parsing must not erase account facts; a malformed history file must not replace valid history.
 - Add view-level tests for a persistent current-state header; `Graphs`, `Facts`, and `Insights` navigation; screen-aware height and small-display reflow; persistent but source-scoped filters; empty and stale states; complete and partial reset copy; destructive confirmation; and visible provenance.
 - Add accessibility checks for keyboard focus order, button labels, chart summaries, selected-point text, contrast, Dynamic Type behavior where macOS supports it, and reduced-motion behavior.
-- Add performance fixtures representing years of compact history and thousands of Tasks. Verify bounded incremental reads, no full-history scan on ordinary refresh, and responsive snapshot publication.
+- Add performance fixtures representing 90 days and ten years of compact history plus thousands of Tasks. Verify bounded incremental reads, no full-history scan on ordinary refresh or periodic sync, bounded reader snapshots, responsive publication, and no proportional increase in steady-state RSS or ordinary refresh time.
 - Run the existing Swift test suite throughout migration. Existing forecast, client, and history behaviors remain regression requirements unless this PRD explicitly replaces them.
 
 ## Out of Scope

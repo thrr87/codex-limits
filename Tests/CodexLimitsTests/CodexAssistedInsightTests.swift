@@ -1,5 +1,3 @@
-import AppKit
-import SwiftUI
 import XCTest
 @testable import CodexLimits
 
@@ -379,8 +377,6 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertFalse(failedStore.showsAnalyzeAction)
         XCTAssertEqual(missingCalls.analysisCalls, 0)
         XCTAssertEqual(failedCalls.analysisCalls, 0)
-        XCTAssertFalse(missingStore.showsCard)
-        XCTAssertFalse(failedStore.showsCard)
     }
 
     func testCancelledAvailabilityCheckCanRunAgain() async {
@@ -401,7 +397,6 @@ final class CodexAssistedInsightTests: XCTestCase {
         let calls = await service.snapshot()
         XCTAssertEqual(calls.catalogCalls, 2)
         XCTAssertTrue(store.showsAnalyzeAction)
-        XCTAssertTrue(store.showsCard)
     }
 
     func testExplicitAnalysisClickPublishesMarkedResultAndOverhead() async {
@@ -562,7 +557,6 @@ final class CodexAssistedInsightTests: XCTestCase {
         let calls = await service.snapshot()
         XCTAssertEqual(calls.catalogCalls, 2)
         XCTAssertFalse(store.showsAnalyzeAction)
-        XCTAssertFalse(store.showsCard)
         XCTAssertNil(store.result)
     }
 
@@ -1367,108 +1361,6 @@ final class CodexAssistedInsightTests: XCTestCase {
         XCTAssertEqual(fixture.snapshot().turnStartCount, 0)
     }
 
-    func testActionProgressFailureAndResultRenderAtSmallAndLargeSizes() async {
-        let reader = UsageIntelligenceEngine.evaluate(
-            UsageIntelligenceInput(
-                account: nil,
-                samples: [],
-                safetyBuffer: 3,
-                sourceState: .available,
-                now: Date(timeIntervalSince1970: 2_000),
-                previousStatus: nil
-            )
-        )
-        let defaults = UserDefaults(
-            suiteName: "CodexAssistedInsightTests-\(UUID().uuidString)"
-        )!
-        let workspace = AnalyticsWorkspaceStore(defaults: defaults)
-        workspace.selectSection(.insights)
-
-        let successService = AssistedServiceFixture(
-            catalogResult: .success(eligibleProfile()),
-            analysisResult: .succeeded(analysisResult())
-        )
-        let successStore = CodexAssistedInsightStore(service: successService)
-        await successStore.checkAvailability()
-        for size in [
-            CGSize(width: 420, height: 620),
-            CGSize(width: 720, height: 780)
-        ] {
-            XCTAssertTrue(
-                renders(
-                    AnalyticsWorkspaceBody(
-                        reader: reader,
-                        store: workspace,
-                        assistedInsights: successStore
-                    ),
-                    size: size
-                )
-            )
-        }
-
-        successStore.startAnalysis(
-            payload: metadataPayload(),
-            scope: analysisScope()
-        )
-        await successStore.waitForAnalysis()
-        XCTAssertTrue(
-            renders(
-                AnalyticsWorkspaceBody(
-                    reader: reader,
-                    store: workspace,
-                    assistedInsights: successStore
-                ),
-                size: CGSize(width: 520, height: 720)
-            )
-        )
-
-        let delayedService = AssistedServiceFixture(
-            catalogResult: .success(eligibleProfile()),
-            analysisResult: .delayed
-        )
-        let delayedStore = CodexAssistedInsightStore(service: delayedService)
-        await delayedStore.checkAvailability()
-        delayedStore.startAnalysis(
-            payload: metadataPayload(),
-            scope: analysisScope()
-        )
-        await Task.yield()
-        XCTAssertTrue(
-            renders(
-                AnalyticsWorkspaceBody(
-                    reader: reader,
-                    store: workspace,
-                    assistedInsights: delayedStore
-                ),
-                size: CGSize(width: 520, height: 720)
-            )
-        )
-        await delayedStore.cancelAnalysis()
-        await delayedStore.waitForAnalysis()
-
-        let failedService = AssistedServiceFixture(
-            catalogResult: .success(eligibleProfile()),
-            analysisResult: .failed(failedOverhead())
-        )
-        let failedStore = CodexAssistedInsightStore(service: failedService)
-        await failedStore.checkAvailability()
-        failedStore.startAnalysis(
-            payload: metadataPayload(),
-            scope: analysisScope()
-        )
-        await failedStore.waitForAnalysis()
-        XCTAssertTrue(
-            renders(
-                AnalyticsWorkspaceBody(
-                    reader: reader,
-                    store: workspace,
-                    assistedInsights: failedStore
-                ),
-                size: CGSize(width: 520, height: 720)
-            )
-        )
-    }
-
     private func profile(
         id: String,
         model: String? = nil,
@@ -1685,17 +1577,6 @@ final class CodexAssistedInsightTests: XCTestCase {
         _ request: [String: Any]
     ) throws -> [String: Any] {
         try XCTUnwrap(request["params"] as? [String: Any])
-    }
-
-    private func renders<V: View>(
-        _ view: V,
-        size: CGSize
-    ) -> Bool {
-        let renderer = ImageRenderer(
-            content: view.frame(width: size.width, height: size.height)
-        )
-        renderer.proposedSize = ProposedViewSize(size)
-        return renderer.nsImage != nil
     }
 
     private func waitUntil(

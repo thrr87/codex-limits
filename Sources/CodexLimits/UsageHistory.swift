@@ -82,6 +82,19 @@ actor UsageHistory {
         let issue: Issue?
     }
 
+    enum RangeResolution: Equatable, Sendable {
+        case exact
+        case downsampled
+    }
+
+    struct RangeView: Equatable, Sendable {
+        let retainedBounds: DateInterval?
+        let coveredInterval: DateInterval?
+        let samples: [UsageSample]
+        let resolution: RangeResolution
+        let hadReadError: Bool
+    }
+
     private struct Marker: Codable {
         let version: Int
         let generation: Int?
@@ -123,6 +136,29 @@ actor UsageHistory {
         let digest: String
     }
 
+    private struct WriterManifest: Codable {
+        let version: Int
+        let generation: Int
+        let oldestDay: String
+        let newestDay: String
+        let latestChangedDay: String
+        let revision: UInt64
+    }
+
+    private struct WriterCursor: Codable {
+        var nextDay: String?
+        var observedRevision: UInt64?
+    }
+
+    private struct SyncProgress: Codable {
+        let version: Int
+        let lineageID: String
+        let generation: Int
+        var publication: WriterCursor
+        var imports: [String: WriterCursor]
+        var nextImportWriter: String?
+    }
+
     private enum HistoryError: Error {
         case invalidFolder
         case invalidFile
@@ -140,9 +176,50 @@ actor UsageHistory {
     private static let lineagesName = "lineages"
     private static let deletionsName = "deletions"
     private static let accountBindingName = ".codex-limits-account.json"
+    private static let writerManifestName = ".codex-limits-writer"
+    private static let syncProgressName = ".codex-limits-sync-progress"
     private static let maximumFileSize = 1_000_000
     private static let maximumGeneration = 1_000_000_000
+    private static let maximumAutomaticSyncCandidates = 32
     private static let automaticSyncInterval: TimeInterval = 30 * 60
+    private static let localMarkerUpdateLock = NSLock()
+    private static let workingSetFileDays = 90
+    private static let workingSetDuration: TimeInterval = 84 * 86_400
+    private static let fullResolutionDuration: TimeInterval = 8 * 86_400
+    private static let historicalBucketDuration: TimeInterval = 60 * 60
+    private static let maximumWorkingSetSamples = 6_000
+    private static let maximumWorkingSetWriters = 32
+    private static let maximumWorkingSetFileReads = 256
+    private static let maximumWorkingSetReadBytes = 8 * 1_024 * 1_024
+
+    private struct WorkingSetReadBudget {
+        var files = 0
+        var bytes = 0
+        var didReachLimit = false
+
+        mutating func admit(_ url: URL) throws -> Bool {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return false
+            }
+            let values = try url.resourceValues(
+                forKeys: [.fileSizeKey, .isRegularFileKey]
+            )
+            guard values.isRegularFile == true,
+                  let size = values.fileSize,
+                  size >= 0,
+                  size <= UsageHistory.maximumFileSize else {
+                throw HistoryError.invalidFile
+            }
+            guard files < UsageHistory.maximumWorkingSetFileReads,
+                  size <= UsageHistory.maximumWorkingSetReadBytes - bytes else {
+                didReachLimit = true
+                return false
+            }
+            files += 1
+            bytes += size
+            return true
+        }
+    }
 
     private let localDirectory: URL
     private let installationID: String
@@ -204,7 +281,7 @@ actor UsageHistory {
         } else if marker.pendingDeletionTarget == .localOnly {
             deletionStatus = .complete
         }
-        let local = readAll(from: activeLocalDirectory)
+        let local = readWorkingSet(from: activeLocalDirectory)
         knownSamples = local.samples
         errorMessage = if migrationWarning {
             "Some usage history couldn’t be migrated."
@@ -241,7 +318,7 @@ actor UsageHistory {
                 installationID: installationID,
                 coordinated: false
             )
-            knownSamples = normalized(knownSamples + [sample])
+            knownSamples = boundedWorkingSet(knownSamples + [sample])
             if let syncDirectory {
                 try prepareRoot(
                     syncDirectory,
@@ -272,7 +349,8 @@ actor UsageHistory {
         to directory: URL,
         accountIdentity: String? = nil,
         accountBindingToken: String? = nil,
-        bindsUnresolvedDeletionTarget: Bool = false
+        bindsUnresolvedDeletionTarget: Bool = false,
+        performFullReconciliation: Bool = true
     ) -> State {
         do {
             try prepareLocalStore()
@@ -329,7 +407,11 @@ actor UsageHistory {
             try reconcileGeneration(with: directory)
             syncDirectory = directory
             errorMessage = nil
-            return synchronize()
+            return synchronize(
+                at: Date(),
+                refreshLocalWhenDisconnected: false,
+                boundedReconciliation: !performFullReconciliation
+            )
         } catch {
             if case HistoryError.wrongDeletionFolder = error {
                 syncDirectory = nil
@@ -378,7 +460,11 @@ actor UsageHistory {
     }
 
     func synchronize() -> State {
-        synchronize(at: Date())
+        synchronize(
+            at: Date(),
+            refreshLocalWhenDisconnected: true,
+            boundedReconciliation: true
+        )
     }
 
     func synchronizeIfDue(at now: Date = Date()) -> State {
@@ -388,12 +474,114 @@ actor UsageHistory {
                 return state()
             }
         }
-        return synchronize(at: now)
+        return synchronize(
+            at: now,
+            refreshLocalWhenDisconnected: false,
+            boundedReconciliation: true
+        )
     }
 
-    private func synchronize(at now: Date) -> State {
+    func rangeView(for requestedInterval: DateInterval) -> RangeView? {
+        guard requestedInterval.duration > 0,
+              requestedInterval.duration <= Self.workingSetDuration,
+              requestedInterval.start.timeIntervalSinceReferenceDate.isFinite,
+              requestedInterval.end.timeIntervalSinceReferenceDate.isFinite else {
+            return nil
+        }
+        do {
+            try prepareLocalStore()
+            try prepareRoot(
+                activeLocalDirectory,
+                createIfMissing: true,
+                coordinated: false
+            )
+        } catch {
+            return RangeView(
+                retainedBounds: nil,
+                coveredInterval: nil,
+                samples: [],
+                resolution: .exact,
+                hadReadError: true
+            )
+        }
+
+        let directory = installationsDirectory(in: activeLocalDirectory)
+        var retainedStart: Date?
+        var retainedEnd: Date?
+        var samples: [UsageSample] = []
+        var wasDownsampled = false
+        var hadReadError = false
+        var budget = WorkingSetReadBudget()
+        do {
+            let writers = try boundedWorkingSetWriters(in: directory)
+            hadReadError = writers.didReachLimit
+            writerLoop: for writer in writers.values {
+                guard !Task.isCancelled else { return nil }
+                do {
+                    if let manifest = try ensureWriterManifest(
+                        in: writer,
+                        generation: 1,
+                        coordinated: false
+                    ), let oldest = date(forDayName: manifest.oldestDay),
+                       let newest = nextDay(after: manifest.newestDay)
+                            .flatMap(date(forDayName:)) {
+                        retainedStart = min(retainedStart ?? oldest, oldest)
+                        retainedEnd = max(retainedEnd ?? newest, newest)
+                    }
+                } catch {
+                    hadReadError = true
+                }
+
+                for day in dayNames(in: requestedInterval) {
+                    guard !Task.isCancelled else { return nil }
+                    let file = writer.appendingPathComponent("\(day).json")
+                    do {
+                        guard try budget.admit(file) else {
+                            if budget.didReachLimit {
+                                hadReadError = true
+                                break writerLoop
+                            }
+                            continue
+                        }
+                        let next = try readDailyFileIfPresent(
+                            at: file,
+                            coordinated: false
+                        ).filter { requestedInterval.contains($0.observedAt) }
+                        let bounded = boundedRangeSamples(samples + next)
+                        samples = bounded.samples
+                        wasDownsampled = wasDownsampled || bounded.didDownsample
+                    } catch {
+                        hadReadError = true
+                    }
+                }
+            }
+        } catch {
+            hadReadError = true
+        }
+
+        let retainedBounds = retainedStart.flatMap { start in
+            retainedEnd.flatMap { end in
+                end > start ? DateInterval(start: start, end: end) : nil
+            }
+        }
+        return RangeView(
+            retainedBounds: retainedBounds,
+            coveredInterval: retainedBounds?.intersection(with: requestedInterval),
+            samples: samples,
+            resolution: wasDownsampled ? .downsampled : .exact,
+            hadReadError: hadReadError
+        )
+    }
+
+    private func synchronize(
+        at now: Date,
+        refreshLocalWhenDisconnected: Bool,
+        boundedReconciliation: Bool
+    ) -> State {
         lastSynchronizationAttemptAt = now
-        guard let syncDirectory else { return state(refreshSamples: true) }
+        guard let syncDirectory else {
+            return state(refreshSamples: refreshLocalWhenDisconnected)
+        }
         do {
             try prepareLocalStore()
             try prepareRoot(
@@ -416,18 +604,37 @@ actor UsageHistory {
             }
             try reconcileGeneration(with: syncDirectory)
             let generation = try effectiveGeneration(in: syncDirectory)
-            let hadImportErrors = try importHistory(
-                from: syncDirectory,
-                generation: generation
-            )
-            try publishOwnHistory(to: syncDirectory, generation: generation)
+            let hadImportErrors: Bool
+            if boundedReconciliation {
+                let marker = try readMarker(
+                    at: localDirectory.appendingPathComponent(Self.markerName),
+                    coordinated: false
+                )
+                guard let lineageID = marker.syncTarget else {
+                    throw HistoryError.invalidFolder
+                }
+                hadImportErrors = try synchronizeBounded(
+                    with: syncDirectory,
+                    generation: generation,
+                    lineageID: lineageID
+                )
+            } else {
+                hadImportErrors = try importHistory(
+                    from: syncDirectory,
+                    generation: generation
+                )
+                try publishOwnHistory(
+                    to: syncDirectory,
+                    generation: generation
+                )
+            }
             errorMessage = hadImportErrors
                 ? "Some synced history couldn’t be read."
                 : nil
         } catch {
             errorMessage = message(for: error)
         }
-        return state(refreshSamples: true)
+        return state()
     }
 
     func deleteAnalyticsHistory(
@@ -621,15 +828,15 @@ actor UsageHistory {
         refreshSamples: Bool = false
     ) -> State {
         if refreshSamples {
-            let local = readAll(from: activeLocalDirectory)
+            let local = readWorkingSet(from: activeLocalDirectory)
             if local.hadError && errorMessage == nil {
                 errorMessage = "Some usage history couldn’t be read."
             }
             knownSamples = local.hadError || errorMessage != nil
-                ? normalized(local.samples + knownSamples + fallback)
+                ? boundedWorkingSet(local.samples + knownSamples + fallback)
                 : local.samples
         } else if !fallback.isEmpty {
-            knownSamples = normalized(knownSamples + fallback)
+            knownSamples = boundedWorkingSet(knownSamples + fallback)
         }
         return State(
             samples: knownSamples,
@@ -718,23 +925,215 @@ actor UsageHistory {
             .appendingPathComponent(installationID, isDirectory: true)
         try createDirectory(at: writerDirectory, coordinated: coordinated)
 
-        for (day, newSamples) in grouped {
+        for day in grouped.keys.sorted() {
+            guard let newSamples = grouped[day] else { continue }
             let url = writerDirectory.appendingPathComponent("\(day).json")
             let existing = try readDailyFileIfPresent(
                 at: url,
                 generation: generation,
                 coordinated: coordinated
             )
+            let merged = normalized(existing + newSamples)
+            guard merged != existing else { continue }
             try write(
-                normalized(existing + newSamples),
+                merged,
                 to: url,
                 generation: generation,
+                coordinated: coordinated
+            )
+            try noteChangedDay(
+                day,
+                in: writerDirectory,
+                generation: generation ?? 1,
                 coordinated: coordinated
             )
         }
     }
 
-    private func importHistory(from remoteRoot: URL, generation: Int) throws -> Bool {
+    private func noteChangedDay(
+        _ day: String,
+        in writerDirectory: URL,
+        generation: Int,
+        coordinated: Bool
+    ) throws {
+        guard date(forDayName: day) != nil else {
+            throw HistoryError.invalidFile
+        }
+        let url = writerDirectory.appendingPathComponent(
+            Self.writerManifestName
+        )
+        let existing: WriterManifest? = if FileManager.default.fileExists(
+            atPath: url.path
+        ) {
+            try JSONDecoder().decode(
+                WriterManifest.self,
+                from: readData(at: url, coordinated: coordinated)
+            )
+        } else {
+            nil
+        }
+        if let existing {
+            guard existing.version == 1,
+                  existing.generation == generation,
+                  date(forDayName: existing.oldestDay) != nil,
+                  date(forDayName: existing.newestDay) != nil,
+                  date(forDayName: existing.latestChangedDay) != nil,
+                  existing.revision < UInt64.max else {
+                throw HistoryError.invalidFile
+            }
+        }
+        let manifest = WriterManifest(
+            version: 1,
+            generation: generation,
+            oldestDay: min(existing?.oldestDay ?? day, day),
+            newestDay: max(existing?.newestDay ?? day, day),
+            latestChangedDay: day,
+            revision: (existing?.revision ?? 0) + 1
+        )
+        try writeData(
+            try JSONEncoder().encode(manifest),
+            to: url,
+            coordinated: coordinated
+        )
+    }
+
+    private func writerManifest(
+        in writerDirectory: URL,
+        generation: Int,
+        coordinated: Bool
+    ) throws -> WriterManifest? {
+        let url = writerDirectory.appendingPathComponent(
+            Self.writerManifestName
+        )
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let manifest = try JSONDecoder().decode(
+            WriterManifest.self,
+            from: readData(at: url, coordinated: coordinated)
+        )
+        guard manifest.version == 1,
+              manifest.generation == generation,
+              date(forDayName: manifest.oldestDay) != nil,
+              date(forDayName: manifest.newestDay) != nil,
+              date(forDayName: manifest.latestChangedDay) != nil,
+              manifest.oldestDay <= manifest.newestDay else {
+            throw HistoryError.invalidFile
+        }
+        return manifest
+    }
+
+    private func ensureWriterManifest(
+        in writerDirectory: URL,
+        generation: Int,
+        coordinated: Bool
+    ) throws -> WriterManifest? {
+        if let manifest = try writerManifest(
+            in: writerDirectory,
+            generation: generation,
+            coordinated: coordinated
+        ) {
+            return manifest
+        }
+        let days = try jsonFiles(in: writerDirectory)
+            .map { $0.deletingPathExtension().lastPathComponent }
+            .filter { date(forDayName: $0) != nil }
+            .sorted()
+        guard let oldestDay = days.first,
+              let newestDay = days.last else {
+            return nil
+        }
+        let manifest = WriterManifest(
+            version: 1,
+            generation: generation,
+            oldestDay: oldestDay,
+            newestDay: newestDay,
+            latestChangedDay: newestDay,
+            revision: 1
+        )
+        try writeData(
+            try JSONEncoder().encode(manifest),
+            to: writerDirectory.appendingPathComponent(
+                Self.writerManifestName
+            ),
+            coordinated: coordinated
+        )
+        return manifest
+    }
+
+    private func syncProgress(
+        lineageID: String,
+        generation: Int
+    ) -> SyncProgress {
+        let url = activeLocalDirectory.appendingPathComponent(
+            Self.syncProgressName
+        )
+        if let data = try? readData(at: url, coordinated: false),
+           let progress = try? JSONDecoder().decode(
+               SyncProgress.self,
+               from: data
+           ), progress.version == 1,
+           progress.lineageID == lineageID,
+           progress.generation == generation {
+            return progress
+        }
+        return SyncProgress(
+            version: 1,
+            lineageID: lineageID,
+            generation: generation,
+            publication: WriterCursor(
+                nextDay: nil,
+                observedRevision: nil
+            ),
+            imports: [:],
+            nextImportWriter: nil
+        )
+    }
+
+    private func saveSyncProgress(_ progress: SyncProgress) throws {
+        try writeData(
+            try JSONEncoder().encode(progress),
+            to: activeLocalDirectory.appendingPathComponent(
+                Self.syncProgressName
+            ),
+            coordinated: false
+        )
+    }
+
+    private func automaticCandidates(
+        manifest: WriterManifest,
+        cursor: inout WriterCursor,
+        limit: Int
+    ) -> [String] {
+        guard limit > 0 else { return [] }
+        var result: [String] = []
+        if cursor.observedRevision != manifest.revision {
+            result.append(manifest.latestChangedDay)
+            cursor.observedRevision = manifest.revision
+        }
+        var next = cursor.nextDay.flatMap { day in
+            day >= manifest.oldestDay && day <= manifest.newestDay
+                ? day
+                : nil
+        } ?? manifest.oldestDay
+        var visited: Set<String> = []
+        while result.count < limit, visited.insert(next).inserted {
+            if !result.contains(next) {
+                result.append(next)
+            }
+            guard let following = nextDay(after: next) else { break }
+            next = following > manifest.newestDay
+                ? manifest.oldestDay
+                : following
+            cursor.nextDay = next
+        }
+        return result
+    }
+
+    private func importHistory(
+        from remoteRoot: URL,
+        generation: Int
+    ) throws -> Bool {
         let remoteInstallations = installationsDirectory(
             in: remoteRoot,
             generation: generation
@@ -747,7 +1146,9 @@ actor UsageHistory {
                 isDirectory: true
             )
             try createDirectory(at: localWriter, coordinated: false)
-            for remoteFile in try jsonFiles(in: remoteWriter) {
+            for remoteFile in try jsonFiles(in: remoteWriter).sorted(by: {
+                $0.lastPathComponent < $1.lastPathComponent
+            }) {
                 do {
                     let localFile = localWriter.appendingPathComponent(remoteFile.lastPathComponent)
                     let remoteSamples = try readDailyFileIfPresent(
@@ -756,11 +1157,21 @@ actor UsageHistory {
                         coordinated: true
                     )
                     let localSamples = try readDailyFileIfPresent(at: localFile, coordinated: false)
-                    try write(
-                        normalized(localSamples + remoteSamples),
-                        to: localFile,
-                        coordinated: false
-                    )
+                    let merged = normalized(localSamples + remoteSamples)
+                    if merged != localSamples {
+                        try write(
+                            merged,
+                            to: localFile,
+                            coordinated: false
+                        )
+                        try noteChangedDay(
+                            remoteFile.deletingPathExtension().lastPathComponent,
+                            in: localWriter,
+                            generation: 1,
+                            coordinated: false
+                        )
+                    }
+                    knownSamples = boundedWorkingSet(knownSamples + merged)
                 } catch {
                     hadError = true
                 }
@@ -769,7 +1180,10 @@ actor UsageHistory {
         return hadError
     }
 
-    private func publishOwnHistory(to remoteRoot: URL, generation: Int) throws {
+    private func publishOwnHistory(
+        to remoteRoot: URL,
+        generation: Int
+    ) throws {
         let localWriter = installationsDirectory(in: activeLocalDirectory)
             .appendingPathComponent(installationID, isDirectory: true)
         guard FileManager.default.fileExists(atPath: localWriter.path) else { return }
@@ -779,7 +1193,9 @@ actor UsageHistory {
         )
             .appendingPathComponent(installationID, isDirectory: true)
         try createDirectory(at: remoteWriter, coordinated: true)
-        for localFile in try jsonFiles(in: localWriter) {
+        for localFile in try jsonFiles(in: localWriter).sorted(by: {
+            $0.lastPathComponent < $1.lastPathComponent
+        }) {
             let remoteFile = remoteWriter.appendingPathComponent(localFile.lastPathComponent)
             let localSamples = try readDailyFileIfPresent(at: localFile, coordinated: false)
             let remoteSamples = try readDailyFileIfPresent(
@@ -788,13 +1204,250 @@ actor UsageHistory {
                 coordinated: true
             )
             let merged = normalized(localSamples + remoteSamples)
+            let day = localFile.deletingPathExtension().lastPathComponent
+            if merged != localSamples {
+                try write(merged, to: localFile, coordinated: false)
+                try noteChangedDay(
+                    day,
+                    in: localWriter,
+                    generation: 1,
+                    coordinated: false
+                )
+            }
+            if merged != remoteSamples {
+                try write(
+                    merged,
+                    to: remoteFile,
+                    generation: generation,
+                    coordinated: true
+                )
+                try noteChangedDay(
+                    day,
+                    in: remoteWriter,
+                    generation: generation,
+                    coordinated: true
+                )
+            }
+            knownSamples = boundedWorkingSet(knownSamples + merged)
+        }
+    }
+
+    private func synchronizeBounded(
+        with remoteRoot: URL,
+        generation: Int,
+        lineageID: String
+    ) throws -> Bool {
+        var progress = syncProgress(
+            lineageID: lineageID,
+            generation: generation
+        )
+        var remaining = Self.maximumAutomaticSyncCandidates
+        var hadError = false
+        let remoteInstallations = installationsDirectory(
+            in: remoteRoot,
+            generation: generation
+        )
+        let remoteWriters = try directoryContents(of: remoteInstallations)
+            .filter { $0.lastPathComponent != installationID }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let localWriter = installationsDirectory(in: activeLocalDirectory)
+            .appendingPathComponent(installationID, isDirectory: true)
+        if FileManager.default.fileExists(atPath: localWriter.path),
+           let manifest = try ensureWriterManifest(
+               in: localWriter,
+               generation: 1,
+               coordinated: false
+           ) {
+            var cursor = progress.publication
+            let limit = remoteWriters.isEmpty
+                ? remaining
+                : min(8, remaining)
+            let days = automaticCandidates(
+                manifest: manifest,
+                cursor: &cursor,
+                limit: limit
+            )
+            let remoteWriter = remoteInstallations.appendingPathComponent(
+                installationID,
+                isDirectory: true
+            )
+            try createDirectory(at: remoteWriter, coordinated: true)
+            for day in days {
+                hadError = try publishDay(
+                    day,
+                    from: localWriter,
+                    to: remoteWriter,
+                    generation: generation
+                ) || hadError
+            }
+            progress.publication = cursor
+            remaining -= days.count
+        }
+
+        let orderedWriters = rotatedWriters(
+            remoteWriters,
+            startingAt: progress.nextImportWriter
+        )
+        var lastWriterID: String?
+        for (index, remoteWriter) in orderedWriters.enumerated()
+            where remaining > 0 {
+            let writerID = remoteWriter.lastPathComponent
+            let writersLeft = orderedWriters.count - index
+            let limit = max(remaining / max(writersLeft, 1), 1)
+            guard let manifest = try ensureWriterManifest(
+                in: remoteWriter,
+                generation: generation,
+                coordinated: true
+            ) else {
+                lastWriterID = writerID
+                continue
+            }
+            var cursor = progress.imports[writerID] ?? WriterCursor(
+                nextDay: nil,
+                observedRevision: nil
+            )
+            let days = automaticCandidates(
+                manifest: manifest,
+                cursor: &cursor,
+                limit: min(limit, remaining)
+            )
+            let localWriter = installationsDirectory(in: activeLocalDirectory)
+                .appendingPathComponent(writerID, isDirectory: true)
+            try createDirectory(at: localWriter, coordinated: false)
+            for day in days {
+                hadError = try importDay(
+                    day,
+                    from: remoteWriter,
+                    to: localWriter,
+                    generation: generation
+                ) || hadError
+            }
+            progress.imports[writerID] = cursor
+            remaining -= days.count
+            lastWriterID = writerID
+        }
+        if let lastWriterID,
+           let index = remoteWriters.firstIndex(where: {
+               $0.lastPathComponent == lastWriterID
+           }), !remoteWriters.isEmpty {
+            progress.nextImportWriter = remoteWriters[
+                (index + 1) % remoteWriters.count
+            ].lastPathComponent
+        }
+        try saveSyncProgress(progress)
+        return hadError
+    }
+
+    private func rotatedWriters(
+        _ writers: [URL],
+        startingAt writerID: String?
+    ) -> [URL] {
+        guard let writerID,
+              let index = writers.firstIndex(where: {
+                  $0.lastPathComponent >= writerID
+              }), index > 0 else {
+            return writers
+        }
+        return Array(writers[index...]) + Array(writers[..<index])
+    }
+
+    private func importDay(
+        _ day: String,
+        from remoteWriter: URL,
+        to localWriter: URL,
+        generation: Int
+    ) throws -> Bool {
+        let remoteFile = remoteWriter.appendingPathComponent("\(day).json")
+        guard FileManager.default.fileExists(atPath: remoteFile.path) else {
+            return false
+        }
+        let localFile = localWriter.appendingPathComponent("\(day).json")
+        let localSamples: [UsageSample]
+        let remoteSamples: [UsageSample]
+        do {
+            localSamples = try readDailyFileIfPresent(
+                at: localFile,
+                coordinated: false
+            )
+            remoteSamples = try readDailyFileIfPresent(
+                at: remoteFile,
+                generation: generation,
+                coordinated: true
+            )
+        } catch {
+            guard isMalformedHistoryFileError(error) else { throw error }
+            return true
+        }
+        let merged = normalized(localSamples + remoteSamples)
+        if merged != localSamples {
             try write(merged, to: localFile, coordinated: false)
+            try noteChangedDay(
+                day,
+                in: localWriter,
+                generation: 1,
+                coordinated: false
+            )
+        }
+        knownSamples = boundedWorkingSet(knownSamples + merged)
+        return false
+    }
+
+    private func publishDay(
+        _ day: String,
+        from localWriter: URL,
+        to remoteWriter: URL,
+        generation: Int
+    ) throws -> Bool {
+        let localFile = localWriter.appendingPathComponent("\(day).json")
+        guard FileManager.default.fileExists(atPath: localFile.path) else {
+            return false
+        }
+        let remoteFile = remoteWriter.appendingPathComponent("\(day).json")
+        let localSamples: [UsageSample]
+        let remoteSamples: [UsageSample]
+        do {
+            localSamples = try readDailyFileIfPresent(
+                at: localFile,
+                coordinated: false
+            )
+            remoteSamples = try readDailyFileIfPresent(
+                at: remoteFile,
+                generation: generation,
+                coordinated: true
+            )
+        } catch {
+            guard isMalformedHistoryFileError(error) else { throw error }
+            return true
+        }
+        let merged = normalized(localSamples + remoteSamples)
+        if merged != localSamples {
+            try write(merged, to: localFile, coordinated: false)
+        }
+        if merged != remoteSamples {
             try write(
                 merged,
                 to: remoteFile,
                 generation: generation,
                 coordinated: true
             )
+            try noteChangedDay(
+                day,
+                in: remoteWriter,
+                generation: generation,
+                coordinated: true
+            )
+        }
+        knownSamples = boundedWorkingSet(knownSamples + merged)
+        return false
+    }
+
+    private func isMalformedHistoryFileError(_ error: Error) -> Bool {
+        if error is DecodingError { return true }
+        switch error {
+        case HistoryError.invalidFile, HistoryError.unsupportedFileVersion:
+            return true
+        default:
+            return false
         }
     }
 
@@ -820,6 +1473,47 @@ actor UsageHistory {
             hadError = true
         }
         return (normalized(samples), hadError)
+    }
+
+    private func readWorkingSet(
+        from root: URL
+    ) -> (samples: [UsageSample], hadError: Bool) {
+        var samples: [UsageSample] = []
+        var hadError = false
+        var budget = WorkingSetReadBudget()
+        let directory = installationsDirectory(in: root)
+        do {
+            let writers = try boundedWorkingSetWriters(in: directory)
+            hadError = writers.didReachLimit
+            writerLoop: for writer in writers.values {
+                do {
+                    for file in try workingSetFiles(in: writer) {
+                        do {
+                            guard try budget.admit(file) else {
+                                if budget.didReachLimit {
+                                    hadError = true
+                                    break writerLoop
+                                }
+                                continue
+                            }
+                            samples = boundedWorkingSet(
+                                samples + (try readDailyFileIfPresent(
+                                    at: file,
+                                    coordinated: false
+                                ))
+                            )
+                        } catch {
+                            hadError = true
+                        }
+                    }
+                } catch {
+                    hadError = true
+                }
+            }
+        } catch {
+            hadError = true
+        }
+        return (boundedWorkingSet(samples), hadError)
     }
 
     private func readDailyFileIfPresent(
@@ -1019,6 +1713,110 @@ actor UsageHistory {
         }
     }
 
+    private func boundedWorkingSet(_ samples: [UsageSample]) -> [UsageSample] {
+        let ordered = normalized(samples)
+        guard let newest = ordered.last?.observedAt else { return [] }
+        let cutoff = newest.addingTimeInterval(-Self.workingSetDuration)
+        let fullResolutionStart = newest.addingTimeInterval(
+            -Self.fullResolutionDuration
+        )
+        var result: [UsageSample] = []
+        var bucketFirst: UsageSample?
+        var bucketLast: UsageSample?
+        var bucketCount = 0
+        var bucketNumber: Int?
+        var bucketReset: Date?
+
+        func flushBucket() {
+            guard let first = bucketFirst else { return }
+            result.append(first)
+            if bucketCount > 1, let last = bucketLast {
+                result.append(last)
+            }
+            bucketFirst = nil
+            bucketLast = nil
+            bucketCount = 0
+            bucketNumber = nil
+            bucketReset = nil
+        }
+
+        for sample in ordered where sample.observedAt >= cutoff {
+            if sample.observedAt >= fullResolutionStart || sample.comparisonBreak {
+                flushBucket()
+                result.append(sample)
+                continue
+            }
+            let number = Int(floor(
+                sample.observedAt.timeIntervalSinceReferenceDate
+                    / Self.historicalBucketDuration
+            ))
+            if bucketNumber != number || bucketReset != sample.resetsAt {
+                flushBucket()
+                bucketFirst = sample
+                bucketNumber = number
+                bucketReset = sample.resetsAt
+            }
+            bucketLast = sample
+            bucketCount += 1
+        }
+        flushBucket()
+        return Array(result.suffix(Self.maximumWorkingSetSamples))
+    }
+
+    private func boundedRangeSamples(
+        _ samples: [UsageSample]
+    ) -> (samples: [UsageSample], didDownsample: Bool) {
+        let ordered = normalized(samples)
+        guard ordered.count > Self.maximumWorkingSetSamples else {
+            return (ordered, false)
+        }
+        var reduced: [UsageSample] = []
+        var bucket: [UsageSample] = []
+        var bucketNumber: Int?
+        var bucketReset: Date?
+
+        func flushBucket() {
+            guard let first = bucket.first else { return }
+            reduced.append(first)
+            if let last = bucket.last, last != first {
+                reduced.append(last)
+            }
+            bucket = []
+            bucketNumber = nil
+            bucketReset = nil
+        }
+
+        for sample in ordered {
+            if sample.comparisonBreak {
+                flushBucket()
+                reduced.append(sample)
+                continue
+            }
+            let number = Int(floor(
+                sample.observedAt.timeIntervalSinceReferenceDate
+                    / Self.historicalBucketDuration
+            ))
+            if bucketNumber != number || bucketReset != sample.resetsAt {
+                flushBucket()
+                bucketNumber = number
+                bucketReset = sample.resetsAt
+            }
+            bucket.append(sample)
+        }
+        flushBucket()
+        guard reduced.count > Self.maximumWorkingSetSamples else {
+            return (reduced, true)
+        }
+        let lastIndex = reduced.count - 1
+        let capped = (0 ..< Self.maximumWorkingSetSamples).map { index in
+            reduced[Int(
+                (Double(index) * Double(lastIndex)
+                    / Double(Self.maximumWorkingSetSamples - 1)).rounded()
+            )]
+        }
+        return (capped, true)
+    }
+
     private func installationsDirectory(
         in root: URL,
         generation: Int? = nil
@@ -1159,6 +1957,35 @@ actor UsageHistory {
         at url: URL,
         _ update: (Marker) throws -> Marker
     ) throws -> Marker {
+        func updateAtURL(_ target: URL) throws -> Marker {
+            try self.beforeCoordinatedMarkerRead?(target)
+            let current = try JSONDecoder().decode(
+                Marker.self,
+                from: self.checkedData(at: target)
+            )
+            guard current.version == Self.folderFormatVersion,
+                  let currentGeneration = current.generation,
+                  (1 ... Self.maximumGeneration).contains(currentGeneration) else {
+                throw current.version == Self.folderFormatVersion
+                    ? HistoryError.invalidFile
+                    : HistoryError.unsupportedFolderVersion
+            }
+            let updated = try update(current)
+            guard updated.version == Self.folderFormatVersion,
+                  let updatedGeneration = updated.generation,
+                  (1 ... Self.maximumGeneration).contains(updatedGeneration) else {
+                throw updated.version == Self.folderFormatVersion
+                    ? HistoryError.invalidFile
+                    : HistoryError.unsupportedFolderVersion
+            }
+            try JSONEncoder().encode(updated).write(to: target, options: .atomic)
+            return updated
+        }
+        guard isUbiquitousItem(url) else {
+            return try Self.localMarkerUpdateLock.withLock {
+                try updateAtURL(url)
+            }
+        }
         var result: Result<Marker, Error>?
         var coordinationError: NSError?
         NSFileCoordinator(filePresenter: nil).coordinate(
@@ -1166,31 +1993,7 @@ actor UsageHistory {
             options: .forReplacing,
             error: &coordinationError
         ) { coordinatedURL in
-            result = Result {
-                try beforeCoordinatedMarkerRead?(coordinatedURL)
-                let current = try JSONDecoder().decode(
-                    Marker.self,
-                    from: checkedData(at: coordinatedURL)
-                )
-                guard current.version == Self.folderFormatVersion,
-                      let currentGeneration = current.generation,
-                      (1 ... Self.maximumGeneration).contains(currentGeneration) else {
-                    throw current.version == Self.folderFormatVersion
-                        ? HistoryError.invalidFile
-                        : HistoryError.unsupportedFolderVersion
-                }
-                let updated = try update(current)
-                guard updated.version == Self.folderFormatVersion,
-                      let updatedGeneration = updated.generation,
-                      (1 ... Self.maximumGeneration).contains(updatedGeneration) else {
-                    throw updated.version == Self.folderFormatVersion
-                        ? HistoryError.invalidFile
-                        : HistoryError.unsupportedFolderVersion
-                }
-                let data = try JSONEncoder().encode(updated)
-                try data.write(to: coordinatedURL, options: .atomic)
-                return updated
-            }
+            result = Result { try updateAtURL(coordinatedURL) }
         }
         if let coordinationError { throw coordinationError }
         guard let result else { throw HistoryError.unavailableFolder }
@@ -1684,6 +2487,46 @@ actor UsageHistory {
         }
     }
 
+    private func boundedWorkingSetWriters(
+        in directory: URL
+    ) throws -> (values: [URL], didReachLimit: Bool) {
+        var values: [URL] = []
+        let preferred = directory.appendingPathComponent(
+            installationID,
+            isDirectory: true
+        )
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(
+            atPath: preferred.path,
+            isDirectory: &isDirectory
+        ), isDirectory.boolValue {
+            values.append(preferred)
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        ) else {
+            return (values, false)
+        }
+        for case let url as URL in enumerator {
+            guard url.standardizedFileURL != preferred.standardizedFileURL,
+                  (try? url.resourceValues(
+                    forKeys: [.isDirectoryKey]
+                  ).isDirectory) == true else {
+                continue
+            }
+            guard values.count < Self.maximumWorkingSetWriters else {
+                // ponytail: cap cold fan-out; add a compact partition summary
+                // if real histories exceed 32 contributing installations.
+                return (values, true)
+            }
+            values.append(url)
+        }
+        return (values, false)
+    }
+
     private func jsonFiles(in directory: URL) throws -> [URL] {
         try FileManager.default.contentsOfDirectory(
             at: directory,
@@ -1695,11 +2538,70 @@ actor UsageHistory {
         }
     }
 
+    private func workingSetFiles(in writerDirectory: URL) throws -> [URL] {
+        guard let manifest = try ensureWriterManifest(
+            in: writerDirectory,
+            generation: 1,
+            coordinated: false
+        ), let newest = date(forDayName: manifest.newestDay) else {
+            return []
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return (0 ..< Self.workingSetFileDays).reversed().compactMap { offset in
+            calendar.date(byAdding: .day, value: -offset, to: newest).map {
+                writerDirectory.appendingPathComponent("\(dayName(for: $0)).json")
+            }
+        }
+    }
+
     private func dayName(for date: Date) -> String {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let parts = calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", parts.year!, parts.month!, parts.day!)
+    }
+
+    private func date(forDayName day: String) -> Date? {
+        let parts = day.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let dayOfMonth = Int(parts[2]) else {
+            return nil
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let date = calendar.date(from: DateComponents(
+            year: year,
+            month: month,
+            day: dayOfMonth
+        )), dayName(for: date) == day else {
+            return nil
+        }
+        return date
+    }
+
+    private func nextDay(after day: String) -> String? {
+        guard let date = date(forDayName: day) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar.date(byAdding: .day, value: 1, to: date).map(dayName)
+    }
+
+    private func dayNames(in interval: DateInterval) -> [String] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var date = calendar.startOfDay(for: interval.start)
+        var result: [String] = []
+        while date <= interval.end, result.count <= Self.workingSetFileDays {
+            result.append(dayName(for: date))
+            guard let next = calendar.date(byAdding: .day, value: 1, to: date) else {
+                break
+            }
+            date = next
+        }
+        return result
     }
 
     private func message(for error: Error) -> String {
