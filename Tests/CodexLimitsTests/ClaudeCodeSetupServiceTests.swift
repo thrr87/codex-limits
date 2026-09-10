@@ -80,14 +80,23 @@ final class ClaudeCodeSetupServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testDisableSuppressesAnInFlightReadinessResult() async throws {
-        let fixture = try fixture(settings: [
-            "payload": Array(repeating: "x", count: 200_000)
-        ])
+    func testDisableSuppressesAQueuedReadinessResult() async throws {
+        let fixture = try fixture(settings: [:])
         let service = ClaudeCodeSetupService(paths: fixture.paths)
+        let coordinator = IntegrationWorkCoordinator()
+        let gate = ClaudeCoordinatorGate()
+        let blocker = Task {
+            await coordinator.run(priority: .explicit) {
+                await gate.hold()
+            }
+        }
+        while !(await gate.started) {
+            await Task.yield()
+        }
         let store = ClaudeCodeIntegrationStore(
             isEnabled: false,
-            service: service
+            service: service,
+            integrationWorkCoordinator: coordinator
         )
         var readinessValues: [ClaudeCodeReadiness] = []
         let observation = store.$readiness.sink {
@@ -101,19 +110,16 @@ final class ClaudeCodeSetupServiceTests: XCTestCase {
         while store.readiness != .checking {
             await Task.yield()
         }
-        try await Task.sleep(for: .milliseconds(1))
-        let probe = ClaudeServiceProbe()
-        let queuedProbe = Task {
-            _ = await service.hasStoredData()
-            await probe.complete()
+        let disablingStarted = expectation(description: "Disable requested")
+        let disabling = Task { @MainActor in
+            disablingStarted.fulfill()
+            await store.setEnabled(false)
         }
-        try await Task.sleep(for: .milliseconds(1))
-        let probeCompletedEarly = await probe.isComplete
-        XCTAssertFalse(probeCompletedEarly)
-
-        await store.setEnabled(false)
+        await fulfillment(of: [disablingStarted], timeout: 2)
+        await gate.release()
+        await blocker.value
         await enabling.value
-        await queuedProbe.value
+        await disabling.value
 
         XCTAssertEqual(store.readiness, .disabled)
         XCTAssertFalse(readinessValues.contains(.setUp))
@@ -506,14 +512,6 @@ final class ClaudeCodeSetupServiceTests: XCTestCase {
                 with: Data(contentsOf: url)
             ) as? [String: Any]
         )
-    }
-}
-
-private actor ClaudeServiceProbe {
-    private(set) var isComplete = false
-
-    func complete() {
-        isComplete = true
     }
 }
 

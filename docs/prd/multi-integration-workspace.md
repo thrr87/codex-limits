@@ -1,8 +1,8 @@
 # Multi-integration workspace
 
-Status: Needs revision — all-enabled idle comparison and lifecycle soak remain release gates
+Status: Accepted for v1 implementation
 
-Development is not blocked. This status postpones release acceptance only; implementation, local testing, and documentation continue normally.
+Release 0.3.0 is accepted with the explicit owner exceptions recorded in [ADR-0015](../adr/0015-ship-claude-as-experimental.md). Unperformed checks remain marked as waived rather than passed.
 
 ## Destination
 
@@ -12,7 +12,7 @@ The product remains passive analytics. A fresher value is never worth noticeable
 
 The 2026-08-22 spike conditionally accepted Claude Code and rejected the OpenCode local-server collector after measuring approximately 736 MiB RSS and 66 MiB of initialization writes. Its Grok exclusion was based on the bare method `x.ai/billing`, which is not the ACP wire name. On 2026-09-10, official Grok Build 1.0.25 returned an authentication-required response for `_x.ai/billing` in an isolated environment without a login and valid billing data with CLI-managed authentication. Grok is restored to the development scope through that read-only route. The historical 1.0.5 binary has not been retested with the corrected method, so no claim is made about its support.
 
-Codex Limits reads no Grok credentials or browser sessions, calls no private billing backend directly, and parses no TUI. Claude’s implementation checks and historical Codex-plus-Claude idle comparison remain evidence for their original scope. A new all-enabled idle comparison covering Grok, provider-owned Grok startup-write measurement, and the eight-hour lifecycle soak remain release work. The product owner waived the eligible Pro/Max Claude observation for this experimental release; see [ADR-0015](../adr/0015-ship-claude-as-experimental.md). See [current Grok validation](../research/grok-build-validation-2026-09-10.md) and the [historical validation spike](../research/multi-integration-v1-validation-spikes-2026-08-22.md).
+Codex Limits reads no Grok credentials or browser sessions, calls no private billing backend directly, and parses no TUI. Claude’s implementation checks and historical Codex-plus-Claude idle comparison remain evidence for their original scope. Provider-owned Grok startup writes are measured. The product owner waived the eligible Pro/Max Claude observation for this experimental release, plus the expanded all-enabled idle comparison and eight-hour lifecycle soak for 0.3.0; see [ADR-0015](../adr/0015-ship-claude-as-experimental.md). These exceptions provide no evidence that the unperformed checks passed. See [current Grok validation](../research/grok-build-validation-2026-09-10.md) and the [historical validation spike](../research/multi-integration-v1-validation-spikes-2026-08-22.md).
 
 ## Confirmed decisions
 
@@ -329,31 +329,31 @@ Disabling Codex pauses its account timer, local collection, history exchange, an
 
 ## v1 release boundary and gates
 
-Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release acceptance waits for the remaining gates. OpenCode remains deferred. The maturity label appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
+Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release 0.3.0 is accepted with the recorded owner exceptions below. OpenCode remains deferred. The maturity label appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
 
 | Release gate | Current evidence | Status |
 |---|---|---|
 | Grok and OpenCode source decision | Grok 1.0.25 accepts correctly prefixed ACP billing with CLI-owned authentication; OpenCode remains excluded by RSS/write budgets | Passed |
 | Bounded Codex history and serialized demand-driven collection | 3,650-day fixture, 32-candidate reconciliation, idle process release, deterministic lifecycle tests | Passed |
 | Claude relay, setup, privacy, deletion, executable selection, and boundary behavior | Packaged helper checks and deterministic Release tests | Passed |
-| All-enabled idle comparison | Historical Codex-plus-Claude comparison passed; Grok startup-write counters are measured, but the expanded comparison remains | Pending |
+| All-enabled idle comparison | Expanded comparison not run; product owner waived it on 2026-09-10 for release 0.3.0; ADR-0015 | Waived for 0.3.0 |
 | Eligible Claude account observation | Product owner waived this check on 2026-09-10 for the experimental Claude Code release; ADR-0015 | Waived |
-| Eight-hour mixed lifecycle soak | Requires the user-confirmed network and sleep/wake cycles defined above | Pending |
+| Eight-hour mixed lifecycle soak | Not run; product owner waived it on 2026-09-10 for release 0.3.0; ADR-0015 | Waived for 0.3.0 |
 
-`Scripts/validate-release.sh` rejects a release while this document is not exactly `Accepted for v1 implementation`. Passing deterministic tests or the short idle comparison cannot change that status; all Pending rows must have recorded evidence first.
+`Scripts/validate-release.sh` requires this document to be exactly `Accepted for v1 implementation`. Each required performance row must be `Passed` or explicitly `Waived for VERSION` for the version being released. A version-specific exception does not satisfy later releases; deterministic tests and short comparisons do not count as evidence for an unperformed gate.
 
 Implementation progress before release acceptance is:
 
 1. bounded Codex default reader, older-range access, eventual sync, and baseline measurements — implemented and measured on 2026-08-22;
 2. shared Integration state, device-local Settings, menu metric selection, and serialized source work — implemented and deterministically tested on 2026-08-22;
-3. Claude Code allowance, setup, exact disable, and app-owned data deletion — implemented, packaged, and deterministically tested on 2026-08-22; lifecycle release checks remain; eligible-account validation is waived for the experimental release;
-4. Grok billing transport, validated snapshot model, Settings/workspace/menu integration — implemented on 2026-09-10, including retained Grok/Claude history and burndown charts, with a successful compiled collector read and 644 passing Release tests; signed native chart QA passed; expanded performance gates remain; eligible Claude observation is waived for the experimental release;
+3. Claude Code allowance, setup, exact disable, and app-owned data deletion — implemented, packaged, and deterministically tested on 2026-08-22; eligible-account validation is waived for the experimental release and lifecycle soak is waived for 0.3.0;
+4. Grok billing transport, validated snapshot model, Settings/workspace/menu integration — implemented on 2026-09-10, including retained Grok/Claude history and burndown charts, with a successful compiled collector read and 644 passing Release tests; signed native chart QA passed; expanded performance gates are waived for 0.3.0;
 5. OpenCode remains deferred until a supported lighter source passes its gates.
 
-The PRD returns to `Accepted for v1 implementation` only when:
+The normal acceptance criteria, subject to the explicit 0.3.0 exceptions above, are:
 
 - provider spikes pass or narrow the scope explicitly; Grok has a working authenticated ACP source and OpenCode remains narrowed out of v1;
-- the Codex-only baseline and expanded all-enabled budgets are reproducible; the 2026-08-22 Codex-plus-Claude comparison does not cover Grok, and the new idle comparison, provider-owned writes, and eight-hour soak remain release work;
+- the Codex-only baseline and expanded all-enabled budgets are reproducible; the 2026-08-22 Codex-plus-Claude comparison does not cover Grok, and the expanded idle comparison and eight-hour soak remain unverified;
 - bounded Codex history has accepted default-reader, older-range, and eventual-sync implementation paths;
 - provider measurement rules have deterministic fixtures;
 - no open lifecycle, privacy, accessibility, or data-selection decision remains.

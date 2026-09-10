@@ -13,16 +13,17 @@ is_accepted_multi_integration_status() {
     [[ $1 == 'Status: Accepted for v1 implementation' ]]
 }
 
-release_gate_passed() {
+release_gate_accepted() {
     local gate=$1
-    awk -F '|' -v gate="$gate" '
+    local version=$2
+    awk -F '|' -v gate="$gate" -v waiver="Waived for $version" '
         function trim(value) {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
             return value
         }
         trim($2) == gate {
             found = 1
-            passed = trim($4) == "Passed"
+            passed = trim($4) == "Passed" || trim($4) == waiver
         }
         END { exit !(found && passed) }
     '
@@ -36,12 +37,18 @@ if [[ ${1:-} == --self-test ]]; then
         'Status: Accepted for v1 implementation'
     ! is_accepted_multi_integration_status \
         'Status: Needs revision — release gates remain'
-    release_gate_passed 'All-enabled idle comparison' <<< \
+    release_gate_accepted 'All-enabled idle comparison' 0.3.0 <<< \
         '| All-enabled idle comparison | Recorded evidence | Passed |'
-    ! release_gate_passed 'All-enabled idle comparison' <<< \
+    ! release_gate_accepted 'All-enabled idle comparison' 0.3.0 <<< \
         '| All-enabled idle comparison | Not run | Pending |'
-    ! release_gate_passed 'Eight-hour mixed lifecycle soak' <<< \
+    ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
         '| Another gate | Recorded evidence | Passed |'
+    release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
+        '| Eight-hour mixed lifecycle soak | Owner decision | Waived for 0.3.0 |'
+    ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.1 <<< \
+        '| Eight-hour mixed lifecycle soak | Owner decision | Waived for 0.3.0 |'
+    ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
+        '| Eight-hour mixed lifecycle soak | Unscoped exception | Waived |'
     print "Release validator checks passed"
     exit
 fi
@@ -62,8 +69,8 @@ is_accepted_multi_integration_status "$multi_integration_status" || {
 for gate in \
     'All-enabled idle comparison' \
     'Eight-hour mixed lifecycle soak'; do
-    release_gate_passed "$gate" < "$multi_integration_prd" || {
-        print -u2 "Multi-integration release gate is not passed: $gate"
+    release_gate_accepted "$gate" "$version" < "$multi_integration_prd" || {
+        print -u2 "Multi-integration release gate is not accepted for $version: $gate"
         exit 65
     }
 done

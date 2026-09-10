@@ -24,7 +24,7 @@
 
 ## What it shows
 
-Codex shows Usage remaining. Codex Limits shows when it resets, how it changed, and which local Tasks this Mac observed. The current development build also includes opt-in Claude Code (Experimental) and Grok (Beta) Integrations with Usage remaining history. Claude records its seven-day and five-hour allowances during normal activity; Grok records its returned weekly or monthly usage pool. OpenCode remains deferred.
+Codex shows Usage remaining. Codex Limits shows when it resets, how it changed, and which local Tasks this Mac observed. Version 0.3.0 also includes opt-in Claude Code (Experimental) and Grok (Beta) Integrations with Usage remaining history. Claude records its seven-day and five-hour allowances during normal activity; Grok records its returned weekly or monthly usage pool. OpenCode remains deferred.
 
 Open the menu to see:
 
