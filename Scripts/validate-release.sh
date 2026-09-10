@@ -9,11 +9,40 @@ is_newer_than() {
     ! is-at-least "$candidate" "$previous"
 }
 
+is_accepted_multi_integration_status() {
+    [[ $1 == 'Status: Accepted for v1 implementation' ]]
+}
+
+release_gate_passed() {
+    local gate=$1
+    awk -F '|' -v gate="$gate" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        trim($2) == gate {
+            found = 1
+            passed = trim($4) == "Passed"
+        }
+        END { exit !(found && passed) }
+    '
+}
+
 if [[ ${1:-} == --self-test ]]; then
     is_newer_than 0.2.7 0.2.6
     ! is_newer_than 0.2.7 0.2.7
     ! is_newer_than 0.2.7 0.2.8
-    print "Release version checks passed"
+    is_accepted_multi_integration_status \
+        'Status: Accepted for v1 implementation'
+    ! is_accepted_multi_integration_status \
+        'Status: Needs revision — release gates remain'
+    release_gate_passed 'Eligible Claude account observation' <<< \
+        '| Eligible Claude account observation | Recorded evidence | Passed |'
+    ! release_gate_passed 'Eligible Claude account observation' <<< \
+        '| Eligible Claude account observation | Not run | Pending |'
+    ! release_gate_passed 'Eight-hour mixed lifecycle soak' <<< \
+        '| Another gate | Recorded evidence | Passed |'
+    print "Release validator checks passed"
     exit
 fi
 
@@ -24,6 +53,21 @@ version=${1:?"Usage: $0 VERSION"}
 }
 
 project_dir=${0:A:h:h}
+multi_integration_prd="$project_dir/docs/prd/multi-integration-workspace.md"
+multi_integration_status=$(sed -n '/^Status: /{p;q;}' "$multi_integration_prd")
+is_accepted_multi_integration_status "$multi_integration_status" || {
+    print -u2 "Multi-integration v1 release gates are not accepted"
+    exit 65
+}
+for gate in \
+    'All-enabled idle comparison' \
+    'Eligible Claude account observation' \
+    'Eight-hour mixed lifecycle soak'; do
+    release_gate_passed "$gate" < "$multi_integration_prd" || {
+        print -u2 "Multi-integration release gate is not passed: $gate"
+        exit 65
+    }
+done
 plist="$project_dir/Resources/Info.plist"
 plist_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
 build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")

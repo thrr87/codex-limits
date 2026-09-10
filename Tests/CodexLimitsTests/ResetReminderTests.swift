@@ -27,9 +27,7 @@ final class ResetReminderTests: XCTestCase {
             fixture.scheduler.events.last,
             .scheduled(
                 ResetReminderRequest(
-                    resetID: "reset-1",
                     firesAt: fixture.now.addingTimeInterval(48 * 60 * 60),
-                    expiresAt: target.expiresAt,
                     title: "Banked reset expires soon",
                     body: "A banked reset expires in 24 hours."
                 )
@@ -56,7 +54,6 @@ final class ResetReminderTests: XCTestCase {
         )
 
         XCTAssertTrue(fixture.coordinator.state.isEnabled)
-        XCTAssertEqual(fixture.coordinator.state.authorization, .denied)
         XCTAssertEqual(fixture.coordinator.state.delivery, .permissionDenied)
         XCTAssertEqual(
             fixture.scheduler.events,
@@ -80,9 +77,7 @@ final class ResetReminderTests: XCTestCase {
             [
                 .scheduled(
                     ResetReminderRequest(
-                        resetID: "reset-1",
                         firesAt: fixture.now.addingTimeInterval(42 * 60 * 60),
-                        expiresAt: target.expiresAt,
                         title: "Banked reset expires soon",
                         body: "A banked reset expires in 6 hours."
                     )
@@ -126,9 +121,7 @@ final class ResetReminderTests: XCTestCase {
             [
                 .scheduled(
                     ResetReminderRequest(
-                        resetID: "reset-1",
                         firesAt: fixture.now.addingTimeInterval(48 * 60 * 60),
-                        expiresAt: changed.expiresAt,
                         title: "Banked reset expires soon",
                         body: "A banked reset expires in 24 hours."
                     )
@@ -213,9 +206,7 @@ final class ResetReminderTests: XCTestCase {
             [
                 .scheduled(
                     ResetReminderRequest(
-                        resetID: "reset-1",
                         firesAt: fixture.now.addingTimeInterval(24 * 60 * 60),
-                        expiresAt: target.expiresAt,
                         title: "Banked reset expires soon",
                         body: "A banked reset expires in 24 hours."
                     )
@@ -259,10 +250,7 @@ final class ResetReminderTests: XCTestCase {
         XCTAssertTrue(scheduler.events.isEmpty)
         XCTAssertEqual(
             restarted.state.delivery,
-            .reminderTimePassed(
-                Date(timeIntervalSince1970: 1_800_000_000)
-                    .addingTimeInterval(24 * 60 * 60)
-            )
+            .reminderTimePassed
         )
     }
 
@@ -297,10 +285,7 @@ final class ResetReminderTests: XCTestCase {
         XCTAssertEqual(coordinator.state.leadTime, .hours6)
         XCTAssertEqual(
             coordinator.state.delivery,
-            .reminderTimePassed(
-                Date(timeIntervalSince1970: 1_800_000_000)
-                    .addingTimeInterval(24 * 60 * 60)
-            )
+            .reminderTimePassed
         )
     }
 
@@ -331,9 +316,7 @@ final class ResetReminderTests: XCTestCase {
             [
                 .scheduled(
                     ResetReminderRequest(
-                        resetID: "reset-1",
                         firesAt: fixture.now.addingTimeInterval(24 * 60 * 60),
-                        expiresAt: target.expiresAt,
                         title: "Banked reset expires soon",
                         body: "A banked reset expires in 24 hours."
                     )
@@ -408,9 +391,7 @@ final class ResetReminderTests: XCTestCase {
             [
                 .scheduled(
                     ResetReminderRequest(
-                        resetID: "reset-1",
                         firesAt: fixture.now.addingTimeInterval(1),
-                        expiresAt: target.expiresAt,
                         title: "Banked reset expires soon",
                         body: "A banked reset expires in 1 hour."
                     )

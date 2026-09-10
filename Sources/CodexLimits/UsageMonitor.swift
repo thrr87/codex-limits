@@ -2,6 +2,67 @@ import AppKit
 import Combine
 import Foundation
 
+enum IntegrationWorkPriority: Int, Sendable {
+    case explicit
+    case visible
+    case automatic
+    case settings
+}
+
+actor IntegrationWorkCoordinator {
+    private struct Waiter {
+        let priority: IntegrationWorkPriority
+        let order: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var isAvailable = true
+    private var nextOrder: UInt64 = 0
+    private var waiters: [Waiter] = []
+
+    func run(
+        priority: IntegrationWorkPriority,
+        operation: @Sendable () async -> Void
+    ) async {
+        await enter(priority: priority)
+        if !Task.isCancelled {
+            await operation()
+        }
+        leave()
+    }
+
+    private func enter(priority: IntegrationWorkPriority) async {
+        if isAvailable {
+            isAvailable = false
+            return
+        }
+        let order = nextOrder
+        nextOrder &+= 1
+        // ponytail: cancelled waiters drain without source work; add waiter IDs
+        // only if bounded-operation metrics show meaningful queue churn.
+        await withCheckedContinuation { continuation in
+            waiters.append(Waiter(
+                priority: priority,
+                order: order,
+                continuation: continuation
+            ))
+        }
+    }
+
+    private func leave() {
+        guard let index = waiters.indices.min(by: {
+            let lhs = waiters[$0]
+            let rhs = waiters[$1]
+            return (lhs.priority.rawValue, lhs.order)
+                < (rhs.priority.rawValue, rhs.order)
+        }) else {
+            isAvailable = true
+            return
+        }
+        waiters.remove(at: index).continuation.resume()
+    }
+}
+
 enum SafetyBufferPolicy {
     static let defaultValue = 3.0
     static let range = 1.0 ... 10.0
@@ -14,6 +75,11 @@ enum SafetyBufferPolicy {
 
 @MainActor
 final class UsageMonitor: ObservableObject {
+    private struct AccountRefreshRequest: Equatable {
+        let generation: UInt64
+        let priority: IntegrationWorkPriority
+    }
+
     private static let accountRefreshInterval: TimeInterval = 600
     static let safetyBufferKey = "safetyBuffer"
 
@@ -29,6 +95,12 @@ final class UsageMonitor: ObservableObject {
     )
     @Published private(set) var samples: [UsageSample] = []
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isEnabled: Bool
+    @Published private(set) var historicalReaderSnapshot: UsageReaderSnapshot?
+    @Published private(set) var historicalRange: DateInterval?
+    @Published private(set) var historicalRetainedBounds: DateInterval?
+    @Published private(set) var historicalRangeIssue: String?
+    @Published private(set) var isLoadingHistoricalRange = false
     @Published private(set) var syncFolderName: String?
     @Published private(set) var syncErrorMessage: String?
     @Published private(set) var historyDeletionStatus: UsageHistory.DeletionStatus = .none
@@ -53,15 +125,22 @@ final class UsageMonitor: ObservableObject {
     private let history: UsageHistory
     private let codexAssistedHistory: CodexAssistedHistory?
     private let fetchUsage: () async throws -> CodexFetchResult
+    private let cancelFetchUsage: @Sendable () async -> Void
     private let evaluateUsage:
         @Sendable (UsageIntelligenceInput) -> UsageReaderSnapshot
     private let localActivityCollector: LocalActivityCollector?
     private let resetReminderCoordinator: ResetReminderCoordinator
+    private let integrationWorkCoordinator: IntegrationWorkCoordinator
     private var historyPartition: AccountHistoryPartition
     private var accountSnapshot: UsageSnapshot?
     private var sourceState: UsageSourceState = .available
     private var previousStatus: PaceStatus?
     private var cancellables: Set<AnyCancellable> = []
+    private var accountRefreshCancellable: AnyCancellable?
+    private var accountFetchTask: Task<CodexFetchResult, Error>?
+    private var accountCollectionGeneration: UInt64 = 0
+    private var accountRefreshRequest: AccountRefreshRequest?
+    private var menuBarSourceActive: Bool
     private var started = false
     private var historyPrepared = false
     private var historyUsesFiles = false
@@ -79,14 +158,25 @@ final class UsageMonitor: ObservableObject {
     )
     private var evaluationGeneration: UInt64 = 0
     private var evaluationTask: Task<UsageReaderSnapshot?, Never>?
+    private var readerBoundaryTask: Task<Void, Never>?
+    private var historicalRangeGeneration: UInt64 = 0
+    private var historicalRangeTask: Task<Void, Never>?
     private var localImportGeneration: UInt64 = 0
     private var localImportTask: Task<Void, Never>?
     private var localAnalyticsVisible = false
     private var localAnalyticsNeedsLoad = false
+    private var visible = false
 
-    convenience init() {
+    convenience init(
+        isEnabled: Bool = true,
+        menuBarSourceActive: Bool = true,
+        integrationWorkCoordinator: IntegrationWorkCoordinator =
+            IntegrationWorkCoordinator()
+    ) {
         self.init(
             defaults: .standard,
+            isEnabled: isEnabled,
+            menuBarSourceActive: menuBarSourceActive,
             localActivityCollector: LocalActivityCollector(
                 projectionSource: ReadOnlyThreadProjectionSource { request in
                     try await CodexClient.shared.threadProjectionResponse(
@@ -97,7 +187,8 @@ final class UsageMonitor: ObservableObject {
                     try? await CodexClient.shared.installedCLIVersion()
                 }
             ),
-            codexAssistedHistory: CodexAssistedHistory.shared
+            codexAssistedHistory: CodexAssistedHistory.shared,
+            integrationWorkCoordinator: integrationWorkCoordinator
         )
     }
 
@@ -105,11 +196,17 @@ final class UsageMonitor: ObservableObject {
         defaults: UserDefaults,
         historyDirectory: URL? = nil,
         startsAutomatically: Bool = true,
+        isEnabled: Bool = true,
+        menuBarSourceActive: Bool = true,
         localActivityCollector: LocalActivityCollector? = nil,
         resetReminderScheduler: (any ResetReminderScheduling)? = nil,
         resetReminderNow: @escaping () -> Date = Date.init,
         codexAssistedHistory: CodexAssistedHistory? = nil,
+        integrationWorkCoordinator: IntegrationWorkCoordinator =
+            IntegrationWorkCoordinator(),
         fetchUsage: @escaping () async throws -> CodexFetchResult = CodexClient.fetch,
+        cancelFetchUsage: @escaping @Sendable () async -> Void =
+            { await CodexClient.cancelFetch() },
         evaluateUsage: @escaping @Sendable (
             UsageIntelligenceInput
         ) -> UsageReaderSnapshot = {
@@ -117,10 +214,14 @@ final class UsageMonitor: ObservableObject {
         }
     ) {
         self.defaults = defaults
+        self.isEnabled = isEnabled
+        self.menuBarSourceActive = menuBarSourceActive
         self.fetchUsage = fetchUsage
+        self.cancelFetchUsage = cancelFetchUsage
         self.evaluateUsage = evaluateUsage
         self.localActivityCollector = localActivityCollector
         self.codexAssistedHistory = codexAssistedHistory
+        self.integrationWorkCoordinator = integrationWorkCoordinator
         let storedSafetyBuffer = defaults.object(
             forKey: Self.safetyBufferKey
         ) as? Double
@@ -192,8 +293,11 @@ final class UsageMonitor: ObservableObject {
         guard !started else { return }
         started = true
         await resetReminderCoordinator.restore()
+        if !isEnabled {
+            await resetReminderCoordinator.reconcile(target: nil)
+        }
         publishResetReminderState()
-        if let cutoff = defaults.object(
+        if isEnabled, let cutoff = defaults.object(
             forKey: Self.localHistoryDeletionCutoffKey
         ) as? Date {
             await localActivityCollector?.restorePendingHistoryDeletion(
@@ -201,43 +305,43 @@ final class UsageMonitor: ObservableObject {
             )
         }
 
-        Timer.publish(
-            every: Self.accountRefreshInterval,
-            on: .main,
-            in: .common
-        )
-            .autoconnect()
-            .sink { [weak self] _ in
-                Task {
-                    @MainActor in await self?.automaticRefresh()
-                }
-            }
-            .store(in: &cancellables)
+        startAccountRefreshTimerIfNeeded()
 
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in
                 Task {
-                    @MainActor in await self?.automaticRefresh()
+                    @MainActor in
+                    await self?.refreshSelectedMenuBarSourceIfStale()
                 }
             }
             .store(in: &cancellables)
 
-        await automaticRefresh()
+        await refreshSelectedMenuBarSourceIfStale()
     }
 
     func automaticRefresh() async {
+        guard isEnabled, menuBarSourceActive else { return }
         await refresh(
             forceHistorySync: false,
-            includeLocalActivity: false
+            includeLocalActivity: false,
+            priority: .automatic
         )
     }
 
-    func refreshAccountIfStale(now: Date = Date()) async {
+    func refreshAccountIfStale(
+        now: Date = Date(),
+        priority: IntegrationWorkPriority = .visible
+    ) async {
+        guard isEnabled else { return }
         guard let fetchedAt = accountSnapshot?.fetchedAt,
               now.timeIntervalSince(fetchedAt)
                 < Self.accountRefreshInterval else {
-            await automaticRefresh()
+            await refresh(
+                forceHistorySync: false,
+                includeLocalActivity: false,
+                priority: priority
+            )
             return
         }
     }
@@ -246,23 +350,76 @@ final class UsageMonitor: ObservableObject {
         forceHistorySync: Bool = true,
         includeLocalActivity: Bool = true
     ) async {
-        guard !isRefreshing else { return }
+        await refresh(
+            forceHistorySync: forceHistorySync,
+            includeLocalActivity: includeLocalActivity,
+            priority: .explicit
+        )
+    }
+
+    private func refresh(
+        forceHistorySync: Bool,
+        includeLocalActivity: Bool,
+        priority: IntegrationWorkPriority
+    ) async {
+        guard isEnabled else { return }
+        if let current = accountRefreshRequest {
+            guard priority.rawValue < current.priority.rawValue else { return }
+            accountFetchTask?.cancel()
+            await cancelFetchUsage()
+        }
+        accountCollectionGeneration &+= 1
+        let request = AccountRefreshRequest(
+            generation: accountCollectionGeneration,
+            priority: priority
+        )
+        accountRefreshRequest = request
         isRefreshing = true
-        defer { isRefreshing = false }
+        await integrationWorkCoordinator.run(priority: priority) {
+            @MainActor [weak self] in
+            guard let self, self.isEnabled,
+                  self.accountRefreshRequest == request else {
+                return
+            }
+            await self.performRefresh(
+                forceHistorySync: forceHistorySync,
+                includeLocalActivity: includeLocalActivity,
+                generation: request.generation
+            )
+        }
+        if accountRefreshRequest == request {
+            accountRefreshRequest = nil
+            isRefreshing = false
+        }
+    }
+
+    private func performRefresh(
+        forceHistorySync: Bool,
+        includeLocalActivity: Bool,
+        generation: UInt64
+    ) async {
+        defer {
+            if generation == accountCollectionGeneration {
+                accountFetchTask = nil
+            }
+        }
         if includeLocalActivity {
             cancelLocalImport()
         }
 
         await restoreHistoryIfAvailable()
         let fetchTask = Task { try await fetchUsage() }
+        accountFetchTask = fetchTask
 
         do {
             let result = try await fetchTask.value
+            guard canPublishAccountWork(generation) else { return }
             guard let account = result.account else {
                 historyMatchesCurrentSnapshot = false
                 await exchangeRestoredHistoryIfAvailable(
                     force: forceHistorySync
                 )
+                guard canPublishAccountWork(generation) else { return }
                 accountSnapshot = result.snapshot
                 sourceState = .available
                 if localAnalyticsVisible,
@@ -272,6 +429,7 @@ final class UsageMonitor: ObservableObject {
                         observedAt: result.snapshot.fetchedAt,
                         identityVerified: false
                     )
+                    guard canPublishAccountWork(generation) else { return }
                 }
                 let published = await recalculate(
                     now: result.snapshot.fetchedAt
@@ -290,13 +448,17 @@ final class UsageMonitor: ObservableObject {
                 planType: result.planType,
                 observedAt: result.snapshot.fetchedAt
             )
+            guard canPublishAccountWork(generation) else { return }
             await prepareHistory(legacySamples: legacySamples)
+            guard canPublishAccountWork(generation) else { return }
             if !historyUsesFiles {
                 let historyState = await history.load(legacySamples: samples)
+                guard canPublishAccountWork(generation) else { return }
                 apply(historyState)
                 historyUsesFiles = historyState.errorMessage == nil
             }
             let historyState = await exchangeHistory(force: forceHistorySync)
+            guard canPublishAccountWork(generation) else { return }
             apply(historyState, configuredFolderName: configuredSyncDirectory?.lastPathComponent)
             repairInitialAccountEpochIfNeeded()
             let exchangeErrorMessage = historyState.errorMessage
@@ -311,6 +473,7 @@ final class UsageMonitor: ObservableObject {
                         accountEpochStartedAt == newSnapshot.fetchedAt
                 )
                 let recordedState = await history.record(sample)
+                guard canPublishAccountWork(generation) else { return }
                 apply(
                     recordedState,
                     configuredFolderName: configuredSyncDirectory?.lastPathComponent
@@ -329,6 +492,7 @@ final class UsageMonitor: ObservableObject {
                     for: newSnapshot,
                     observedAt: newSnapshot.fetchedAt
                 )
+                guard canPublishAccountWork(generation) else { return }
             }
             let published = await recalculate(now: newSnapshot.fetchedAt)
             persist()
@@ -336,9 +500,11 @@ final class UsageMonitor: ObservableObject {
                 await reconcileResetReminder()
             }
         } catch {
+            guard canPublishAccountWork(generation) else { return }
             await exchangeRestoredHistoryIfAvailable(
                 force: forceHistorySync
             )
+            guard canPublishAccountWork(generation) else { return }
             sourceState = .failed(
                 (error as? CodexClientError)?.localizedDescription
                     ?? "Couldn’t read Codex usage. Try refreshing again."
@@ -351,6 +517,7 @@ final class UsageMonitor: ObservableObject {
                     observedAt: Date(),
                     identityVerified: false
                 )
+                guard canPublishAccountWork(generation) else { return }
             }
             _ = await recalculate()
             persist()
@@ -359,6 +526,7 @@ final class UsageMonitor: ObservableObject {
 
     func setLocalAnalyticsVisible(_ isVisible: Bool) async {
         if isVisible {
+            guard isEnabled else { return }
             if !localAnalyticsVisible {
                 localAnalyticsVisible = true
                 localAnalyticsNeedsLoad = true
@@ -384,17 +552,273 @@ final class UsageMonitor: ObservableObject {
         }
         guard localAnalyticsVisible,
               localAnalyticsNeedsLoad,
-              let accountSnapshot else {
+              accountSnapshot != nil else {
             return
         }
-        let identityVerified = sourceState == .available
-            && historyAccountIdentity != nil
-        await refreshLocalActivity(
-            for: accountSnapshot,
-            observedAt: identityVerified ? accountSnapshot.fetchedAt : Date(),
-            identityVerified: identityVerified
+        await integrationWorkCoordinator.run(priority: .visible) {
+            @MainActor [weak self] in
+            guard let self,
+                  self.isEnabled,
+                  self.localAnalyticsVisible,
+                  self.localAnalyticsNeedsLoad,
+                  let accountSnapshot = self.accountSnapshot else {
+                return
+            }
+            let identityVerified = self.sourceState == .available
+                && self.historyAccountIdentity != nil
+            await self.refreshLocalActivity(
+                for: accountSnapshot,
+                observedAt: identityVerified
+                    ? accountSnapshot.fetchedAt
+                    : Date(),
+                identityVerified: identityVerified
+            )
+            _ = await self.recalculate()
+        }
+    }
+
+    func setVisible(_ visible: Bool) async {
+        guard visible != self.visible else { return }
+        self.visible = visible
+        scheduleReaderBoundary()
+        if !visible, !menuBarSourceActive {
+            await cancelAccountCollection()
+        }
+        if !visible {
+            clearHistoricalRange()
+        }
+    }
+
+    func setEnabled(_ enabled: Bool) async {
+        guard enabled != isEnabled else { return }
+        isEnabled = enabled
+        accountCollectionGeneration &+= 1
+        accountFetchTask?.cancel()
+        accountFetchTask = nil
+        accountRefreshRequest = nil
+        isRefreshing = false
+
+        if enabled {
+            startAccountRefreshTimerIfNeeded()
+            scheduleReaderBoundary()
+            while isRefreshing {
+                guard !Task.isCancelled else { return }
+                await Task.yield()
+            }
+            await refreshSelectedMenuBarSourceIfStale()
+            return
+        }
+
+        accountRefreshCancellable?.cancel()
+        accountRefreshCancellable = nil
+        await cancelFetchUsage()
+        readerBoundaryTask?.cancel()
+        readerBoundaryTask = nil
+        clearHistoricalRange()
+        cancelLocalImport()
+        evaluationGeneration &+= 1
+        evaluationTask?.cancel()
+        evaluationTask = nil
+        localAnalyticsVisible = false
+        localAnalyticsNeedsLoad = false
+        localActivityCollection = .unavailable(
+            "Codex local records are unavailable"
         )
-        _ = await recalculate()
+        await localActivityCollector?.releaseCachedFacts()
+        _ = await history.disconnect()
+        await resetReminderCoordinator.reconcile(target: nil)
+        publishResetReminderState()
+    }
+
+    func setMenuBarSourceActive(_ active: Bool) async {
+        guard active != menuBarSourceActive else { return }
+        menuBarSourceActive = active
+        if !active {
+            accountRefreshCancellable?.cancel()
+            accountRefreshCancellable = nil
+            scheduleReaderBoundary()
+            if !visible {
+                await cancelAccountCollection()
+            }
+            return
+        }
+        guard isEnabled else { return }
+        scheduleReaderBoundary()
+        startAccountRefreshTimerIfNeeded()
+        await refreshAccountIfStale(priority: .automatic)
+    }
+
+    private func refreshSelectedMenuBarSourceIfStale() async {
+        guard menuBarSourceActive else { return }
+        await refreshAccountIfStale(priority: .automatic)
+    }
+
+    private func startAccountRefreshTimerIfNeeded() {
+        guard started, isEnabled, menuBarSourceActive,
+              accountRefreshCancellable == nil else {
+            return
+        }
+        accountRefreshCancellable = Timer.publish(
+            every: Self.accountRefreshInterval,
+            on: .main,
+            in: .common
+        )
+            .autoconnect()
+            .sink { [weak self] _ in
+                Task {
+                    @MainActor in await self?.automaticRefresh()
+                }
+            }
+    }
+
+    private func canPublishAccountWork(_ generation: UInt64) -> Bool {
+        isEnabled
+            && generation == accountCollectionGeneration
+            && !Task.isCancelled
+    }
+
+    private func cancelAccountCollection() async {
+        accountCollectionGeneration &+= 1
+        accountFetchTask?.cancel()
+        accountFetchTask = nil
+        accountRefreshRequest = nil
+        isRefreshing = false
+        await cancelFetchUsage()
+    }
+
+    var canLoadEarlierHistory: Bool {
+        guard !samples.isEmpty else { return false }
+        guard let historicalRange,
+              let retained = historicalRetainedBounds else {
+            return true
+        }
+        return retained.start < historicalRange.start
+    }
+
+    func loadEarlierHistory(
+        exploration: AnalyticsExplorationState,
+        dispositions: [String: InsightDisposition]
+    ) async {
+        guard let end = historicalRange?.start
+            ?? samples.first?.observedAt else { return }
+        await loadHistoricalRange(
+            DateInterval(
+                start: end.addingTimeInterval(-84 * 86_400),
+                end: end
+            ),
+            exploration: exploration,
+            dispositions: dispositions
+        )
+    }
+
+    func loadLaterHistory(
+        exploration: AnalyticsExplorationState,
+        dispositions: [String: InsightDisposition]
+    ) async {
+        guard let historicalRange else { return }
+        guard let latestStart = samples.first?.observedAt,
+              historicalRange.end < latestStart else {
+            clearHistoricalRange()
+            return
+        }
+        let end = min(
+            historicalRange.end.addingTimeInterval(84 * 86_400),
+            latestStart
+        )
+        await loadHistoricalRange(
+            DateInterval(
+                start: end.addingTimeInterval(-84 * 86_400),
+                end: end
+            ),
+            exploration: exploration,
+            dispositions: dispositions
+        )
+    }
+
+    func clearHistoricalRange() {
+        historicalRangeGeneration &+= 1
+        historicalRangeTask?.cancel()
+        historicalRangeTask = nil
+        historicalReaderSnapshot = nil
+        historicalRange = nil
+        historicalRetainedBounds = nil
+        historicalRangeIssue = nil
+        isLoadingHistoricalRange = false
+    }
+
+    private func loadHistoricalRange(
+        _ interval: DateInterval,
+        exploration: AnalyticsExplorationState,
+        dispositions: [String: InsightDisposition]
+    ) async {
+        guard isEnabled, visible else { return }
+        historicalRangeGeneration &+= 1
+        let generation = historicalRangeGeneration
+        historicalRangeTask?.cancel()
+        isLoadingHistoricalRange = true
+        historicalRangeIssue = nil
+        var rangeExploration = exploration
+        rangeExploration.timeRange = .selected
+        rangeExploration.visibleRange = interval
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performHistoricalRangeLoad(
+                interval,
+                exploration: rangeExploration,
+                dispositions: dispositions,
+                generation: generation
+            )
+        }
+        historicalRangeTask = task
+        await task.value
+        if historicalRangeGeneration == generation {
+            historicalRangeTask = nil
+            isLoadingHistoricalRange = false
+        }
+    }
+
+    private func performHistoricalRangeLoad(
+        _ interval: DateInterval,
+        exploration: AnalyticsExplorationState,
+        dispositions: [String: InsightDisposition],
+        generation: UInt64
+    ) async {
+        await integrationWorkCoordinator.run(priority: .visible) {
+            @MainActor [weak self] in
+            guard let self, self.isEnabled, self.visible,
+                  self.historicalRangeGeneration == generation,
+                  !Task.isCancelled,
+                  let view = await self.history.rangeView(for: interval) else {
+                return
+            }
+            let input = self.evaluationInput(
+                analyticsExploration: exploration,
+                insightDispositions: dispositions,
+                historySamples: view.samples
+            )
+            let evaluateUsage = self.evaluateUsage
+            let evaluation = Task.detached(priority: .userInitiated) {
+                Task.isCancelled ? nil : evaluateUsage(input)
+            }
+            let snapshot = await withTaskCancellationHandler {
+                await evaluation.value
+            } onCancel: {
+                evaluation.cancel()
+            }
+            guard let snapshot, self.isEnabled, self.visible,
+                  self.historicalRangeGeneration == generation,
+                  !Task.isCancelled else { return }
+            self.historicalReaderSnapshot = snapshot
+            self.historicalRange = interval
+            self.historicalRetainedBounds = view.retainedBounds
+            self.historicalRangeIssue = if view.hadReadError {
+                "Some history couldn’t be read."
+            } else if view.samples.isEmpty {
+                "No usage observations in this range."
+            } else {
+                nil
+            }
+        }
     }
 
     func updateSafetyBuffer(_ value: Double) {
@@ -854,7 +1278,8 @@ final class UsageMonitor: ObservableObject {
         safetyBuffer: Double? = nil,
         now: Date = Date(),
         analyticsExploration: AnalyticsExplorationState? = nil,
-        insightDispositions: [String: InsightDisposition]? = nil
+        insightDispositions: [String: InsightDisposition]? = nil,
+        historySamples: [UsageSample]? = nil
     ) -> UsageIntelligenceInput {
         let storedBuffer = defaults.object(forKey: Self.safetyBufferKey) as? Double
         let buffer = SafetyBufferPolicy.normalized(
@@ -862,7 +1287,9 @@ final class UsageMonitor: ObservableObject {
         )
         return UsageIntelligenceInput(
             account: accountSnapshot,
-            samples: historyMatchesCurrentSnapshot ? samples : [],
+            samples: historyMatchesCurrentSnapshot
+                ? (historySamples ?? samples)
+                : [],
             safetyBuffer: buffer,
             sourceState: sourceState,
             now: now,
@@ -908,10 +1335,42 @@ final class UsageMonitor: ObservableObject {
             return false
         }
         readerSnapshot = snapshot
+        scheduleReaderBoundary()
         if let status = snapshot.guidance?.status {
             previousStatus = status
         }
         return true
+    }
+
+    private func scheduleReaderBoundary() {
+        readerBoundaryTask?.cancel()
+        guard isEnabled, menuBarSourceActive || visible,
+              let account = readerSnapshot.account,
+              let reset = account.mainLimit?.window.resetsAt else {
+            readerBoundaryTask = nil
+            return
+        }
+        let now = Date()
+        let candidates = [
+            account.fetchedAt.addingTimeInterval(15 * 60),
+            reset
+        ].filter { $0 > now }.sorted()
+        guard let boundary = candidates.first else {
+            readerBoundaryTask = nil
+            return
+        }
+        readerBoundaryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(
+                    for: .seconds(boundary.timeIntervalSinceNow)
+                )
+            } catch {
+                return
+            }
+            guard let self else { return }
+            readerBoundaryTask = nil
+            _ = await recalculate()
+        }
     }
 
     func analyticsPreferencesDidChange(
@@ -1126,7 +1585,8 @@ final class UsageMonitor: ObservableObject {
             accountBindingToken: defaults.string(
                 forKey: Self.historySyncAccountBindingKey
             ),
-            bindsUnresolvedDeletionTarget: true
+            bindsUnresolvedDeletionTarget: true,
+            performFullReconciliation: false
         )
         historyConnectionActive = connectedState.folderName != nil
         apply(connectedState, configuredFolderName: directory.lastPathComponent)
@@ -1198,7 +1658,8 @@ final class UsageMonitor: ObservableObject {
                 accountIdentity: historyAccountIdentity,
                 accountBindingToken: defaults.string(
                     forKey: Self.historySyncAccountBindingKey
-                )
+                ),
+                performFullReconciliation: false
             )
             historyConnectionActive = state.folderName != nil
             return state

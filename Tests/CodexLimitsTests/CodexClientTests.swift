@@ -2,6 +2,30 @@ import XCTest
 @testable import CodexLimits
 
 final class CodexClientTests: XCTestCase {
+    func testSelectedExecutableMustBeARegularExecutableFile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer {
+            _ = CodexClient.selectExecutable(nil)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let executable = directory.appendingPathComponent("codex")
+        let plainFile = directory.appendingPathComponent("plain")
+        try Data("#!/bin/sh\n".utf8).write(to: executable)
+        try Data().write(to: plainFile)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+
+        XCTAssertFalse(CodexClient.selectExecutable(plainFile))
+        XCTAssertTrue(CodexClient.selectExecutable(executable))
+    }
+
     func testIsolatedHomeLinksCredentialsAndRemovesTheLink() throws {
         let root = temporaryDirectory()
         let source = root.appendingPathComponent("source", isDirectory: true)
@@ -110,6 +134,22 @@ final class CodexClientTests: XCTestCase {
         XCTAssertEqual(second.snapshot.mainLimit?.window.remainingPercent, 70)
         XCTAssertEqual(server.connectionCount, 1)
         XCTAssertEqual(server.initializationCount, 1)
+    }
+
+    func testIdleConnectionClosesAndTheNextReadReconnects() async throws {
+        let server = PersistentAppServerFixture()
+        let client = CodexClient(
+            makeConnection: server.makeConnection,
+            timeout: 1,
+            connectionIdleTimeout: 0.01
+        )
+
+        _ = try await client.installedCLIVersion()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        _ = try await client.installedCLIVersion()
+
+        XCTAssertEqual(server.connectionCount, 2)
+        XCTAssertEqual(server.initializationCount, 2)
     }
 
     func testClosedServerOutputReportsConnectionLost() async {

@@ -25,24 +25,32 @@ if [[ ${CODEX_LIMITS_UNIVERSAL:-0} == 1 ]]; then
     arm_release="$project_dir/.build/universal-arm64/arm64-apple-macosx/release"
     intel_release="$project_dir/.build/universal-x86_64/x86_64-apple-macosx/release"
     executable="$project_dir/.build/release/CodexLimits"
+    claude_relay="$project_dir/.build/release/CodexLimitsClaudeRelay"
     mkdir -p "${executable:h}"
     lipo -create \
         "$arm_release/CodexLimits" \
         "$intel_release/CodexLimits" \
         -output "$executable"
+    lipo -create \
+        "$arm_release/CodexLimitsClaudeRelay" \
+        "$intel_release/CodexLimitsClaudeRelay" \
+        -output "$claude_relay"
     framework="$arm_release/Sparkle.framework"
 else
     xcrun swift build "${build_args[@]}"
     executable="$project_dir/.build/release/CodexLimits"
+    claude_relay="$project_dir/.build/release/CodexLimitsClaudeRelay"
     framework="$project_dir/.build/release/Sparkle.framework"
 fi
 
 rm -rf "$app_dir"
 mkdir -p \
     "$app_dir/Contents/MacOS" \
+    "$app_dir/Contents/Helpers" \
     "$app_dir/Contents/Resources" \
     "$app_dir/Contents/Frameworks"
 cp "$executable" "$app_dir/Contents/MacOS/CodexLimits"
+cp "$claude_relay" "$app_dir/Contents/Helpers/CodexLimitsClaudeRelay"
 install_name_tool -add_rpath \
     @loader_path/../Frameworks \
     "$app_dir/Contents/MacOS/CodexLimits"

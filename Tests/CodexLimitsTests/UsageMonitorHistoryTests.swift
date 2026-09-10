@@ -4,6 +4,171 @@ import XCTest
 
 @MainActor
 final class UsageMonitorHistoryTests: XCTestCase {
+    func testUnselectedMenuSourceWaitsForDemandAndStopsAutomaticRefresh() async throws {
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 64
+            ),
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_600),
+                remaining: 63
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            isEnabled: false,
+            menuBarSourceActive: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.start()
+        var callCount = await source.callCount
+        XCTAssertEqual(callCount, 0)
+
+        await monitor.setEnabled(true)
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 0)
+
+        await monitor.refreshAccountIfStale()
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 1)
+
+        await monitor.setMenuBarSourceActive(true)
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 2)
+
+        await monitor.setMenuBarSourceActive(false)
+        await monitor.automaticRefresh()
+        callCount = await source.callCount
+        XCTAssertEqual(callCount, 2)
+    }
+
+    func testDisabledMonitorDoesNoSourceWorkUntilEnabled() async throws {
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 64
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            isEnabled: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.start()
+        await monitor.refresh()
+        let disabledCallCount = await source.callCount
+        XCTAssertEqual(disabledCallCount, 0)
+
+        await monitor.setEnabled(true)
+        let enabledCallCount = await source.callCount
+        XCTAssertEqual(enabledCallCount, 1)
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "64%")
+    }
+
+    func testDisplayBoundaryExpiresCodexWithoutAnotherSourceRead() async throws {
+        let now = Date()
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: now,
+                remaining: 64,
+                resetsAt: now.addingTimeInterval(0.15)
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+
+        await monitor.start()
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "64%")
+        let deadline = Date().addingTimeInterval(2)
+        while monitor.readerSnapshot.menuBarText != "—", Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "—")
+        XCTAssertEqual(monitor.readerSnapshot.freshness, .unavailable)
+        let callCount = await source.callCount
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testDisablingMonitorCancelsAnInFlightFetchBeforePublication() async throws {
+        let source = DelayedFetchSource(
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 64
+            )
+        )
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+        let refresh = Task { await monitor.refresh() }
+        while await source.callCount == 0 {
+            await Task.yield()
+        }
+
+        await monitor.setEnabled(false)
+        await refresh.value
+
+        XCTAssertFalse(monitor.isEnabled)
+        XCTAssertNil(monitor.readerSnapshot.account)
+    }
+
+    func testHidingUnselectedCodexCancelsVisibleAccountWork() async {
+        let source = DelayedFetchSource(
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 64
+            )
+        )
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            menuBarSourceActive: false,
+            fetchUsage: { try await source.next() }
+        )
+        await monitor.setVisible(true)
+        let refresh = Task { await monitor.refreshAccountIfStale() }
+        while await source.callCount == 0 {
+            await Task.yield()
+        }
+
+        await monitor.setVisible(false)
+        await refresh.value
+
+        XCTAssertNil(monitor.readerSnapshot.account)
+        XCTAssertFalse(monitor.isRefreshing)
+    }
+
     func testSafetyBufferPolicyNormalizesInvalidValues() {
         XCTAssertEqual(SafetyBufferPolicy.normalized(nil), 3)
         XCTAssertEqual(SafetyBufferPolicy.normalized(.nan), 3)
@@ -77,7 +242,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let fetchedAt = Date(timeIntervalSince1970: 1_900_000)
+        let fetchedAt = Date()
         defaults.set(
             try JSONEncoder().encode(
                 StoredStateFixture(
@@ -591,6 +756,50 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
+    func testExplicitRefreshSupersedesQueuedAutomaticRefresh() async {
+        let coordinator = IntegrationWorkCoordinator()
+        let gate = UsageMonitorCoordinatorGate()
+        let blocker = Task {
+            await coordinator.run(priority: .explicit) {
+                await gate.hold()
+            }
+        }
+        while !(await gate.started) {
+            await Task.yield()
+        }
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
+                remaining: 80
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: UserDefaults(
+                suiteName: "UsageMonitorHistoryTests-\(UUID().uuidString)"
+            )!,
+            historyDirectory: temporaryDirectory(),
+            startsAutomatically: false,
+            integrationWorkCoordinator: coordinator,
+            fetchUsage: { try await source.next() }
+        )
+        let automatic = Task { await monitor.automaticRefresh() }
+        while !monitor.isRefreshing {
+            await Task.yield()
+        }
+        let explicit = Task { await monitor.refresh() }
+        try? await Task.sleep(for: .milliseconds(10))
+
+        await gate.release()
+        await blocker.value
+        await explicit.value
+        await automatic.value
+
+        let callCount = await source.callCount
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(monitor.readerSnapshot.menuBarText, "80%")
+    }
+
     func testTokenActivityRefreshesOnlyWhenAccountDataIsStale() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -638,11 +847,13 @@ final class UsageMonitorHistoryTests: XCTestCase {
             description: "first account evaluation started"
         )
         let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+        let fetchedAt = Date()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
-                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
-                remaining: 80
+                fetchedAt: fetchedAt,
+                remaining: 80,
+                resetsAt: fetchedAt.addingTimeInterval(7 * 86_400)
             )
         ])
         let monitor = UsageMonitor(
@@ -686,11 +897,13 @@ final class UsageMonitorHistoryTests: XCTestCase {
             description: "account evaluation started"
         )
         let evaluator = BlockingUsageEvaluator(started: evaluationStarted)
+        let fetchedAt = Date()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
-                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
-                remaining: 80
+                fetchedAt: fetchedAt,
+                remaining: 80,
+                resetsAt: fetchedAt.addingTimeInterval(7 * 86_400)
             )
         ])
         let monitor = UsageMonitor(
@@ -774,11 +987,13 @@ final class UsageMonitorHistoryTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let root = temporaryDirectory()
+        let fetchedAt = Date()
         let source = FetchSequence([
             makeFetchResult(
                 identity: "user@example.com",
-                fetchedAt: Date(timeIntervalSince1970: 1_900_000),
-                remaining: 80
+                fetchedAt: fetchedAt,
+                remaining: 80,
+                resetsAt: fetchedAt.addingTimeInterval(7 * 86_400)
             )
         ])
         let monitor = UsageMonitor(
@@ -969,7 +1184,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         requestCount = await requests.count
         XCTAssertEqual(requestCount, 0)
 
-        for graph in AnalyticsGraph.coreCases {
+        for graph in [AnalyticsGraph.usageRemaining, .tokenActivity] {
             var state = AnalyticsExplorationState.initial
             state.graph = graph
             await monitor.setLocalAnalyticsVisible(
@@ -1772,6 +1987,59 @@ final class UsageMonitorHistoryTests: XCTestCase {
         )
     }
 
+    func testEarlierHistoryLoadsOnlyAfterVisibleUserDemand() async throws {
+        let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let root = temporaryDirectory()
+        let currentAt = Date(timeIntervalSince1970: 9_000_000)
+        let oldAt = currentAt.addingTimeInterval(-30 * 86_400)
+        let source = FetchSequence([
+            makeFetchResult(
+                identity: "user@example.com",
+                fetchedAt: currentAt,
+                remaining: 80,
+                resetsAt: currentAt.addingTimeInterval(7 * 86_400)
+            )
+        ])
+        let monitor = UsageMonitor(
+            defaults: defaults,
+            historyDirectory: root,
+            startsAutomatically: false,
+            fetchUsage: { try await source.next() }
+        )
+        await monitor.refresh()
+        let partition = try JSONDecoder().decode(
+            AccountHistoryPartition.self,
+            from: XCTUnwrap(defaults.data(forKey: "historyAccountPartition"))
+        )
+        let olderWriter = UsageHistory(
+            localDirectory: root,
+            installationID: "older-fixture",
+            partition: partition
+        )
+        _ = await olderWriter.load()
+        _ = await olderWriter.record(UsageSample(
+            observedAt: oldAt,
+            remainingPercent: 90,
+            resetsAt: oldAt.addingTimeInterval(7 * 86_400)
+        ))
+
+        XCTAssertNil(monitor.historicalReaderSnapshot)
+        await monitor.setVisible(true)
+        await monitor.loadEarlierHistory(
+            exploration: .initial,
+            dispositions: [:]
+        )
+
+        XCTAssertEqual(
+            monitor.historicalReaderSnapshot?.chart.allObserved.first?.date,
+            oldAt
+        )
+        await monitor.setVisible(false)
+        XCTAssertNil(monitor.historicalReaderSnapshot)
+    }
+
     func testUnresolvableSavedSyncTargetKeepsDeletionPending() async throws {
         let suiteName = "UsageMonitorHistoryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -2018,6 +2286,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         identity: String,
         fetchedAt: Date,
         remaining: Double,
+        resetsAt: Date = Date(timeIntervalSince1970: 2_000_000),
         lifetimeTokens: Int64? = nil,
         lifetimeTokensObservedAt: Date? = nil,
         planType: String? = nil
@@ -2026,6 +2295,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
             account: .stable(identity: identity),
             fetchedAt: fetchedAt,
             remaining: remaining,
+            resetsAt: resetsAt,
             lifetimeTokens: lifetimeTokens,
             lifetimeTokensObservedAt: lifetimeTokensObservedAt,
             planType: planType
@@ -2036,6 +2306,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
         account: CodexAccountObservation,
         fetchedAt: Date,
         remaining: Double,
+        resetsAt: Date = Date(timeIntervalSince1970: 2_000_000),
         lifetimeTokens: Int64? = nil,
         lifetimeTokensObservedAt: Date? = nil,
         planType: String? = nil
@@ -2047,7 +2318,7 @@ final class UsageMonitorHistoryTests: XCTestCase {
                     name: "Codex",
                     window: UsageWindow(
                         remainingPercent: remaining,
-                        resetsAt: Date(timeIntervalSince1970: 2_000_000),
+                        resetsAt: resetsAt,
                         durationMinutes: 10_080
                     )
                 ),
@@ -2145,6 +2416,21 @@ private actor DelayedFetchSource {
         calls += 1
         try await Task.sleep(nanoseconds: 50_000_000)
         return result
+    }
+}
+
+private actor UsageMonitorCoordinatorGate {
+    private(set) var started = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

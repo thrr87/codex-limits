@@ -45,7 +45,6 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
     let sourceVersion: String?
     let observedAt: Date?
     let points: [LocalTokenActivityPoint]
-    let accountComparison: LocalCoverageEvaluation
 
     static func unavailable(
         _ reason: String,
@@ -58,8 +57,7 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
             reason: reason,
             sourceVersion: nil,
             observedAt: nil,
-            points: [],
-            accountComparison: .unavailable
+            points: []
         )
     }
 
@@ -94,8 +92,7 @@ struct LocalTokenActivitySnapshot: Equatable, Sendable {
             reason: updatedReason,
             sourceVersion: source.version,
             observedAt: source.observedAt,
-            points: points,
-            accountComparison: accountComparison
+            points: points
         )
     }
 
@@ -194,8 +191,7 @@ enum LocalTokenActivityAggregator {
                     reason: "Local token total is invalid",
                     sourceVersion: sourceVersion(observation),
                     observedAt: observedAt(observation),
-                    points: [],
-                    accountComparison: .unavailable
+                    points: []
                 )
             }
             total = addition.partialValue
@@ -238,8 +234,7 @@ enum LocalTokenActivityAggregator {
             reason: reason,
             sourceVersion: sourceVersion(observation),
             observedAt: observedAt(observation),
-            points: points,
-            accountComparison: .unavailable
+            points: points
         )
     }
 

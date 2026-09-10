@@ -3241,6 +3241,8 @@ final class UsageIntelligenceEngineTests: XCTestCase {
 
         XCTAssertNil(reader.weeklyUsageRemaining)
         XCTAssertNil(reader.interval)
+        XCTAssertEqual(reader.menuBarText, "—")
+        XCTAssertEqual(reader.freshness, .unavailable)
         XCTAssertEqual(reader.evidence.reason, "Current allowance window unavailable")
         XCTAssertEqual(reader.guidanceTitle, "Current allowance window unavailable")
         XCTAssertTrue(reader.chart.allObserved.contains {

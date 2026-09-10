@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 import XCTest
 @testable import CodexLimits
 
@@ -881,33 +880,6 @@ final class CodexSourceAnalysisTests: XCTestCase {
         XCTAssertNotNil(properties["recommendation"])
         XCTAssertNotNil(properties["evidence"])
         XCTAssertNil(properties["insightKind"])
-    }
-
-    func testPreflightRendersWithNativeCategoryControls() {
-        let draft = CodexSourceContentDraft(
-            selection: sourceSelection(),
-            values: [
-                .prompts: ["Build the report"],
-                .responses: ["Done"],
-                .code: ["+let answer = 42"],
-                .paths: ["/synthetic/atlas/App.swift"],
-                .commands: ["swift test"],
-                .toolOutput: ["All tests passed"]
-            ]
-        )
-        let renderer = ImageRenderer(
-            content: SourceAnalysisPreflightView(
-                draft: draft,
-                cancel: {},
-                analyze: { _ in }
-            )
-        )
-        renderer.proposedSize = ProposedViewSize(
-            width: 460,
-            height: 640
-        )
-
-        XCTAssertNotNil(renderer.nsImage)
     }
 
     func testSourceContentNeverEntersAnalyticsHistory() async throws {

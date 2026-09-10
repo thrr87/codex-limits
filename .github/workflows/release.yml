@@ -83,9 +83,14 @@ jobs:
         run: |
           set -euo pipefail
           app='.build/release/Codex Limits.app'
+          helper="$app/Contents/Helpers/CodexLimitsClaudeRelay"
           codesign --verify --deep --strict "$app"
+          test -x "$helper"
+          codesign --verify --strict "$helper"
           archs=$(lipo -archs "$app/Contents/MacOS/CodexLimits")
           test "$archs" = 'x86_64 arm64' -o "$archs" = 'arm64 x86_64'
+          helper_archs=$(lipo -archs "$helper")
+          test "$helper_archs" = 'x86_64 arm64' -o "$helper_archs" = 'arm64 x86_64'
           xmllint --noout "$ARTIFACTS/appcast.xml"
           grep -q 'sparkle:edSignature' "$ARTIFACTS/appcast.xml"
           grep -q 'sparkle:criticalUpdate' "$ARTIFACTS/appcast.xml"

@@ -1,20 +1,44 @@
 import AppKit
 import Charts
+import ClaudeIntegrationCore
 import SwiftUI
+
+private enum IntegrationDestination: String, Identifiable {
+    case all = "All"
+    case codex = "Codex"
+    case claudeCode = "Claude Code"
+    case grok = "Grok"
+
+    var id: String { rawValue }
+}
 
 struct MenuContentView: View {
     @ObservedObject var monitor: UsageMonitor
+    @ObservedObject var integrations: IntegrationPreferences
+    @ObservedObject var claudeCode: ClaudeCodeIntegrationStore
+    @ObservedObject var grok: GrokIntegrationStore
     @StateObject private var workspace: AnalyticsWorkspaceStore
     @StateObject private var assistedInsights: CodexAssistedInsightStore
     @StateObject private var updater = AppUpdater()
+    @State private var destination: IntegrationDestination = .all
+    @AppStorage private var safetyBuffer: Double
     @Environment(\.openSettings) private var openSettings
+    private let chartDefaults: UserDefaults
 
     init(
         monitor: UsageMonitor,
+        integrations: IntegrationPreferences,
+        claudeCode: ClaudeCodeIntegrationStore,
+        grok: GrokIntegrationStore,
         defaults: UserDefaults = .standard,
         assistedInsights: CodexAssistedInsightStore? = nil
     ) {
         self.monitor = monitor
+        self.integrations = integrations
+        self.claudeCode = claudeCode
+        self.grok = grok
+        self.chartDefaults = defaults
+        _safetyBuffer = AppStorage(wrappedValue: 3, UsageMonitor.safetyBufferKey, store: defaults)
         _workspace = StateObject(
             wrappedValue: AnalyticsWorkspaceStore(defaults: defaults)
         )
@@ -24,39 +48,19 @@ struct MenuContentView: View {
     }
 
     var body: some View {
+        if availableDestinations.count == 1 {
+            noIntegrationsWorkspace
+        } else {
+            enabledWorkspace
+        }
+    }
+
+    private var enabledWorkspace: some View {
         let layout = currentLayout
-        VStack(spacing: 0) {
-            WorkspaceHeader(
-                reader: monitor.readerSnapshot,
-                isRefreshing: monitor.isRefreshing,
-                isCompact: layout.isCompact,
-                resetReminderState: monitor.resetReminderState,
-                refresh: {
-                    Task { await monitor.refresh() }
-                },
-                setResetReminderEnabled: { isEnabled in
-                    Task {
-                        await monitor.setResetReminderEnabled(isEnabled)
-                    }
-                },
-                availableUpdateVersion: updater.availableVersion,
-                showAvailableUpdate: updater.showAvailableUpdate,
-                settings: showSettings
-            )
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
-
-            Divider()
-
-            Picker(
-                "View",
-                selection: Binding(
-                    get: { workspace.state.section },
-                    set: workspace.selectSection
-                )
-            ) {
-                ForEach(AnalyticsSection.allCases) { section in
-                    Text(section.rawValue).tag(section)
+        return VStack(spacing: 0) {
+            Picker("Integration", selection: $destination) {
+                ForEach(availableDestinations) { destination in
+                    Text(destination.rawValue).tag(destination)
                 }
             }
             .pickerStyle(.segmented)
@@ -66,11 +70,16 @@ struct MenuContentView: View {
 
             Divider()
 
-            ScrollView {
-                workspaceContent
-                    .padding(20)
+            switch effectiveDestination {
+            case .all:
+                integrationOverview
+            case .codex:
+                codexWorkspace
+            case .claudeCode:
+                claudeCodeWorkspace
+            case .grok:
+                grokWorkspace
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
             workspaceFooter
@@ -81,17 +90,686 @@ struct MenuContentView: View {
         .task {
             updater.start()
         }
+        .task(id: effectiveDestination) {
+            await updateVisibleIntegrationWork()
+        }
         .task(id: workspace.state) {
-            let state = workspace.state
-            await monitor.setLocalAnalyticsVisible(
-                state.usesLocalAnalytics
-            )
-            if state.section == .graphs,
-               state.graph == .tokenActivity {
-                await monitor.refreshAccountIfStale()
+            guard effectiveDestination == .codex else { return }
+            await updateCodexWorkspaceWork()
+        }
+        .task(id: integrations.enabledIntegrations) {
+            await updateVisibleIntegrationWork()
+        }
+        .task(id: safetyBuffer) {
+            guard effectiveDestination == .all else { return }
+            await updateVisibleIntegrationWork()
+        }
+        .onChange(of: integrations.enabledIntegrations) { _, _ in
+            if !availableDestinations.contains(destination) {
+                destination = .all
+            }
+        }
+        .onDisappear {
+            Task {
+                await monitor.setVisible(false)
+                await monitor.setLocalAnalyticsVisible(false)
+                await claudeCode.setVisible(false)
+                await grok.setVisible(false)
             }
         }
         .environment(\.locale, Locale(identifier: "en_US"))
+    }
+
+    private var codexWorkspace: some View {
+        VStack(spacing: 0) {
+            integrationHeader("Codex")
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let weekly = monitor.readerSnapshot.weeklyUsageRemaining {
+                        Text("Usage remaining · \(Int(weekly.window.remainingPercent.rounded()))%")
+                            .font(.title.weight(.semibold))
+                            .monospacedDigit()
+                        Text("Weekly · Resets \(weekly.window.resetsAt.formatted(date: .abbreviated, time: .shortened))")
+                            .foregroundStyle(.secondary)
+                    }
+                    if workspace.state.section == .graphs,
+                       workspace.state.graph == .usageRemaining,
+                       (workspace.state.timeRange == .twelveWeeks
+                            || monitor.historicalRange != nil) {
+                        historicalRangeControls
+                    }
+                    workspaceContent
+                    Divider()
+                    TimelineView(.periodic(from: .now, by: 60)) { context in
+                        Text(monitor.readerSnapshot.updatedText(at: context.date))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 10) {
+                        Button("Refresh") { Task { await monitor.refresh() } }
+                            .disabled(monitor.isRefreshing)
+                        if monitor.isRefreshing {
+                            ProgressView().controlSize(.small)
+                                .accessibilityLabel("Checking Codex usage")
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func integrationHeader(_ name: String, beta: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(name).font(.title2.weight(.semibold))
+            if beta {
+                Text("Beta").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if name == "Codex" {
+                Menu("More") {
+                    ForEach(AnalyticsGraph.coreCases) { graph in
+                        Button(graph.rawValue) {
+                            workspace.selectGraph(graph)
+                            workspace.selectSection(.graphs)
+                        }
+                    }
+                    Divider()
+                    Button("Facts & reset reminders") { workspace.selectSection(.facts) }
+                    Button("Insights") { workspace.selectSection(.insights) }
+                    if let version = updater.availableVersion {
+                        Divider()
+                        Button("Upgrade to \(version)", action: updater.showAvailableUpdate)
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel("More Codex views")
+            }
+            Button("Settings", action: showSettings).buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+    }
+
+    private var integrationOverview: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if integrations.isEnabled(.codex) {
+                    integrationOverviewRow(
+                        name: "Codex",
+                        primary: monitor.readerSnapshot.weeklyUsageRemaining.map {
+                            "Usage remaining · \(Int($0.window.remainingPercent.rounded()))%"
+                        } ?? "Usage is not available",
+                        secondary: monitor.readerSnapshot.sourceMessage
+                            ?? monitor.readerSnapshot.weeklyUsageRemaining.map {
+                            "Resets \($0.window.resetsAt.formatted(date: .abbreviated, time: .shortened))"
+                        },
+                        status: monitor.isRefreshing ? "Checking"
+                            : (monitor.readerSnapshot.freshness == .stale ? "Stale" : nil),
+                        overview: monitor.readerSnapshot.weeklyUsageRemaining.flatMap {
+                            UsageOverviewSnapshot(
+                                chart: monitor.readerSnapshot.chart, window: $0.window, now: Date()
+                            )
+                        },
+                        destination: .codex
+                    )
+                }
+                if integrations.isEnabled(.claudeCode) {
+                    integrationOverviewRow(
+                        name: "Claude Code",
+                        primary: claudeOverviewPrimary,
+                        secondary: claudeOverviewSecondary,
+                        status: claudeOverviewTrailing,
+                        overview: claudeCode.overview,
+                        destination: .claudeCode
+                    )
+                }
+                if integrations.isEnabled(.grok) {
+                    integrationOverviewRow(
+                        name: "Grok",
+                        primary: grokOverviewPrimary,
+                        secondary: grok.error?.localizedDescription
+                            ?? grok.currentSnapshot.map {
+                                "\($0.period == .weekly ? "Weekly" : "Monthly") · Resets \($0.resetsAt.formatted(date: .abbreviated, time: .shortened))"
+                            },
+                        status: grok.isRefreshing ? "Checking" : (grok.isStale ? "Stale" : nil),
+                        overview: grok.overview,
+                        destination: .grok
+                    )
+                }
+            }
+            .padding(20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var historicalRangeControls: some View {
+        HStack(spacing: 12) {
+            Button {
+                Task {
+                    await monitor.loadEarlierHistory(
+                        exploration: workspace.state,
+                        dispositions: workspace.insightDispositions
+                    )
+                    selectLoadedHistoricalRange()
+                }
+            } label: {
+                Label("Earlier", systemImage: "chevron.left")
+            }
+            .disabled(
+                monitor.isLoadingHistoricalRange
+                    || !monitor.canLoadEarlierHistory
+            )
+
+            if let range = monitor.historicalRange {
+                Text(
+                    "\(range.start.formatted(date: .abbreviated, time: .omitted))–\(range.end.formatted(date: .abbreviated, time: .omitted))"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+
+                Button {
+                    Task {
+                        await monitor.loadLaterHistory(
+                            exploration: workspace.state,
+                            dispositions: workspace.insightDispositions
+                        )
+                        selectLoadedHistoricalRange()
+                    }
+                } label: {
+                    Label("Later", systemImage: "chevron.right")
+                }
+                .disabled(monitor.isLoadingHistoricalRange)
+
+                Button("Latest") {
+                    monitor.clearHistoricalRange()
+                    workspace.selectTimeRange(.twelveWeeks)
+                }
+            }
+
+            if monitor.isLoadingHistoricalRange {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading history range")
+            }
+
+            Spacer()
+
+            if let issue = monitor.historicalRangeIssue {
+                Text(issue)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private var claudeCodeWorkspace: some View {
+        VStack(spacing: 0) {
+            integrationHeader("Claude Code", beta: true)
+
+            Divider()
+
+            ScrollView {
+                claudeCodeContent
+                    .padding(20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var grokOverviewPrimary: String {
+        if let snapshot = grok.currentSnapshot {
+            return "Usage remaining · \(Int(snapshot.remainingPercent.rounded()))%"
+        }
+        if grok.snapshot != nil { return "New usage observation needed" }
+        return grok.isRefreshing ? "Checking" : "Usage is not available"
+    }
+
+    private var grokWorkspace: some View {
+        VStack(spacing: 0) {
+            integrationHeader("Grok", beta: true)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(grokOverviewPrimary)
+                        .font(.title.weight(.semibold))
+                        .monospacedDigit()
+                    if let snapshot = grok.currentSnapshot {
+                        Text("\(snapshot.period == .weekly ? "Weekly" : "Monthly") · Resets \(snapshot.resetsAt.formatted(date: .abbreviated, time: .shortened))")
+                            .foregroundStyle(.secondary)
+                        if snapshot.isUnifiedBilling == true {
+                            Text("Shared across Grok products.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                    }
+                    IntegrationUsageRemainingView(
+                        title: "Usage remaining",
+                        metric: grok.snapshot?.historyObservation.metric ?? grok.history.last?.metric ?? "grok-weekly",
+                        observations: grok.history,
+                        current: grok.snapshot?.historyObservation,
+                        now: grok.displayNow,
+                        isStale: grok.isStale,
+                        defaults: chartDefaults
+                    )
+                    .id(grok.snapshot?.historyObservation.metric ?? grok.history.last?.metric)
+                    if let snapshot = grok.snapshot {
+                        if let plan = snapshot.subscriptionTier {
+                            LabeledContent("Plan", value: plan)
+                        }
+                        if let balance = snapshot.prepaidBalanceUSD {
+                            LabeledContent("Prepaid balance", value: balance.formatted(.currency(code: "USD")))
+                        }
+                        if let used = snapshot.onDemandUsedUSD {
+                            LabeledContent("On-demand usage", value: used.formatted(.currency(code: "USD")))
+                        }
+                        if let cap = snapshot.onDemandCapUSD {
+                            LabeledContent("On-demand limit", value: cap.formatted(.currency(code: "USD")))
+                        }
+                        Divider()
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Last checked \(snapshot.observedAt.formatted(.relative(presentation: .named)))")
+                            if grok.isStale {
+                                Label("Stale", systemImage: "clock.badge.exclamationmark")
+                            }
+                            if let version = snapshot.sourceVersion {
+                                Text("Grok Build \(version)").foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.callout)
+                    }
+                    if let error = grok.error {
+                        Label(error.localizedDescription, systemImage: "exclamationmark.triangle")
+                            .font(.callout)
+                        if error == .notFound || error == .authenticationRequired || error == .unsupported {
+                            Button("Open Settings", action: showSettings)
+                        }
+                    }
+                    if let issue = grok.storageIssue {
+                        Text(issue).font(.callout).foregroundStyle(.secondary)
+                    }
+                    if let issue = grok.historyIssue {
+                        Text(issue).font(.callout).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 10) {
+                        Button("Refresh") { Task { await grok.refresh() } }
+                            .disabled(!grok.canRefresh)
+                            .help("Checks are at least 30 seconds apart.")
+                        if grok.isRefreshing {
+                            ProgressView().controlSize(.small).accessibilityLabel("Checking Grok usage")
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var noIntegrationsWorkspace: some View {
+        VStack(spacing: 0) {
+            WorkspaceMessage(
+                icon: "switch.2",
+                title: "No integrations enabled",
+                message: "Enable an integration to show usage."
+            ) {
+                Button("Open Settings", action: showSettings)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+            workspaceFooter
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+        }
+        .frame(width: 420, height: 460)
+        .environment(\.locale, Locale(identifier: "en_US"))
+    }
+
+    private var availableDestinations: [IntegrationDestination] {
+        [.all]
+            + (integrations.isEnabled(.codex) ? [.codex] : [])
+            + (integrations.isEnabled(.claudeCode) ? [.claudeCode] : [])
+            + (integrations.isEnabled(.grok) ? [.grok] : [])
+    }
+
+    private var effectiveDestination: IntegrationDestination {
+        availableDestinations.contains(destination) ? destination : .all
+    }
+
+    @ViewBuilder
+    private var claudeCodeContent: some View {
+        if let snapshot = claudeCode.snapshot {
+            VStack(alignment: .leading, spacing: 18) {
+                if let sevenDay = snapshot.sevenDay,
+                   sevenDay.resetsAt > claudeCode.displayNow {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(
+                            "Usage remaining · \(Int(sevenDay.remainingPercent.rounded()))%"
+                        )
+                        .font(.title.weight(.semibold))
+                        .monospacedDigit()
+                        Text(
+                            "7-day · Resets \(sevenDay.resetsAt.formatted(date: .abbreviated, time: .shortened))"
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(
+                        snapshot.sevenDay == nil
+                            ? "7-day usage unavailable"
+                            : "New usage observation needed"
+                    )
+                    .font(.headline)
+                    Text("Use Claude Code to record current usage.")
+                        .foregroundStyle(.secondary)
+                }
+
+                claudeUsageChart(title: "7-day usage remaining", metric: "claude-seven-day")
+
+                if let fiveHour = snapshot.fiveHour,
+                   fiveHour.resetsAt > claudeCode.displayNow {
+                    LabeledContent(
+                        "5-hour usage remaining",
+                        value: "\(Int(fiveHour.remainingPercent.rounded()))%"
+                    )
+                    .monospacedDigit()
+                    Text(
+                        "Resets \(fiveHour.resetsAt.formatted(date: .abbreviated, time: .shortened))"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                claudeUsageChart(title: "5-hour usage remaining", metric: "claude-five-hour")
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(
+                        "Last observed \(snapshot.observedAt.formatted(.relative(presentation: .named)))"
+                    )
+                    if claudeCode.displayFreshness == .stale {
+                        Label("Stale", systemImage: "clock.badge.exclamationmark")
+                    }
+                    Text("Usage updates during Claude Code activity.")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.callout)
+
+                if let issue = claudeSnapshotIssue {
+                    Label(issue, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                    Button("Open Settings", action: showSettings)
+                }
+                if let issue = claudeCode.historyIssue {
+                    Text(issue).font(.callout).foregroundStyle(.secondary)
+                }
+
+                Button("Check for new observation") {
+                    Task { await claudeCode.checkForNewObservation() }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            VStack(alignment: .leading, spacing: 18) {
+                claudeUnavailableContent
+                claudeUsageChart(title: "7-day usage remaining", metric: "claude-seven-day")
+                claudeUsageChart(title: "5-hour usage remaining", metric: "claude-five-hour")
+                if let issue = claudeCode.historyIssue {
+                    Text(issue).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func claudeUsageChart(title: String, metric: String) -> some View {
+        IntegrationUsageRemainingView(
+            title: title, metric: metric, observations: claudeCode.history,
+            current: claudeCode.snapshot?.historyObservations.first { $0.metric == metric },
+            now: claudeCode.displayNow, isStale: claudeCode.displayFreshness != .fresh,
+            defaults: chartDefaults
+        )
+    }
+
+    @ViewBuilder
+    private var claudeUnavailableContent: some View {
+        switch claudeCode.readiness {
+        case .checking:
+            WorkspaceMessage(
+                icon: "arrow.clockwise",
+                title: "Checking",
+                message: "Checking Claude Code setup."
+            ) {
+                ProgressView().controlSize(.small)
+            }
+        case .notFound:
+            WorkspaceMessage(
+                icon: "terminal",
+                title: "Claude Code not found",
+                message: "Install Claude Code, then check again in Settings."
+            ) {
+                Button("Open Settings", action: showSettings)
+            }
+        case .waitingForData:
+            WorkspaceMessage(
+                icon: "clock",
+                title: "Use Claude Code to record usage",
+                message: "Usage appears after the first response in a session."
+            ) {
+                Button("Check for new observation") {
+                    Task { await claudeCode.checkForNewObservation() }
+                }
+            }
+        case .conflict:
+            WorkspaceMessage(
+                icon: "exclamationmark.triangle",
+                title: "Existing status line",
+                message: "Codex Limits won’t change your Claude Code status line."
+            ) {
+                Button("Open Settings", action: showSettings)
+            }
+        case .manualCleanupRequired:
+            WorkspaceMessage(
+                icon: "exclamationmark.triangle",
+                title: "Setup changed",
+                message: "Remove the Codex Limits command from your Claude Code status line."
+            ) {
+                Button("Open Settings", action: showSettings)
+            }
+        case .setUp, .updateRequired, .failed, .disabled, .ready:
+            WorkspaceMessage(
+                icon: "gearshape",
+                title: "Set up Claude Code",
+                message: "Finish setup in Settings to record usage."
+            ) {
+                Button("Open Settings", action: showSettings)
+            }
+        }
+    }
+
+    private var claudeOverviewPrimary: String {
+        guard let snapshot = claudeCode.snapshot else {
+            return claudeReadinessText
+        }
+        guard let sevenDay = snapshot.sevenDay else {
+            return "7-day usage unavailable"
+        }
+        guard sevenDay.resetsAt > claudeCode.displayNow else {
+            return "New usage observation needed"
+        }
+        return "Usage remaining · \(Int(sevenDay.remainingPercent.rounded()))%"
+    }
+
+    private var claudeOverviewSecondary: String? {
+        guard let snapshot = claudeCode.snapshot else { return nil }
+        var details: [String] = []
+        if let sevenDay = snapshot.sevenDay, sevenDay.resetsAt > claudeCode.displayNow {
+            details.append("Resets \(sevenDay.resetsAt.formatted(date: .abbreviated, time: .shortened))")
+        }
+        if let fiveHour = snapshot.fiveHour, fiveHour.resetsAt > claudeCode.displayNow {
+            details.append("5-hour remaining · \(Int(fiveHour.remainingPercent.rounded()))%")
+        }
+        return details.isEmpty ? nil : details.joined(separator: " · ")
+    }
+
+    private var claudeOverviewTrailing: String? {
+        guard let snapshot = claudeCode.snapshot else { return nil }
+        if let issue = claudeSnapshotIssue { return issue }
+        return switch claudeCode.displayFreshness {
+        case .fresh:
+            "Last observed \(snapshot.observedAt.formatted(.relative(presentation: .named)))"
+        case .stale:
+            "Stale"
+        case .expired:
+            "Last observed \(snapshot.observedAt.formatted(.relative(presentation: .named)))"
+        case nil:
+            nil
+        }
+    }
+
+    private var claudeSnapshotIssue: String? {
+        switch claudeCode.readiness {
+        case .setUp:
+            "Set up in Settings"
+        case .conflict:
+            "Existing status line"
+        case .updateRequired:
+            "Update required"
+        case .failed:
+            "Claude Code usage couldn’t be read"
+        case .notFound:
+            "Claude Code not found"
+        default:
+            nil
+        }
+    }
+
+    private var claudeReadinessText: String {
+        switch claudeCode.readiness {
+        case .notFound: "Not found"
+        case .waitingForData: "Waiting for data"
+        case .conflict: "Existing status line"
+        case .checking: "Checking"
+        default: "Set up"
+        }
+    }
+
+    private func integrationOverviewRow(
+        name: String,
+        primary: String,
+        secondary: String?,
+        status: String?,
+        overview: UsageOverviewSnapshot?,
+        destination: IntegrationDestination
+    ) -> some View {
+        Button {
+            self.destination = destination
+        } label: {
+            HStack(spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(name).font(.headline)
+                    Text(primary).monospacedDigit()
+                    if let secondary {
+                        Text(secondary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let status {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let overview {
+                    UsageOverviewChart(snapshot: overview)
+                        .frame(width: currentLayout.isCompact ? 110 : 150, height: 72)
+                }
+            }
+            .padding(14)
+            .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Open \(name) usage details.")
+    }
+
+    private func updateVisibleIntegrationWork() async {
+        guard !Task.isCancelled else { return }
+        switch effectiveDestination {
+        case .all:
+            monitor.clearHistoricalRange()
+            await monitor.setVisible(integrations.isEnabled(.codex))
+            guard !Task.isCancelled else { return }
+            await monitor.setLocalAnalyticsVisible(false)
+            guard !Task.isCancelled else { return }
+            await claudeCode.setVisible(
+                integrations.isEnabled(.claudeCode), includeHistory: false,
+                safetyBuffer: safetyBuffer
+            )
+            guard !Task.isCancelled else { return }
+            await grok.setVisible(
+                integrations.isEnabled(.grok), includeHistory: false, safetyBuffer: safetyBuffer
+            )
+            guard !Task.isCancelled else { return }
+            if integrations.isEnabled(.codex) {
+                await monitor.refreshAccountIfStale()
+            }
+        case .codex:
+            await monitor.setVisible(true)
+            guard !Task.isCancelled else { return }
+            await claudeCode.setVisible(false)
+            await grok.setVisible(false)
+            guard !Task.isCancelled else { return }
+            await updateCodexWorkspaceWork()
+        case .claudeCode:
+            monitor.clearHistoricalRange()
+            await monitor.setVisible(false)
+            guard !Task.isCancelled else { return }
+            await monitor.setLocalAnalyticsVisible(false)
+            guard !Task.isCancelled else { return }
+            await claudeCode.setVisible(true)
+            await grok.setVisible(false)
+        case .grok:
+            monitor.clearHistoricalRange()
+            await monitor.setVisible(false)
+            guard !Task.isCancelled else { return }
+            await monitor.setLocalAnalyticsVisible(false)
+            guard !Task.isCancelled else { return }
+            await claudeCode.setVisible(false)
+            await grok.setVisible(true)
+        }
+    }
+
+    private func updateCodexWorkspaceWork() async {
+        let state = workspace.state
+        if state.timeRange != .selected {
+            monitor.clearHistoricalRange()
+        }
+        await monitor.setLocalAnalyticsVisible(state.usesLocalAnalytics)
+        await monitor.refreshAccountIfStale()
+    }
+
+    private func selectLoadedHistoricalRange() {
+        guard let range = monitor.historicalRange,
+              let snapshot = monitor.historicalReaderSnapshot,
+              let window = snapshot.account?.mainLimit?.window else { return }
+        let current = DateInterval(
+            start: window.startsAt,
+            end: window.resetsAt
+        )
+        workspace.selectVisibleRange(
+            range,
+            within: snapshot.chart.availableRange(including: current)
+        )
     }
 
     @ViewBuilder
@@ -109,6 +787,7 @@ struct MenuContentView: View {
             TimelineView(.periodic(from: .now, by: 60)) { context in
                 AnalyticsWorkspaceBody(
                     reader: monitor.readerSnapshot,
+                    historicalReader: monitor.historicalReaderSnapshot,
                     store: workspace,
                     assistedInsights: assistedInsights,
                     now: context.date,
@@ -222,6 +901,7 @@ struct AnalyticsWorkspacePresentationView<Content: View>: View {
 @MainActor
 struct AnalyticsWorkspaceBody: View {
     let reader: UsageReaderSnapshot
+    let historicalReader: UsageReaderSnapshot?
     @ObservedObject var store: AnalyticsWorkspaceStore
     @ObservedObject var assistedInsights: CodexAssistedInsightStore
     let now: Date
@@ -232,6 +912,7 @@ struct AnalyticsWorkspaceBody: View {
 
     init(
         reader: UsageReaderSnapshot,
+        historicalReader: UsageReaderSnapshot? = nil,
         store: AnalyticsWorkspaceStore,
         assistedInsights: CodexAssistedInsightStore,
         now: Date = Date(),
@@ -239,13 +920,13 @@ struct AnalyticsWorkspaceBody: View {
         resetReminderState: ResetReminderState = ResetReminderState(
             isEnabled: false,
             leadTime: .hours24,
-            authorization: .unknown,
             delivery: .off
         ),
         setResetReminderEnabled: @escaping (Bool) -> Void = { _ in },
         setResetReminderLeadTime: @escaping (ResetReminderLeadTime) -> Void = { _ in }
     ) {
         self.reader = reader
+        self.historicalReader = historicalReader
         self.store = store
         self.assistedInsights = assistedInsights
         self.now = now
@@ -260,7 +941,11 @@ struct AnalyticsWorkspaceBody: View {
         Group {
             switch store.state.section {
             case .graphs:
-                GraphsWorkspace(reader: reader, store: store, now: now)
+                GraphsWorkspace(
+                    reader: historicalReader ?? reader,
+                    store: store,
+                    now: now
+                )
             case .facts:
                 FactsWorkspace(
                     reader: reader,
@@ -293,188 +978,6 @@ struct AnalyticsWorkspaceBody: View {
                 break
             }
         }
-    }
-}
-
-private struct WorkspaceHeader: View {
-    let reader: UsageReaderSnapshot
-    let isRefreshing: Bool
-    let isCompact: Bool
-    let resetReminderState: ResetReminderState
-    let refresh: () -> Void
-    let setResetReminderEnabled: (Bool) -> Void
-    let availableUpdateVersion: String?
-    let showAvailableUpdate: () -> Void
-    let settings: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                if let weekly = reader.weeklyUsageRemaining {
-                    Text(
-                        weekly.window.remainingPercent,
-                        format: .number.precision(.fractionLength(0))
-                    )
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    Text("% remaining")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(reader.evidence.reason ?? "Weekly usage unavailable")
-                        .font(.headline)
-                }
-
-                Spacer()
-
-                Button(action: refresh) {
-                    if isRefreshing {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh")
-                .accessibilityLabel("Refresh usage")
-
-                if let availableUpdateVersion {
-                    Button(action: showAvailableUpdate) {
-                        Image(systemName: "arrow.down.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Upgrade to \(availableUpdateVersion)")
-                    .accessibilityLabel("Upgrade Codex Limits")
-                    .accessibilityValue(
-                        "Version \(availableUpdateVersion) is available"
-                    )
-                }
-
-                Button(action: settings) {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.borderless)
-                .help("Settings")
-                .accessibilityLabel("Settings")
-            }
-
-            if isCompact {
-                VStack(alignment: .leading, spacing: 7) {
-                    headerFactRows
-                }
-            } else {
-                HStack(spacing: 22) {
-                    headerFactRows
-                }
-            }
-
-            if reader.weeklyUsageRemaining != nil {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(reader.guidanceTitle)
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(
-                            reader.guidance.map { statusColor($0.status) }
-                                ?? .secondary
-                        )
-                    Text(reader.guidanceMessage)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(isCompact ? 2 : 1)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var headerFactRows: some View {
-        if let weekly = reader.weeklyUsageRemaining {
-            HeaderFact(
-                label: "Reset",
-                value: weekly.window.resetsAt.formatted(
-                    date: .abbreviated,
-                    time: .shortened
-                )
-            )
-        }
-        if let summary = reader.bankedResets {
-            TimelineView(.periodic(from: .now, by: 60)) { context in
-                HStack(spacing: 5) {
-                    HeaderFact(
-                        label: "Banked resets",
-                        value: summary.headerValue(at: context.date)
-                    )
-                    .help(summary.inspectionText(at: context.date))
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Banked resets")
-                    .accessibilityValue(
-                        "\(summary.headerValue(at: context.date)) · \(summary.inspectionText(at: context.date))"
-                    )
-
-                    if summary.currentNextKnownExpiry(at: context.date) != nil
-                        || resetReminderState.isEnabled {
-                        Button {
-                            setResetReminderEnabled(
-                                !resetReminderState.isEnabled
-                            )
-                        } label: {
-                            Image(
-                                systemName: resetReminderState.isEnabled
-                                    ? "bell.fill"
-                                    : "bell"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(
-                            resetReminderState.isEnabled
-                                ? Color.accentColor
-                                : Color.secondary
-                        )
-                        .help(resetReminderState.controlHelp)
-                        .accessibilityLabel("Reset Reminder")
-                        .accessibilityValue(
-                            "\(resetReminderState.isEnabled ? "On" : "Off"). \(resetReminderState.statusText)"
-                        )
-                        .accessibilityHint(
-                            resetReminderState.isEnabled
-                                ? "Turn reminder off."
-                                : "Turn reminder on."
-                        )
-                    }
-                }
-            }
-        } else {
-            HeaderFact(label: "Banked resets", value: "Unavailable")
-        }
-        TimelineView(.periodic(from: .now, by: 60)) { context in
-            HeaderFact(
-                label: "Freshness",
-                value: reader.updatedText(at: context.date)
-                    .replacingOccurrences(of: "Updated ", with: "")
-            )
-        }
-    }
-
-    private func statusColor(_ status: PaceStatus) -> Color {
-        switch status {
-        case .slowDown: .red
-        case .onTrack: .green
-        case .roomToUseMore: .blue
-        }
-    }
-}
-
-private struct HeaderFact: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .monospacedDigit()
-        }
-        .font(.caption)
     }
 }
 
@@ -513,37 +1016,16 @@ private struct GraphsWorkspace: View {
     }
 
     private var graphToolbar: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 12) {
-                graphPicker
-                rangePicker
-                scopeControl
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(store.state.graph.rawValue).font(.headline)
                 Spacer()
+                rangePicker
             }
-            VStack(alignment: .leading, spacing: 10) {
-                graphPicker
-                HStack(spacing: 12) {
-                    rangePicker
-                    scopeControl
-                }
+            if !store.state.graph.usesAccountScope {
+                WorkspaceFilterMenu(reader: reader, store: store)
             }
         }
-    }
-
-    private var graphPicker: some View {
-        Picker(
-            "Graph",
-            selection: Binding(
-                get: { store.state.graph },
-                set: store.selectGraph
-            )
-        ) {
-            ForEach(AnalyticsGraph.coreCases) { graph in
-                Text(graph.rawValue).tag(graph)
-            }
-        }
-        .frame(minWidth: 180)
-        .accessibilityLabel("Graph")
     }
 
     private var rangePicker: some View {
@@ -560,21 +1042,8 @@ private struct GraphsWorkspace: View {
                 Text(range.rawValue).tag(range)
             }
         }
-        .frame(minWidth: 130)
+        .frame(maxWidth: 200)
         .accessibilityLabel("Time range")
-    }
-
-    @ViewBuilder
-    private var scopeControl: some View {
-        if store.state.graph.usesAccountScope {
-            Label("Account", systemImage: "person.crop.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("Data from your Codex account.")
-                .accessibilityLabel("Account scope")
-        } else {
-            WorkspaceFilterMenu(reader: reader, store: store)
-        }
     }
 
     @ViewBuilder
@@ -590,43 +1059,53 @@ private struct GraphsWorkspace: View {
                     now: now
                 )
 
-                Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
-                    GridRow {
-                        Text("Reset")
-                            .foregroundStyle(.secondary)
-                        Text(
-                            weekly.window.resetsAt.formatted(
-                                date: .abbreviated,
-                                time: .shortened
-                            )
-                        )
-                    }
-                    GridRow {
-                        Text("Suggested pace")
-                            .foregroundStyle(.secondary)
-                        Text(reader.suggestedPaceText)
-                    }
-                    GridRow {
-                        Text("Runway")
-                            .foregroundStyle(.secondary)
-                        Text(reader.runwayText)
-                    }
-                    if let gap = reader.guidance?.runway.gapText {
-                        GridRow {
-                            Text("Gap to reset")
-                                .foregroundStyle(.secondary)
-                            Text(gap)
+                DisclosureGroup("Usage details") {
+                    VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(reader.guidanceTitle).fontWeight(.semibold)
+                            Text(reader.guidanceMessage).foregroundStyle(.secondary)
                         }
-                    }
-                    if let range = reader.guidance?.remainingAtResetRange {
-                        GridRow {
-                            Text("Range")
-                                .foregroundStyle(.secondary)
-                            Text(range.text)
+                        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+                            GridRow {
+                                Text("Reset")
+                                    .foregroundStyle(.secondary)
+                                Text(
+                                    weekly.window.resetsAt.formatted(
+                                        date: .abbreviated,
+                                        time: .shortened
+                                    )
+                                )
+                            }
+                            GridRow {
+                                Text("Suggested pace")
+                                    .foregroundStyle(.secondary)
+                                Text(reader.suggestedPaceText)
+                            }
+                            GridRow {
+                                Text("Runway")
+                                    .foregroundStyle(.secondary)
+                                Text(reader.runwayText)
+                            }
+                            if let gap = reader.guidance?.runway.gapText {
+                                GridRow {
+                                    Text("Gap to reset")
+                                        .foregroundStyle(.secondary)
+                                    Text(gap)
+                                }
+                            }
+                            if let range = reader.guidance?.remainingAtResetRange {
+                                GridRow {
+                                    Text("Range")
+                                        .foregroundStyle(.secondary)
+                                    Text(range.text)
+                                }
+                            }
                         }
+                        .font(.callout)
                     }
+                    .font(.callout)
+                    .padding(.top, 8)
                 }
-                .font(.callout)
             }
         } else {
             unavailableCurrentWindow
@@ -638,10 +1117,13 @@ private struct GraphsWorkspace: View {
     }
 
     private var unavailableCurrentWindow: some View {
-        UnavailableGraph(
+        WorkspaceMessage(
+            icon: "chart.xyaxis.line",
             title: reader.evidence.reason ?? "Weekly usage unavailable",
             message: "Try refreshing to check again."
-        )
+        ) {
+            EmptyView()
+        }
     }
 }
 
@@ -1572,25 +2054,12 @@ func accountTokenIntervalText(
     timeZone: TimeZone = .autoupdatingCurrent,
     locale: Locale = .autoupdatingCurrent
 ) -> String {
-    let formatter = DateFormatter()
-    formatter.dateStyle = .medium
-    formatter.timeStyle = .short
-    formatter.timeZone = timeZone
-    formatter.locale = locale
-    return "\(formatter.string(from: interval.start))–\(formatter.string(from: interval.end))"
-}
-
-func accountTokenIntervalAccessibilityValue(
-    _ interval: AccountTokenActivityInterval,
-    timeZone: TimeZone = .autoupdatingCurrent,
-    locale: Locale = .autoupdatingCurrent
-) -> String {
-    let dates = accountTokenIntervalText(
-        DateInterval(start: interval.start, end: interval.end),
-        timeZone: timeZone,
-        locale: locale
-    )
-    return "\(interval.tokenDelta) account tokens. Account. \(dates). \(interval.method.displayName)."
+    Date.IntervalFormatStyle(
+        date: .abbreviated,
+        time: .shortened,
+        locale: locale,
+        timeZone: timeZone
+    ).format(interval.start ..< interval.end)
 }
 
 func accountTokenDisplayIntervalAccessibilityValue(
@@ -1769,15 +2238,44 @@ private struct TokenActivityWorkspace: View {
     }
 
     private var accountCard: some View {
-        TokenSourceCard(
-            title: "Account",
-            source: reader.accountTokenActivity.sourceDescription,
-            value: reader.accountTokenActivity.tokens.map(compactTokenCount)
-                ?? "Not available",
-            detail: summaryDetail,
-            freshness: reader.fetchedAt,
-            freshnessLabel: "Updated",
-            color: .blue
+        let source = reader.accountTokenActivity.sourceDescription
+        let value = reader.accountTokenActivity.tokens.map(compactTokenCount)
+            ?? "Not available"
+        return VStack(alignment: .leading, spacing: 9) {
+            Label("Account", systemImage: "person.crop.circle")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.blue)
+            Text(source)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.system(size: 26, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(summaryDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            if let freshness = reader.fetchedAt {
+                Text("Updated " + freshness.formatted(
+                    date: .abbreviated,
+                    time: .shortened
+                ))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 155, alignment: .topLeading)
+        .background(
+            Color.blue.opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.blue.opacity(0.16))
+        }
+        .help(
+            "Account, \(source). \(value) tokens. \(summaryDetail)"
         )
     }
 
@@ -2019,57 +2517,6 @@ private struct TokenActivityWorkspace: View {
     }
 }
 
-private struct TokenSourceCard: View {
-    let title: String
-    let source: String
-    let value: String
-    let detail: String
-    let freshness: Date?
-    let freshnessLabel: String
-    let color: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label(title, systemImage: title == "Account"
-                ? "person.crop.circle"
-                : "laptopcomputer")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(color)
-            Text(source)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            Text(value)
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-            if let freshness {
-                Text(freshnessLabel + " " + freshness.formatted(
-                    date: .abbreviated,
-                    time: .shortened
-                ))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 155, alignment: .topLeading)
-        .background(
-            color.opacity(0.07),
-            in: RoundedRectangle(cornerRadius: 12)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(color.opacity(0.16))
-        }
-        .help(
-            "\(title), \(source). \(value) tokens. \(detail)"
-        )
-    }
-}
-
 private struct WorkspaceFilterMenu: View {
     let reader: UsageReaderSnapshot
     @ObservedObject var store: AnalyticsWorkspaceStore
@@ -2158,6 +2605,152 @@ private struct WorkspaceFilterMenu: View {
     }
 }
 
+private struct UsageOverviewChart: View {
+    let snapshot: UsageOverviewSnapshot
+
+    var body: some View {
+        Chart {
+            RuleMark(y: .value("Empty", 0))
+                .foregroundStyle(Color.secondary.opacity(0.2))
+            ForEach(snapshot.target) { point in
+                LineMark(
+                    x: .value("Time", point.date), y: .value("Remaining", point.remaining),
+                    series: .value("Series", "Target")
+                )
+                .foregroundStyle(Color.green)
+                .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
+            }
+            ForEach(Array(snapshot.observedSegments.enumerated()), id: \.offset) { index, segment in
+                ForEach(segment) { point in
+                    LineMark(
+                        x: .value("Time", point.date), y: .value("Remaining", point.remaining),
+                        series: .value("Series", "Actual \(index)")
+                    )
+                    .foregroundStyle(Color.blue)
+                    .lineStyle(StrokeStyle(lineWidth: 2))
+                    .interpolationMethod(.stepEnd)
+                    if segment.count == 1 {
+                        PointMark(x: .value("Time", point.date), y: .value("Remaining", point.remaining))
+                            .foregroundStyle(Color.blue)
+                            .symbolSize(8)
+                    }
+                }
+            }
+            if let point = snapshot.latest {
+                PointMark(x: .value("Time", point.date), y: .value("Remaining", point.remaining))
+                    .foregroundStyle(Color.blue)
+                    .symbolSize(28)
+            }
+        }
+        .chartXScale(domain: snapshot.range.start ... snapshot.range.end)
+        .chartYScale(domain: 0 ... 100)
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
+        .padding(3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Current usage window")
+        .accessibilityValue(snapshot.latest.map {
+            "Last recorded \(Int($0.remaining.rounded()))% remaining, \($0.date.formatted(date: .abbreviated, time: .shortened))"
+        } ?? "No usage observations")
+        .help("Current window · Blue: actual usage remaining · Green dashed: target")
+    }
+}
+
+private struct IntegrationUsageRemainingView: View {
+    private struct Input: Equatable, Sendable {
+        let metric: String
+        let observations: [AllowanceObservation]
+        let current: AllowanceObservation?
+        let now: Date
+        let isStale: Bool
+        let safetyBuffer: Double
+
+        func chart() -> IntegrationAllowanceChart? {
+            IntegrationAllowanceChart(
+                metric: metric, observations: observations, current: current,
+                now: now, isStale: isStale, safetyBuffer: safetyBuffer
+            )
+        }
+    }
+
+    let title: String
+    let metric: String
+    let observations: [AllowanceObservation]
+    let current: AllowanceObservation?
+    let now: Date
+    let isStale: Bool
+    @StateObject private var store: AnalyticsWorkspaceStore
+    @AppStorage private var safetyBuffer: Double
+    @State private var data: IntegrationAllowanceChart?
+    @State private var renderedInput: Input?
+
+    init(
+        title: String, metric: String, observations: [AllowanceObservation],
+        current: AllowanceObservation?, now: Date, isStale: Bool, defaults: UserDefaults
+    ) {
+        self.title = title
+        self.metric = metric
+        self.observations = observations
+        self.current = current
+        self.now = now
+        self.isStale = isStale
+        _store = StateObject(wrappedValue: AnalyticsWorkspaceStore(defaults: defaults, keyPrefix: metric + "."))
+        _safetyBuffer = AppStorage(wrappedValue: 3, UsageMonitor.safetyBufferKey, store: defaults)
+    }
+
+    var body: some View {
+        let input = Input(
+            metric: metric, observations: observations, current: current,
+            now: now, isStale: isStale, safetyBuffer: safetyBuffer
+        )
+        return VStack(alignment: .leading, spacing: 0) {
+          if let data {
+            let chart = renderedInput == input ? data.chart : UsageChartSnapshot(
+                observedSource: data.chart.observedSource,
+                target: data.chart.target,
+                currentProjection: [],
+                currentAllowanceReset: data.chart.currentAllowanceReset,
+                allowanceWindows: data.chart.allowanceWindows,
+                currentRunsFaster: false,
+                accessibilityValue: "Recorded usage history. Updating the estimate."
+            )
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text(title).font(.headline)
+                    Spacer()
+                    Picker("Range", selection: Binding(get: { store.state.timeRange }, set: store.selectTimeRange)) {
+                        ForEach(AnalyticsTimeRange.allCases.filter { $0.isPreset || store.state.timeRange == .selected }) {
+                            Text($0.rawValue).tag($0)
+                        }
+                    }
+                    .frame(maxWidth: 200)
+                    .accessibilityLabel("\(title) time range")
+                }
+                UsageRemainingChart(
+                    window: data.window, chart: chart, evidence: data.evidence,
+                    store: store, now: now
+                )
+                if let reason = data.forecastUnavailableReason {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+          }
+        }
+        .task(id: input) {
+            let task = Task.detached(priority: .userInitiated) { input.chart() }
+            let result = await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            data = result
+            renderedInput = input
+        }
+    }
+}
+
 private struct UsageRemainingChart: View {
     let window: UsageWindow
     let chart: UsageChartSnapshot
@@ -2198,7 +2791,9 @@ private struct UsageRemainingChart: View {
 
     private var xAxisDates: [Date] {
         let step: TimeInterval
-        if visibleRange.duration <= 2 * 86_400 {
+        if visibleRange.duration <= 6 * 3_600 {
+            step = 3_600
+        } else if visibleRange.duration <= 2 * 86_400 {
             step = 6 * 3_600
         } else if visibleRange.duration <= 10 * 86_400 {
             step = 86_400
@@ -2240,7 +2835,8 @@ private struct UsageRemainingChart: View {
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
                             if visibleRange.duration <= 2 * 86_400 {
-                                Text(date, format: .dateTime.hour())
+                                Text(date, format: .dateTime.hour().minute())
+                                    .fixedSize()
                             } else if visibleRange.duration <= 10 * 86_400 {
                                 Text(
                                     date,
@@ -2298,6 +2894,13 @@ private struct UsageRemainingChart: View {
                     )
                 }
                 keyboardRangeStart = nil
+            }
+            .onChange(of: chart) { _, chart in
+                if let selection {
+                    self.selection = UsageChartSelection.nearest(
+                        to: selection.date, in: chart, within: visibleRange
+                    )
+                }
             }
 
             selectedPointDetail
@@ -2359,7 +2962,9 @@ private struct UsageRemainingChart: View {
 
     @ViewBuilder
     private var chartLegend: some View {
-        ChartLegendItem(label: "Target", color: .green, dash: [3, 3])
+        if !chart.target.isEmpty {
+            ChartLegendItem(label: "Target", color: .green, dash: [3, 3])
+        }
         ChartLegendItem(
             label: "Actual · \(chart.observedSource.rawValue)",
             color: .blue
@@ -2848,6 +3453,14 @@ private struct FactsWorkspace: View {
                         .foregroundStyle(.secondary)
                     }
                 }
+            }
+
+            WorkspaceCard(title: "Active Time") {
+                activeTimeContent
+            }
+
+            WorkspaceCard(title: "Usage Receipts") {
+                receiptContent
             }
 
         }
@@ -4466,21 +5079,6 @@ private struct FactRow: View {
             }
         }
         .accessibilityElement(children: .combine)
-    }
-}
-
-private struct UnavailableGraph: View {
-    let title: String
-    let message: String
-
-    var body: some View {
-        WorkspaceMessage(
-            icon: "chart.xyaxis.line",
-            title: title,
-            message: message
-        ) {
-            EmptyView()
-        }
     }
 }
 
