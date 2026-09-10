@@ -1,7 +1,7 @@
 # Codex limits after GPT‑5.6: user research and product opportunities
 
-Date: 2026-07-27  
-Primary observation window: 2026-07-09–2026-07-27  
+Date: 2026-07-27\
+Primary observation window: 2026-07-09–2026-07-27\
 Product: `codex-limits`
 
 ## Executive summary

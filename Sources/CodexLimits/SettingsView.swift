@@ -61,7 +61,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Text("Claude Code")
-                            Text("Beta")
+                            Text("Experimental")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

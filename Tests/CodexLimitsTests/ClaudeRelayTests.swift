@@ -131,6 +131,35 @@ final class ClaudeRelayTests: XCTestCase {
         XCTAssertEqual(try ClaudeRelay.readSnapshot(at: cache), changed)
     }
 
+    func testClockRollbackReplacesFutureCacheWithoutSeedingItAndKeepsWriterOrdering() throws {
+        let root = temporaryDirectory()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let cache = root.appendingPathComponent("snapshot.json")
+        let marker = root.appendingPathComponent("enabled")
+        try Data().write(to: marker)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func reading(offset: TimeInterval, remaining: Double) -> ClaudeAllowanceSnapshot {
+            ClaudeAllowanceSnapshot(
+                observedAt: now.addingTimeInterval(offset), cliVersion: "2.1.92", fiveHour: nil,
+                sevenDay: ClaudeAllowanceWindowSnapshot(remainingPercent: remaining, resetsAt: now.addingTimeInterval(86_400))
+            )
+        }
+        let future = reading(offset: 3_600, remaining: 90)
+        try JSONEncoder().encode(future).write(to: cache)
+        XCTAssertThrowsError(try ClaudeRelay.readSnapshot(at: cache, now: now))
+        let current = reading(offset: 0, remaining: 70)
+
+        XCTAssertTrue(try ClaudeRelay.storeIfNewer(current, at: cache, enabledMarkerURL: marker, now: { now }))
+        XCTAssertEqual(try ClaudeRelay.readSnapshot(at: cache, now: now), current)
+        let history = try AllowanceHistory.read(in: ClaudeRelay.historyDirectory(for: cache), now: now.addingTimeInterval(7_200))
+        XCTAssertEqual(history, current.historyObservations, "Rejected future cache must not seed the history")
+
+        let delayed = reading(offset: -120, remaining: 80)
+        XCTAssertFalse(try ClaudeRelay.storeIfNewer(delayed, at: cache, enabledMarkerURL: marker, now: { now.addingTimeInterval(180) }))
+        XCTAssertThrowsError(try ClaudeRelay.storeIfNewer(future, at: cache, enabledMarkerURL: marker, now: { now }))
+        XCTAssertEqual(try ClaudeRelay.readSnapshot(at: cache, now: now), current)
+    }
+
     func testReaderRejectsTamperedCache() throws {
         let root = temporaryDirectory()
         try FileManager.default.createDirectory(

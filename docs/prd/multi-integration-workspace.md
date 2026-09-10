@@ -1,18 +1,18 @@
 # Multi-integration workspace
 
-Status: Needs revision — eligible Claude observation, all-enabled idle comparison, and lifecycle soak remain release gates
+Status: Needs revision — all-enabled idle comparison and lifecycle soak remain release gates
 
 Development is not blocked. This status postpones release acceptance only; implementation, local testing, and documentation continue normally.
 
 ## Destination
 
-The multi-integration model covers Codex, Claude Code, Grok, and OpenCode without pretending that they expose equivalent data. The v1 development workspace presents Codex, Claude Code, and Grok. Claude Code and Grok are opt-in Beta Integrations; release acceptance remains subject to the gates below. OpenCode remains a future Integration until a supported lighter source passes the same functional, privacy, and performance gates. Users choose which shipped Integrations participate and which single Integration metric appears in the menu bar. Disabled Integrations perform no automatic source collection. Enabled Integrations collect only what their visible or explicitly selected capabilities require.
+The multi-integration model covers Codex, Claude Code, Grok, and OpenCode without pretending that they expose equivalent data. The v1 development workspace presents Codex, Claude Code, and Grok. Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release acceptance remains subject to the gates below. OpenCode remains a future Integration until a supported lighter source passes the same functional, privacy, and performance gates. Users choose which shipped Integrations participate and which single Integration metric appears in the menu bar. Disabled Integrations perform no automatic source collection. Enabled Integrations collect only what their visible or explicitly selected capabilities require.
 
 The product remains passive analytics. A fresher value is never worth noticeable CPU, memory, disk, network, process, or UI cost.
 
 The 2026-08-22 spike conditionally accepted Claude Code and rejected the OpenCode local-server collector after measuring approximately 736 MiB RSS and 66 MiB of initialization writes. Its Grok exclusion was based on the bare method `x.ai/billing`, which is not the ACP wire name. On 2026-09-10, official Grok Build 1.0.25 returned an authentication-required response for `_x.ai/billing` in an isolated environment without a login and valid billing data with CLI-managed authentication. Grok is restored to the development scope through that read-only route. The historical 1.0.5 binary has not been retested with the corrected method, so no claim is made about its support.
 
-Codex Limits reads no Grok credentials or browser sessions, calls no private billing backend directly, and parses no TUI. Claude’s implementation checks and historical Codex-plus-Claude idle comparison remain evidence for their original scope. An eligible Pro/Max Claude observation, a new all-enabled idle comparison covering Grok, provider-owned Grok startup-write measurement, and the eight-hour lifecycle soak remain release work. See [current Grok validation](../research/grok-build-validation-2026-09-10.md) and the [historical validation spike](../research/multi-integration-v1-validation-spikes-2026-08-22.md).
+Codex Limits reads no Grok credentials or browser sessions, calls no private billing backend directly, and parses no TUI. Claude’s implementation checks and historical Codex-plus-Claude idle comparison remain evidence for their original scope. A new all-enabled idle comparison covering Grok, provider-owned Grok startup-write measurement, and the eight-hour lifecycle soak remain release work. The product owner waived the eligible Pro/Max Claude observation for this experimental release; see [ADR-0015](../adr/0015-ship-claude-as-experimental.md). See [current Grok validation](../research/grok-build-validation-2026-09-10.md) and the [historical validation spike](../research/multi-integration-v1-validation-spikes-2026-08-22.md).
 
 ## Confirmed decisions
 
@@ -53,7 +53,7 @@ The contents of `All` and Integration detail views are intentionally fixed in v1
 
 ## Settings and Integration lifecycle
 
-Settings uses one native row per Integration. Each row contains the Integration name, `Beta` when applicable, an actionable readiness state when needed, and its switch. A healthy Integration does not add decorative status copy outside Settings.
+Settings uses one native row per Integration. Each row contains the Integration name, `Experimental` for Claude Code or `Beta` for Grok, an actionable readiness state when needed, and its switch. A healthy Integration does not add decorative status copy outside Settings.
 
 Opening Settings renders cached readiness immediately. Once per Settings presentation, executable existence checks may run sequentially as cheap file metadata reads. Settings does not launch every CLI. Version, authentication, server, or capability probes run only after the user enables that Integration or selects its explicit `Set up`, `Check again`, or `Locate…` action. These probes use the same serialized work coordinator as collection and are cancelled when no longer needed.
 
@@ -255,8 +255,8 @@ The packaged implementation uses a 256 KiB input cap, a 64 KiB cache cap, an ato
 - Accept exact weekly and monthly source period types. Validate supported finite reset timestamps, including fractional seconds and UTC offsets. Retain optional provider-reported `currentPeriod.start` or legacy `billingPeriodStart` only when it is supported, finite, and earlier than reset; a missing start remains absent. Never infer a monthly start from a fixed duration. A valid past reset remains an expired cached observation. Unknown periods, invalid resets, missing configuration, authentication failure, unsupported method, timeout, and incompatible schema have safe distinct errors.
 - Prepaid, on-demand, subscription-tier, and unified-pool fields are optional Account Facts. Missing fields remain absent and never replace the current-period allowance. A shared-pool percentage is not attributed solely to Grok Build.
 - Obtain source version from initialization metadata (`_meta.agentVersion`), without a separate version process on every read. Bound and sanitize optional display strings.
-- Official stable 1.0.25 passed a real authenticated read on 2026-09-10. The probe used 77,578,240 bytes maximum transient child RSS, 0.208 seconds child CPU, 4,349 stdout bytes, and no stderr; wall time including cleanup was 1.984 seconds. No model request was made, and the owned process group stopped with SIGTERM. Live provider-owned initialization writes have not yet been quantified.
-- The complete Grok/Claude history and chart implementation passed the 640-test Release suite on 2026-09-10 with zero failures. This includes source/date validation, bounded journal reads and locks, lifecycle and deletion races, actual-only history, and compatible-observation forecasts. Signed native QA verified both providers’ charts, point selection, zoom, and separate range state using synthetic observations. All-enabled performance/lifecycle gates and an eligible live Claude observation remain separate checks.
+- Official stable 1.0.25 passed a real authenticated read on 2026-09-10. The probe used 77,578,240 bytes maximum transient child RSS, 0.208 seconds child CPU, 4,349 stdout bytes, and no stderr; wall time including cleanup was 1.984 seconds. No model request was made, and the owned process group stopped with SIGTERM. A second live probe sampled 897,024 physical disk-write bytes and 1,552,384 logical-write bytes through the billing response, with no retained files in its temporary working directory; see the validation note for scope.
+- The complete Grok/Claude history and chart implementation passed the 644-test Release suite on 2026-09-10 with zero failures. This includes source/date validation, bounded journal reads and locks, lifecycle and deletion races, actual-only history, and compatible-observation forecasts. Signed native QA verified both providers’ charts, point selection, zoom, and separate range state using synthetic observations. All-enabled performance/lifecycle gates remain separate checks; the eligible live Claude observation is waived for the experimental release.
 
 See [Grok validation and local test steps](../research/grok-build-validation-2026-09-10.md).
 ### OpenCode
@@ -329,15 +329,15 @@ Disabling Codex pauses its account timer, local collection, history exchange, an
 
 ## v1 release boundary and gates
 
-Claude Code and Grok are opt-in `Beta` Integrations in the development build; release acceptance waits for the remaining gates. OpenCode remains deferred. `Beta` appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
+Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release acceptance waits for the remaining gates. OpenCode remains deferred. The maturity label appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
 
 | Release gate | Current evidence | Status |
 |---|---|---|
 | Grok and OpenCode source decision | Grok 1.0.25 accepts correctly prefixed ACP billing with CLI-owned authentication; OpenCode remains excluded by RSS/write budgets | Passed |
 | Bounded Codex history and serialized demand-driven collection | 3,650-day fixture, 32-candidate reconciliation, idle process release, deterministic lifecycle tests | Passed |
 | Claude relay, setup, privacy, deletion, executable selection, and boundary behavior | Packaged helper checks and deterministic Release tests | Passed |
-| All-enabled idle comparison | Historical Codex-plus-Claude comparison passed; repeat with Grok enabled and quantify live provider-owned startup writes for the expanded scope | Pending |
-| Eligible Claude account observation | Requires one user-intended response from a consenting Pro or Max tester | Pending |
+| All-enabled idle comparison | Historical Codex-plus-Claude comparison passed; Grok startup-write counters are measured, but the expanded comparison remains | Pending |
+| Eligible Claude account observation | Product owner waived this check on 2026-09-10 for the experimental Claude Code release; ADR-0015 | Waived |
 | Eight-hour mixed lifecycle soak | Requires the user-confirmed network and sleep/wake cycles defined above | Pending |
 
 `Scripts/validate-release.sh` rejects a release while this document is not exactly `Accepted for v1 implementation`. Passing deterministic tests or the short idle comparison cannot change that status; all Pending rows must have recorded evidence first.
@@ -346,8 +346,8 @@ Implementation progress before release acceptance is:
 
 1. bounded Codex default reader, older-range access, eventual sync, and baseline measurements — implemented and measured on 2026-08-22;
 2. shared Integration state, device-local Settings, menu metric selection, and serialized source work — implemented and deterministically tested on 2026-08-22;
-3. Claude Code allowance, setup, exact disable, and app-owned data deletion — implemented, packaged, and deterministically tested on 2026-08-22; end-to-end eligible-account and lifecycle release checks remain;
-4. Grok billing transport, validated snapshot model, Settings/workspace/menu integration — implemented on 2026-09-10, including retained Grok/Claude history and burndown charts, with a successful compiled collector read and 640 passing Release tests; signed native chart QA passed; expanded performance gates and eligible Claude observation remain;
+3. Claude Code allowance, setup, exact disable, and app-owned data deletion — implemented, packaged, and deterministically tested on 2026-08-22; lifecycle release checks remain; eligible-account validation is waived for the experimental release;
+4. Grok billing transport, validated snapshot model, Settings/workspace/menu integration — implemented on 2026-09-10, including retained Grok/Claude history and burndown charts, with a successful compiled collector read and 644 passing Release tests; signed native chart QA passed; expanded performance gates remain; eligible Claude observation is waived for the experimental release;
 5. OpenCode remains deferred until a supported lighter source passes its gates.
 
 The PRD returns to `Accepted for v1 implementation` only when:

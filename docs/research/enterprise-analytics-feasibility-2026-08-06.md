@@ -1,7 +1,7 @@
 # Enterprise analytics for Codex Limits: feasibility and counterevidence
 
-Date: 2026-08-06  
-Product: `codex-limits`  
+Date: 2026-08-06\
+Product: `codex-limits`\
 Scope: OpenAI/Codex organization analytics, local data collection, competition, privacy, deployment, and pricing
 
 ## Executive verdict
@@ -200,4 +200,3 @@ Build a paid pilot only after all of the following are true:
 Until then, the smallest defensible strategy is:
 
 > full-featured local OSS for developers; no enterprise backend; revisit commercialization only around a proven diagnostic workflow or a separately validated multi-vendor product.
-

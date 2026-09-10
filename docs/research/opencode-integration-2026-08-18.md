@@ -1,7 +1,7 @@
 # OpenCode w Codex Limits: źródło telemetrii, nie jeden vendor
 
-Data researchu i dostępu do źródeł: **2026-08-18**.  
-Zakres wersji: oficjalne docs OpenCode dostępne tego dnia oraz oficjalny release [`v1.18.18`](https://github.com/anomalyco/opencode/releases/tag/v1.18.18) z 2026-08-13.  
+Data researchu i dostępu do źródeł: **2026-08-18**.\
+Zakres wersji: oficjalne docs OpenCode dostępne tego dnia oraz oficjalny release [`v1.18.18`](https://github.com/anomalyco/opencode/releases/tag/v1.18.18) z 2026-08-13.\
 Źródła zewnętrzne w tym dokumencie są wyłącznie pierwotne: dokumentacja i repozytorium OpenCode.
 
 > Aktualizacja runtime 2026-08-22: opis poniżej pozostaje przyszłym kontraktem domenowym, ale rekomendowany collector `opencode serve --pure` został odrzucony po pomiarze około 736 MiB RSS, około 66 MiB zapisów inicjalizacyjnych i stałego portu 4096 mimo żądania portu 0. OpenCode jest odroczony poza v1 do czasu pojawienia się wspieranego, znacznie lżejszego źródła. Zobacz [wyniki walidacji](multi-integration-v1-validation-spikes-2026-08-22.md).

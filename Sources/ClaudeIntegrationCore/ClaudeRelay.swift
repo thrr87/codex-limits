@@ -132,7 +132,8 @@ public enum ClaudeRelay {
     public static func storeIfNewer(
         _ snapshot: ClaudeAllowanceSnapshot,
         at cacheURL: URL,
-        enabledMarkerURL: URL
+        enabledMarkerURL: URL,
+        now: () -> Date = { Date() }
     ) throws -> Bool {
         guard let markerIdentity = enabledMarkerIdentity(at: enabledMarkerURL) else {
             throw ClaudeRelayError.disabled
@@ -141,7 +142,11 @@ public enum ClaudeRelay {
             guard enabledMarkerIdentity(at: enabledMarkerURL) == markerIdentity else {
                 throw ClaudeRelayError.disabled
             }
-            let existing = try? readSnapshot(at: cacheURL)
+            let wallTime = now()
+            guard snapshot.observedAt <= wallTime.addingTimeInterval(AllowanceHistory.maximumObservationClockSkew) else {
+                throw ClaudeRelayError.invalidInput
+            }
+            let existing = try? readSnapshot(at: cacheURL, now: wallTime)
             if let existing {
                 if existing.observedAt >= snapshot.observedAt {
                     return false
@@ -158,7 +163,7 @@ public enum ClaudeRelay {
             do {
                 try AllowanceHistory.append(
                     (existing?.historyObservations ?? []) + snapshot.historyObservations,
-                    in: historyDirectory(for: cacheURL)
+                    in: historyDirectory(for: cacheURL), now: now
                 )
             } catch {
                 historyFailed = true
@@ -223,7 +228,7 @@ public enum ClaudeRelay {
         return values?.fileResourceIdentifier as? NSObject
     }
 
-    public static func readSnapshot(at cacheURL: URL) throws
+    public static func readSnapshot(at cacheURL: URL, now: Date = Date()) throws
         -> ClaudeAllowanceSnapshot {
         let value = try JSONDecoder().decode(
             ClaudeAllowanceSnapshot.self,
@@ -231,6 +236,7 @@ public enum ClaudeRelay {
         )
         guard value.version == 1,
               value.observedAt.timeIntervalSinceReferenceDate.isFinite,
+              value.observedAt <= now.addingTimeInterval(AllowanceHistory.maximumObservationClockSkew),
               value.cliVersion == acceptedVersion(value.cliVersion),
               value.fiveHour != nil || value.sevenDay != nil,
               value.fiveHour.map(isValid) ?? true,

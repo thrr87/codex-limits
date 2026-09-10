@@ -93,6 +93,24 @@ final class AllowanceHistoryTests: XCTestCase {
         XCTAssertThrowsError(try AllowanceHistory.read(in: directory, now: now, since: Date(timeIntervalSince1970: .nan)))
     }
 
+    func testClockRollbackKeepsFutureHistoryButDoesNotSuppressCurrentObservations() throws {
+        let directory = temporaryDirectory().appendingPathComponent("History")
+        let future = point(now.addingTimeInterval(3_600), remaining: 90)
+        let current = point(now, remaining: 70)
+        let delayed = point(now.addingTimeInterval(-120), remaining: 80)
+        try AllowanceHistory.append([future], in: directory, now: { self.now.addingTimeInterval(3_600) })
+        try AllowanceHistory.append([current], in: directory, now: { self.now })
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        let recovered = try Data(contentsOf: file)
+
+        try AllowanceHistory.append([delayed], in: directory, now: { self.now })
+        try AllowanceHistory.append([current, future], in: directory, now: { self.now })
+
+        XCTAssertEqual(try Data(contentsOf: file), recovered, "Delayed writers and retries must remain deduplicated")
+        XCTAssertEqual(try AllowanceHistory.read(in: directory, now: now), [current])
+        XCTAssertEqual(try AllowanceHistory.read(in: directory, now: now.addingTimeInterval(7_200)), [current, future])
+    }
+
     func testContendedDayFileReturnsWithoutAnUnboundedWait() throws {
         let directory = temporaryDirectory().appendingPathComponent("History")
         let first = point(now.addingTimeInterval(-60), remaining: 90)

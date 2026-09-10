@@ -1,7 +1,7 @@
 # xAI / Grok jako vendor w Codex Limits
 
-Data researchu i dostępu do źródeł: **2026-08-18**  
-Zakres: aktualny kontrakt repozytorium, xAI Inference API, Management API, SuperGrok oraz Grok Build CLI  
+Data researchu i dostępu do źródeł: **2026-08-18**\
+Zakres: aktualny kontrakt repozytorium, xAI Inference API, Management API, SuperGrok oraz Grok Build CLI\
 Źródła zewnętrzne: wyłącznie oficjalna dokumentacja xAI i oficjalne repozytorium `xai-org/grok-build`
 
 ## Werdykt

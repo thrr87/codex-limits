@@ -1,8 +1,8 @@
 # Claude Code jako dodatkowy vendor — wykonalność integracji
 
-**Data:** 2026-08-18  
-**Data dostępu do źródeł:** 2026-08-18  
-**Zakres:** aplikacja `codex-limits`, Claude Code CLI, Claude Agent SDK, Claude API oraz administracyjne API Anthropic  
+**Data:** 2026-08-18\
+**Data dostępu do źródeł:** 2026-08-18\
+**Zakres:** aplikacja `codex-limits`, Claude Code CLI, Claude Agent SDK, Claude API oraz administracyjne API Anthropic\
 **Źródła:** wyłącznie oficjalna dokumentacja Anthropic i oficjalne repozytoria Anthropic
 
 > **Status implementacyjny:** ten dokument zachowuje szeroki research wykonalności, ale jego warianty historii, modelu i sesji nie są autoryzacją v1. Normatywny zakres wyznaczają [PRD multi-integracji](../prd/multi-integration-workspace.md) oraz [wyniki spike'ów](multi-integration-v1-validation-spikes-2026-08-22.md): v1 przechowuje tylko ostatni allowlisted snapshot limitów, nie zapisuje modelu ani identyfikatora sesji i modyfikuje wyłącznie user settings po potwierdzeniu.

@@ -36,10 +36,10 @@ if [[ ${1:-} == --self-test ]]; then
         'Status: Accepted for v1 implementation'
     ! is_accepted_multi_integration_status \
         'Status: Needs revision — release gates remain'
-    release_gate_passed 'Eligible Claude account observation' <<< \
-        '| Eligible Claude account observation | Recorded evidence | Passed |'
-    ! release_gate_passed 'Eligible Claude account observation' <<< \
-        '| Eligible Claude account observation | Not run | Pending |'
+    release_gate_passed 'All-enabled idle comparison' <<< \
+        '| All-enabled idle comparison | Recorded evidence | Passed |'
+    ! release_gate_passed 'All-enabled idle comparison' <<< \
+        '| All-enabled idle comparison | Not run | Pending |'
     ! release_gate_passed 'Eight-hour mixed lifecycle soak' <<< \
         '| Another gate | Recorded evidence | Passed |'
     print "Release validator checks passed"
@@ -61,7 +61,6 @@ is_accepted_multi_integration_status "$multi_integration_status" || {
 }
 for gate in \
     'All-enabled idle comparison' \
-    'Eligible Claude account observation' \
     'Eight-hour mixed lifecycle soak'; do
     release_gate_passed "$gate" < "$multi_integration_prd" || {
         print -u2 "Multi-integration release gate is not passed: $gate"

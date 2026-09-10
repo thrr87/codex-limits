@@ -24,7 +24,7 @@
 
 ## What it shows
 
-Codex shows Usage remaining. Codex Limits shows when it resets, how it changed, and which local Tasks this Mac observed. The current development build also includes opt-in Claude Code and Grok Beta Integrations with Usage remaining history. Claude records its seven-day and five-hour allowances during normal activity; Grok records its returned weekly or monthly usage pool. OpenCode remains deferred.
+Codex shows Usage remaining. Codex Limits shows when it resets, how it changed, and which local Tasks this Mac observed. The current development build also includes opt-in Claude Code (Experimental) and Grok (Beta) Integrations with Usage remaining history. Claude records its seven-day and five-hour allowances during normal activity; Grok records its returned weekly or monthly usage pool. OpenCode remains deferred.
 
 Open the menu to see:
 
@@ -33,7 +33,7 @@ Open the menu to see:
 - Account and local token activity.
 - Active time, concurrency, and Usage Receipts for the Task Trees this Mac can read.
 - Checks that run on this Mac and an optional `Analyze with Codex` action.
-- Claude Code's last observed seven-day and five-hour Usage remaining, with recorded history when that Beta Integration is enabled and an eligible Pro or Max account supplies the data.
+- Claude Code's last observed seven-day and five-hour Usage remaining, with recorded history when that Experimental Integration is enabled and an eligible Pro or Max account supplies the data.
 - Grok Usage remaining, recorded history, its reset, and available plan, prepaid, and pay-as-you-go facts when Grok Beta is enabled.
 
 Choose `All` for compact current-window charts beside each Integration’s remaining allowance and reset. Blue shows recorded usage remaining; the green dashed line shows the target. Select a row to open its detail.
@@ -154,7 +154,7 @@ For a local Grok check, build and open the app, enable `Grok` in Settings, and s
 
 ## Current limitations
 
-- Multi-integration release acceptance remains pending: the all-enabled idle comparison, eligible Claude observation, and eight-hour lifecycle soak are incomplete. Local development testing can proceed.
+- Multi-integration release acceptance remains pending: the all-enabled idle comparison and eight-hour lifecycle soak are incomplete. The live Claude observation is explicitly waived for the Experimental Integration. Local development testing can proceed.
 - Claude and Grok sources do not provide a stable account identity. Their histories describe this local installation, do not sync, and cannot reconstruct usage from before observations were recorded.
 
 - Existing 0.2.6 and older installations require one final manual update to a version that includes the in-app updater.

@@ -56,7 +56,7 @@ Use only the state that tells the user what can happen next:
 - `Update required` — the installed CLI cannot provide the accepted source contract.
 - A provider-specific error such as `Billing unavailable` — a shipped supported source failed and the user can retry or change setup. Do not expose errors for deferred Integrations.
 
-Use `Last observed` for Claude Code and any other event-driven source. Use `Stale` only after the source-specific Freshness window and before the same known reset. Use `Expired` internally; reader copy should say `New usage observation needed` rather than exposing the implementation term. Use `Beta` in Settings and the Integration detail header, not beside every value.
+Use `Last observed` for Claude Code and any other event-driven source. Use `Stale` only after the source-specific Freshness window and before the same known reset. Use `Expired` internally; reader copy should say `New usage observation needed` rather than exposing the implementation term. Use `Experimental` for Claude Code and `Beta` for Grok in Settings and the Integration detail header, not beside every value.
 
 ## Menu bar metric labels
 

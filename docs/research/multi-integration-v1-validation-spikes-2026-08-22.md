@@ -2,7 +2,7 @@
 
 > **Correction — 2026-09-10:** The Grok exclusion and Grok-specific no-source claims below are superseded. The August probe used bare `x.ai/billing`; ACP requires `_x.ai/billing` on the wire. Official stable 1.0.25 passed a real authenticated read with the corrected method. The historical 1.0.5 prefix case remains untested. Grok is now a development Beta; OpenCode remains deferred. The original Codex-plus-Claude idle result does not cover Grok, and the expanded all-enabled comparison, provider-owned Grok write measurement, eligible Claude observation, and eight-hour soak remain release work. See [current Grok validation](grok-build-validation-2026-09-10.md). Original evidence follows unchanged.
 
-Date: 2026-08-22  
+Date: 2026-08-22\
 Status: Completed for this machine; Claude release gates remain
 
 ## Purpose

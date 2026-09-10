@@ -148,6 +148,33 @@ enum UsageHistoryPolicy {
     static let tightBoundary: TimeInterval = 15 * 60
     static let maximumComparableGap: TimeInterval = 30 * 60
 
+    static func aligningWindowResets(
+        _ samples: [UsageSample],
+        currentReset: Date?
+    ) -> [UsageSample] {
+        var anchors = currentReset.map { [$0] } ?? []
+        var aligned: [Date: Date] = [:]
+        for sample in samples.sorted(by: { $0.observedAt > $1.observedAt })
+        where aligned[sample.resetsAt] == nil {
+            let anchor = anchors.first {
+                abs($0.timeIntervalSince(sample.resetsAt)) <= tightBoundary
+            } ?? sample.resetsAt
+            aligned[sample.resetsAt] = anchor
+            if anchor == sample.resetsAt { anchors.append(anchor) }
+        }
+        return samples.map { sample in
+            guard let reset = aligned[sample.resetsAt],
+                  reset != sample.resetsAt else { return sample }
+            return UsageSample(
+                observedAt: sample.observedAt,
+                remainingPercent: sample.remainingPercent,
+                resetsAt: reset,
+                lifetimeTokens: sample.lifetimeTokens,
+                comparisonBreak: sample.comparisonBreak
+            )
+        }
+    }
+
     static func segments(
         _ samples: [UsageSample]
     ) -> [[UsageSample]] {

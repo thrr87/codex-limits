@@ -68,6 +68,17 @@ final class ClaudeCodeSetupServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.displayFreshness(now: now), .stale)
     }
 
+    func testClockRollbackMarksFutureClaudeObservationStale() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let snapshot = ClaudeAllowanceSnapshot(
+            observedAt: now.addingTimeInterval(3_600), cliVersion: "2.1.92", fiveHour: nil,
+            sevenDay: ClaudeAllowanceWindowSnapshot(remainingPercent: 70, resetsAt: now.addingTimeInterval(86_400))
+        )
+        XCTAssertEqual(snapshot.displayFreshness(now: now), .stale)
+        XCTAssertEqual(snapshot.displayFreshness(now: now.addingTimeInterval(3_540)), .fresh)
+        XCTAssertEqual(snapshot.displayFreshness(now: now.addingTimeInterval(3_660)), .fresh)
+    }
+
     @MainActor
     func testDisableSuppressesAnInFlightReadinessResult() async throws {
         let fixture = try fixture(settings: [

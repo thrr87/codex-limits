@@ -1,6 +1,6 @@
 # Codex Limits a metoda multi-provider z CodexBar
 
-Data badania: 2026-08-21  
+Data badania: 2026-08-21\
 Zakres: porównanie architektury, kontraktów, kolejności prób, transportu, obsługi poświadczeń, normalizacji, odświeżania i błędów. To nie jest analiza ani propozycja kopiowania kodu CodexBar.
 
 > Aktualizacja runtime 2026-08-22: późniejszy spike potwierdził granicę zaufania rekomendowaną w tym dokumencie, ale odrzucił dwa pierwotne źródła v1. Grok Build stable 1.0.5 zwraca `-32601 Method not found` dla `x.ai/billing` przez zewnętrzne ACP, a OpenCode `serve --pure` nie mieści się w budżecie pamięci i zapisów. Codex Limits nie przejmuje fallbacków CodexBar opartych na credentials, cookies ani prywatnych backendach, więc Grok i OpenCode są odroczone. Zobacz [wyniki walidacji](multi-integration-v1-validation-spikes-2026-08-22.md).
@@ -217,6 +217,6 @@ Implementacja powinna powstać jako niezależny projekt kontraktów na podstawie
 
 CodexBar potwierdza, że multi-provider jest wykonalny i że dobrym rdzeniem jest **uporządkowany łańcuch źródeł normalizujących się do jednej migawki**. Nie potwierdza natomiast, że wszystkie jego źródła są odpowiednie dla Codex Limits. Obecna metoda Codex Limits jest bardziej konserwatywna, łatwiejsza do obrony prywatnościowo i powinna stać się wzorcem zaufania dla kolejnych integracji.
 
-Najłatwiejsze: opakowanie Codex, wspólny stan per integracja, Claude przez jawny `statusLine` oraz lokalna aktywność OpenCode przez `opencode serve`.  
-Umiarkowane: Grok jako beta przez oficjalne ACP z wykrywaniem capability.  
+Najłatwiejsze: opakowanie Codex, wspólny stan per integracja, Claude przez jawny `statusLine` oraz lokalna aktywność OpenCode przez `opencode serve`.\
+Umiarkowane: Grok jako beta przez oficjalne ACP z wykrywaniem capability.\
 Najtrudniejsze i niewarte v1: prywatne limity OpenCode oraz wszelkie fallbacki wymagające przejmowania tokenów/cookies.

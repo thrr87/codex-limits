@@ -2,7 +2,7 @@
 
 > **Correction — 2026-09-10:** The source-exclusion conclusion below is superseded. The probe used bare `x.ai/billing`; ACP requires `_x.ai/billing` on the JSON-RPC wire. Official stable 1.0.25 accepts the corrected method and passed a real authenticated read. The historical 1.0.5 binary has not been retested with the prefix, so its billing capability remains unproven. Grok is restored as a development Beta; expanded release checks remain pending. See [current validation](grok-build-validation-2026-09-10.md). The original observations and interpretation are retained below as historical evidence.
 
-Date: 2026-08-22  
+Date: 2026-08-22\
 Status: Stable 1.0.5 external collector rejected for v1
 
 ## Verdict

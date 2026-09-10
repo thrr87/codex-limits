@@ -162,11 +162,11 @@ struct MenuContentView: View {
         }
     }
 
-    private func integrationHeader(_ name: String, beta: Bool = false) -> some View {
+    private func integrationHeader(_ name: String, maturity: String? = nil) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text(name).font(.title2.weight(.semibold))
-            if beta {
-                Text("Beta").font(.caption).foregroundStyle(.secondary)
+            if let maturity {
+                Text(maturity).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             if name == "Codex" {
@@ -311,7 +311,7 @@ struct MenuContentView: View {
 
     private var claudeCodeWorkspace: some View {
         VStack(spacing: 0) {
-            integrationHeader("Claude Code", beta: true)
+            integrationHeader("Claude Code", maturity: "Experimental")
 
             Divider()
 
@@ -333,7 +333,7 @@ struct MenuContentView: View {
 
     private var grokWorkspace: some View {
         VStack(spacing: 0) {
-            integrationHeader("Grok", beta: true)
+            integrationHeader("Grok", maturity: "Beta")
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {

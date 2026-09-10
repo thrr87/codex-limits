@@ -2394,6 +2394,36 @@ final class UsageIntelligenceEngineTests: XCTestCase {
         )
     }
 
+    func testResetTimeJitterDoesNotCreateASecondAllowanceWindow() {
+        let now = Date(timeIntervalSince1970: 6_400_000)
+        let account = makeSnapshot(remaining: 34, fetchedAt: now)
+        let reset = account.mainLimit!.window.resetsAt
+        let reader = UsageIntelligenceEngine.evaluate(
+            UsageIntelligenceInput(
+                account: account,
+                samples: [
+                    UsageSample(
+                        observedAt: now.addingTimeInterval(-3 * 86_400),
+                        remainingPercent: 70,
+                        resetsAt: reset.addingTimeInterval(1)
+                    ),
+                    UsageSample(
+                        observedAt: now.addingTimeInterval(-60),
+                        remainingPercent: 34,
+                        resetsAt: reset.addingTimeInterval(1)
+                    )
+                ],
+                safetyBuffer: 3,
+                sourceState: .available,
+                now: now,
+                previousStatus: nil
+            )
+        )
+
+        XCTAssertEqual(reader.chart.allowanceWindows.count, 1)
+        XCTAssertEqual(reader.chart.observed.count, 3)
+    }
+
     func testAccountEpochDoesNotHideStoredChartPoints() {
         let now = Date(timeIntervalSince1970: 6_400_000)
         let account = makeSnapshot(remaining: 70, fetchedAt: now)

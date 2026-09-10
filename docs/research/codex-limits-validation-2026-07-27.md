@@ -1,8 +1,8 @@
 # Codex limits after GPT‑5.6: validation, counterevidence, and shipping decisions
 
-Date: 2026-07-27  
-Observation window: 2026-07-09–2026-07-27  
-Companion to: [codex-limits-user-research-2026-07-27.md](./codex-limits-user-research-2026-07-27.md)  
+Date: 2026-07-27\
+Observation window: 2026-07-09–2026-07-27\
+Companion to: [codex-limits-user-research-2026-07-27.md](./codex-limits-user-research-2026-07-27.md)\
 Product: `codex-limits`
 
 ## Executive verdict
@@ -604,53 +604,53 @@ The product should help users test these hypotheses against their own history wi
 
 These questions should be resolved one at a time. The recommended defaults preserve the high-confidence product while keeping uncertain analytics reversible.
 
-1. **Product center — resolved:** how should glanceable decisions and power analytics be divided?  
+1. **Product center — resolved:** how should glanceable decisions and power analytics be divided?\
    **Decision:** opening the menu-bar item presents one screen-aware, scrollable Analytics Workspace. A compact current-state header stays visible above switchable `Graphs`, `Facts`, and `Insights` views. `Graphs` switches between `Usage remaining`, `Token activity`, `Usage per token`, and `Concurrency`; `Facts` holds account facts, reset details, Other limits, and Usage Receipts.
-2. **Hours-based metrics — resolved:** what should measured and forecast time mean?  
+2. **Hours-based metrics — resolved:** what should measured and forecast time mean?\
    **Decision:** `Active time this week` is observed local time in the current Allowance Window, with overlapping Task Tree activity counted once. `Estimated active time available` is a range based on recent comparable work and appears only with high enough Local Coverage. Never use `runtime/week` or imply a fixed hours entitlement.
-3. **Reminder default — resolved:** what should happen when a reset first becomes observable?  
+3. **Reminder default — resolved:** what should happen when a reset first becomes observable?\
    **Decision:** reminders remain off until enabled. Once enabled, schedule one notification with a default Reminder Lead Time of 24 hours; the user can select another interval.
-4. **Missing expiry detail — resolved:** how visible should incomplete backend detail be?  
+4. **Missing expiry detail — resolved:** how visible should incomplete backend detail be?\
    **Decision:** show a short Reset Detail Coverage label next to the authoritative count, such as `3 banked resets · 1 expiry known`. Use `Next known expiry` for partial detail and `Expiry dates unavailable` when no expiry is known.
-5. **Local diagnostics — resolved:** what is the consent boundary?  
+5. **Local diagnostics — resolved:** what is the consent boundary?\
    **Decision:** Codex information already accessible on the machine can be analyzed without a separate analytics opt-in, but all Codex-derived data, computation, and derived history remain local and are not transmitted as product telemetry.
-6. **Project identity — resolved:** how should work be grouped and named?  
+6. **Project identity — resolved:** how should work be grouped and named?\
    **Decision:** reuse the hierarchy already presented by Codex and show its short folder or project name. Do not create aliases, infer another hierarchy, or rename Codex projects.
-7. **Mutation boundary — resolved:** may the app change Codex state?  
+7. **Mutation boundary — resolved:** may the app change Codex state?\
    **Decision:** no. It reads, calculates, shows, reminds, and analyzes on request without redeeming resets, changing settings, or controlling tasks. `Reset Reminder` replaces the rejected Reset Automation and never changes account state.
-8. **Usage deviation posture — resolved:** should unusual burn trigger notifications?  
+8. **Usage deviation posture — resolved:** should unusual burn trigger notifications?\
    **Decision:** no. Show a Usage Deviation as a passive Insight with its evidence, comparison period, Coverage, and Confidence. Do not send anomaly notifications or claim a cause.
-9. **Canonical orientation — resolved:** should allowance be shown as used or remaining?  
+9. **Canonical orientation — resolved:** should allowance be shown as used or remaining?\
    **Decision:** use Codex’s reader-facing label `Usage remaining` for every primary percentage and burn-down orientation. Consumption metrics may use `used` only when the label names the quantity explicitly.
-10. **Test seam — resolved:** what unit should own the intelligence logic?  
+10. **Test seam — resolved:** what unit should own the intelligence logic?\
     **Decision:** one pure `UsageIntelligenceEngine` transforms normalized account events, local activity events, settings, and `now` into the complete reader-facing snapshot. Source adapters only read and normalize data. SwiftUI only renders the snapshot. Test adapters against protocol fixtures and test forecasts, reset segmentation, coverage, reconciliation, confidence, and copy-driving states through the engine.
-11. **Codex-assisted trigger — resolved:** may model-assisted analysis run automatically?  
+11. **Codex-assisted trigger — resolved:** may model-assisted analysis run automatically?\
     **Decision:** no. It is a separately labeled, user-initiated `Analyze with Codex` action with an information tip explaining that it sends a request to Codex and consumes allowance.
-12. **Codex-assisted preflight — resolved:** when is an additional confirmation required?  
+12. **Codex-assisted preflight — resolved:** when is an additional confirmation required?\
     **Decision:** Metadata-only Analysis starts directly from the explicit action. Source-backed Analysis first shows a short preflight listing the content categories that will be sent to Codex.
-13. **Codex-assisted execution profile — resolved:** which model performs the default analysis?  
+13. **Codex-assisted execution profile — resolved:** which model performs the default analysis?\
     **Decision:** show the feature only when `model/list` advertises the exact GPT-5.6 Luna Medium profile. Do not fall back to GPT-5.5 Medium, Terra, Sol, another reasoning level, or the analyzed Task model. A stronger retry requires a separate user action and an explicitly available profile.
-14. **Comparable workload baseline — resolved:** what historical period anchors the comparison?  
+14. **Comparable workload baseline — resolved:** what historical period anchors the comparison?\
     **Decision:** the median of exactly four previous complete High-comparability weekly windows, with the option to pin another qualifying historical period. Partial observations remain factual but enter comparison only when the Coverage, comparability, boundary, and workload-mix gates in `docs/MEASUREMENT-CONTRACT.md` pass.
-15. **Canonical token totals — resolved:** which token source leads the weekly view?  
+15. **Canonical token totals — resolved:** which token source leads the weekly view?\
     **Decision:** Account Token Activity is the primary weekly total. Prefer a same-account lifetime-token delta across a bounded weekly interval. Calendar-day buckets remain factual, but a partial-day sum never becomes an exact weekly total. Local Token Activity provides Task, agent, and model breakdowns. When compatible interval and token definitions are proven, the product shows both and reports Local Coverage rather than silently merging them.
-16. **Product language — resolved:** how should reader-facing copy be written?  
+16. **Product language — resolved:** how should reader-facing copy be written?\
     **Decision:** follow Orwell’s six rules: use literal, short, necessary, active, everyday language and break a rule only to avoid harsh, false, or unclear text. Product-specific examples live in `docs/PRODUCT-LANGUAGE.md`.
-17. **Usage receipt unit — resolved:** what defines one receipt?  
+17. **Usage receipt unit — resolved:** what defines one receipt?\
     **Decision:** one Task Tree: the root Codex Task and every observable descendant agent task. The receipt totals the tree and drills down to agents and turns; projects group Tasks but do not define receipt boundaries.
-18. **Analytics history retention — resolved:** how long should Derived Records remain on the machine?  
+18. **Analytics history retention — resolved:** how long should Derived Records remain on the machine?\
     **Decision:** keep Analytics History without a time limit until the user deletes it. Do not copy Source Content into the history. `Delete analytics history` removes the whole Codex Limits history on the Mac and in the selected sync folder. It does not rebuild automatically; a separate explicit action can rebuild only what remains available from Codex sources.
-19. **PRD scope — resolved:** should advanced analytics be deferred to a later product phase?  
+19. **PRD scope — resolved:** should advanced analytics be deferred to a later product phase?\
     **Decision:** no. The PRD covers the complete Analytics Workspace, including comparable-workload analysis, Active Time, Concurrency, deep local diagnostics, and user-initiated Codex-assisted Insights alongside the high-confidence allowance and reset features.
-20. **Primary allowance window — resolved:** which account window anchors the product?  
+20. **Primary allowance window — resolved:** which account window anchors the product?\
     **Decision:** the `10080`-minute weekly window owns the menu-bar percentage, header, Runway, Suggested Pace, and default Usage remaining graph. Five-hour and model-specific windows stay named Other limits and never replace a missing weekly window.
-21. **Measurement contract — resolved:** when may the product show Coverage, Confidence, or a comparison?  
+21. **Measurement contract — resolved:** when may the product show Coverage, Confidence, or a comparison?\
     **Decision:** use the shared thresholds, interval boundaries, workload-mix gates, account partitioning, and withholding rules in `docs/MEASUREMENT-CONTRACT.md`. Low-confidence conclusions remain hidden with a reason.
-22. **Local source boundary — resolved:** may a second app-server observe another Codex process by assumption?  
+22. **Local source boundary — resolved:** may a second app-server observe another Codex process by assumption?\
     **Decision:** no. A technical spike must prove the safest read-only, incremental source before Local Token Activity implementation. The app never resumes or takes ownership of a user Task merely to observe it.
-23. **Account facts — resolved:** which factual account context belongs in Token activity and Facts?  
+23. **Account facts — resolved:** which factual account context belongs in Token activity and Facts?\
     **Decision:** show available lifetime tokens, peak daily tokens, longest running turn, current and longest streak, credits, unlimited-credit state, and spend-control state. Missing fields do not invalidate present facts.
-24. **History deletion across sync — resolved:** how does deletion stay final when another Mac is offline?  
+24. **History deletion across sync — resolved:** how does deletion stay final when another Mac is offline?\
     **Decision:** advance an empty sync generation, block older imports, and keep deletion pending if the folder is unavailable. Preserve settings and do not claim completion until supported stores are cleared.
 
 ## Final assessment

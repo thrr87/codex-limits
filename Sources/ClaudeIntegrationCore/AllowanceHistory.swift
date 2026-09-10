@@ -64,11 +64,13 @@ public enum AllowanceHistory {
     public static let maximumReadBytes = 32 * 1_024 * 1_024
     public static let maximumRecordBytes = 512
     public static let maximumReadRecords = 200_000
+    public static let maximumObservationClockSkew: TimeInterval = 60
     private static let maximumAppendRecords = 64
 
     public static func append(
         _ observations: [AllowanceObservation],
-        in directory: URL
+        in directory: URL,
+        now: () -> Date = { Date() }
     ) throws {
         guard observations.count <= maximumAppendRecords else {
             throw AllowanceHistoryError.invalidRecord
@@ -87,7 +89,7 @@ public enum AllowanceHistory {
         )
         let days = Dictionary(grouping: observations, by: { dayName($0.observedAt) })
         for day in days.keys.sorted() {
-            try appendDay(days[day]!.sorted(by: ordered), to: directory.appendingPathComponent(day))
+            try appendDay(days[day]!.sorted(by: ordered), to: directory.appendingPathComponent(day), now: now)
         }
     }
 
@@ -156,7 +158,7 @@ public enum AllowanceHistory {
         }
     }
 
-    private static func appendDay(_ observations: [AllowanceObservation], to url: URL) throws {
+    private static func appendDay(_ observations: [AllowanceObservation], to url: URL, now: () -> Date) throws {
         let descriptor = open(url.path, O_CREAT | O_RDWR | O_APPEND, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         defer { close(descriptor) }
@@ -200,7 +202,11 @@ public enum AllowanceHistory {
             throw AllowanceHistoryError.invalidRecord
         }
         var seen = Set(recent)
-        var latest = Dictionary(grouping: recent, by: \.metric).mapValues {
+        // Read the wall clock after acquiring the lock: queued writers may wait
+        // while a newer observation is committed. Future records from a clock
+        // rollback remain on disk but cannot suppress current observations.
+        let latestAcceptedTime = now().addingTimeInterval(maximumObservationClockSkew)
+        var latest = Dictionary(grouping: recent.filter { $0.observedAt <= latestAcceptedTime }, by: \.metric).mapValues {
             $0.map(\.observedAt).max()!
         }
         // ponytail: ordered sources need only bounded-tail retry deduplication;

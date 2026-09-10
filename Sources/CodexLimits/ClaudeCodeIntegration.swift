@@ -987,7 +987,7 @@ extension ClaudeAllowanceSnapshot {
            primaryReset <= now {
             return .expired
         }
-        return now.timeIntervalSince(observedAt) <= 30 * 60
+        return (-AllowanceHistory.maximumObservationClockSkew ... 30 * 60).contains(now.timeIntervalSince(observedAt))
             ? .fresh
             : .stale
     }
