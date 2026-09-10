@@ -85,7 +85,7 @@ Claude and Grok charts show actual observations recorded on this Mac. They start
 
 1. Codex Limits starts your installed Codex CLI and reads account data through its local app server when Codex has demand.
 2. It reads local Codex records without taking control of a Task.
-3. If you explicitly set up Claude Code Beta, Claude Code sends bounded allowance fields to a short-lived local helper during normal Claude activity; Codex Limits does not prompt Claude or poll it.
+3. If you explicitly set up Claude Code Experimental, Claude Code sends bounded allowance fields to a short-lived local helper during normal Claude activity; Codex Limits does not prompt Claude or poll it.
 4. If you enable Grok Beta, the app reads billing through your official Grok Build CLI. The CLI manages its own login and service connection; no prompt or coding session is created.
 5. It stores compact history files on your Mac and keeps each Codex account separate. Claude and Grok each retain their own local observation history until you delete it; their active charts read a bounded view of the latest 84 days.
 6. It uses those sources to make provider-specific cards without combining their allowances.
@@ -121,7 +121,7 @@ Do not attach raw CLI output or screenshots containing account usage to public i
 - macOS 14 or later
 - Xcode 16.4 or later
 - A signed-in standalone Codex CLI to use the Codex Integration. Known Homebrew and native installer locations are detected, and Settings offers `Locate…` for another executable path.
-- Claude Code is optional. Its Beta allowance card requires explicit setup and an eligible Pro or Max account; Free can run Claude Code but does not provide the required allowance fields.
+- Claude Code is optional. Its Experimental allowance card requires explicit setup and an eligible Pro or Max account; Free can run Claude Code but does not provide the required allowance fields.
 - Grok Build is optional. Its Beta allowance card requires a compatible official CLI and a Grok login with available allowance data. Version 1.0.25 passed a real billing read on 2026-09-10.
 
 Codex Limits does not use a Codex binary bundled with another app. Install and update each standalone CLI yourself. OpenCode is not included in v1.
