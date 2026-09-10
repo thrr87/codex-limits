@@ -494,7 +494,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
         let preparation = Task {
             await store.prepareSourceAnalysis(selection: selection)
         }
-        await Task.yield()
+        while !(await reader.isPreparing) { await Task.yield() }
         store.invalidateSourcePreflight(
             for: CodexSourceSelection(
                 interval: DateInterval(
@@ -506,6 +506,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
                 projectLabel: selection.projectLabel
             )
         )
+        await reader.resume()
         await preparation.value
 
         XCTAssertNil(store.sourcePreflight)
@@ -529,7 +530,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
         let preparation = Task {
             await store.prepareSourceAnalysis(selection: selection)
         }
-        try? await Task.sleep(for: .milliseconds(20))
+        while !(await reader.isPreparing) { await Task.yield() }
         store.cancelSourcePreflight()
         await preparation.value
 
@@ -749,7 +750,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
                 eligibleProfile(effort: "medium"),
                 eligibleProfile(effort: "medium")
             ],
-            delayedPrimaryCalls: [2]
+            heldPrimaryCalls: [2]
         )
         let store = CodexAssistedInsightStore(
             service: service,
@@ -773,8 +774,9 @@ final class CodexSourceAnalysisTests: XCTestCase {
                 categories: [.prompts]
             )
         }
-        try? await Task.sleep(for: .milliseconds(20))
+        while !(await service.isPrimaryCheckHeld) { await Task.yield() }
         store.invalidateSourcePreflight(for: changed(selection))
+        await service.resumePrimaryCheck()
 
         let started = await start.value
         let calls = await service.sourceCalls()
@@ -791,7 +793,7 @@ final class CodexSourceAnalysisTests: XCTestCase {
                 eligibleProfile(effort: "medium")
             ],
             strongerProfile: eligibleProfile(effort: "high"),
-            delayedPrimaryCalls: [3]
+            heldPrimaryCalls: [3]
         )
         let store = CodexAssistedInsightStore(
             service: service,
@@ -817,8 +819,9 @@ final class CodexSourceAnalysisTests: XCTestCase {
         let retry = Task {
             await store.retrySourceWithStrongerProfile()
         }
-        try? await Task.sleep(for: .milliseconds(20))
+        while !(await service.isPrimaryCheckHeld) { await Task.yield() }
         store.invalidateSourcePreflight(for: changed(selection))
+        await service.resumePrimaryCheck()
 
         let retried = await retry.value
         let calls = await service.sourceCalls()
@@ -1219,6 +1222,8 @@ private actor SourceReaderFixture: CodexSourceContentReading {
 
 private actor DelayedSourceReaderFixture: CodexSourceContentReading {
     let draft: CodexSourceContentDraft
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isPreparing: Bool { continuation != nil }
 
     init(draft: CodexSourceContentDraft) {
         self.draft = draft
@@ -1227,14 +1232,21 @@ private actor DelayedSourceReaderFixture: CodexSourceContentReading {
     func prepare(
         selection _: CodexSourceSelection
     ) async throws -> CodexSourceContentDraft {
-        try await Task.sleep(for: .milliseconds(30))
+        await withCheckedContinuation { continuation = $0 }
         return draft
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 
 private actor CancellableSourceReaderFixture: CodexSourceContentReading {
     let draft: CodexSourceContentDraft
     private var cancelled = false
+    private var continuation: CheckedContinuation<Void, Error>?
+    var isPreparing: Bool { continuation != nil }
 
     init(draft: CodexSourceContentDraft) {
         self.draft = draft
@@ -1244,7 +1256,11 @@ private actor CancellableSourceReaderFixture: CodexSourceContentReading {
         selection _: CodexSourceSelection
     ) async throws -> CodexSourceContentDraft {
         do {
-            try await Task.sleep(for: .seconds(1))
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation = $0 }
+            } onCancel: {
+                Task { await self.cancel() }
+            }
             return draft
         } catch {
             cancelled = true
@@ -1254,6 +1270,11 @@ private actor CancellableSourceReaderFixture: CodexSourceContentReading {
 
     func wasCancelled() -> Bool {
         cancelled
+    }
+
+    private func cancel() {
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
     }
 }
 
@@ -1267,8 +1288,10 @@ private actor SourceAnalysisServiceFixture: CodexAssistedInsightServicing {
     private var primaryProfiles: [CodexAssistedModelProfile?]
     private let advertisedStrongerProfile: CodexAssistedModelProfile?
     private let sourceOutcome: CodexAssistedAnalysisOutcome
-    private let delayedPrimaryCalls: Set<Int>
+    private let heldPrimaryCalls: Set<Int>
     private var primaryCallCount = 0
+    private var primaryCheck: CheckedContinuation<Void, Never>?
+    var isPrimaryCheckHeld: Bool { primaryCheck != nil }
 
     init(
         primaryProfiles: [CodexAssistedModelProfile?] = [
@@ -1279,7 +1302,7 @@ private actor SourceAnalysisServiceFixture: CodexAssistedInsightServicing {
             )
         ],
         strongerProfile: CodexAssistedModelProfile? = nil,
-        delayedPrimaryCalls: Set<Int> = [],
+        heldPrimaryCalls: Set<Int> = [],
         sourceOutcome: CodexAssistedAnalysisOutcome = .failed(
             CodexAnalyticsOverhead(
                 durationSeconds: 0,
@@ -1289,14 +1312,14 @@ private actor SourceAnalysisServiceFixture: CodexAssistedInsightServicing {
     ) {
         self.primaryProfiles = primaryProfiles
         advertisedStrongerProfile = strongerProfile
-        self.delayedPrimaryCalls = delayedPrimaryCalls
+        self.heldPrimaryCalls = heldPrimaryCalls
         self.sourceOutcome = sourceOutcome
     }
 
     func eligibleProfile() async throws -> CodexAssistedModelProfile? {
         primaryCallCount += 1
-        if delayedPrimaryCalls.contains(primaryCallCount) {
-            try await Task.sleep(for: .milliseconds(80))
+        if heldPrimaryCalls.contains(primaryCallCount) {
+            await withCheckedContinuation { primaryCheck = $0 }
         }
         guard !primaryProfiles.isEmpty else { return nil }
         return primaryProfiles.count == 1
@@ -1306,6 +1329,11 @@ private actor SourceAnalysisServiceFixture: CodexAssistedInsightServicing {
 
     func eligibleStrongerProfile() async throws -> CodexAssistedModelProfile? {
         advertisedStrongerProfile
+    }
+
+    func resumePrimaryCheck() {
+        primaryCheck?.resume()
+        primaryCheck = nil
     }
 
     func analyze(
