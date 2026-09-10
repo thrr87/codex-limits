@@ -31,24 +31,24 @@ release_gate_accepted() {
 
 if [[ ${1:-} == --self-test ]]; then
     is_newer_than 0.2.7 0.2.6
-    ! is_newer_than 0.2.7 0.2.7
-    ! is_newer_than 0.2.7 0.2.8
+    ! is_newer_than 0.2.7 0.2.7 || exit 1
+    ! is_newer_than 0.2.7 0.2.8 || exit 1
     is_accepted_multi_integration_status \
         'Status: Accepted for v1 implementation'
     ! is_accepted_multi_integration_status \
-        'Status: Needs revision — release gates remain'
+        'Status: Needs revision — release gates remain' || exit 1
     release_gate_accepted 'All-enabled idle comparison' 0.3.0 <<< \
         '| All-enabled idle comparison | Recorded evidence | Passed |'
     ! release_gate_accepted 'All-enabled idle comparison' 0.3.0 <<< \
-        '| All-enabled idle comparison | Not run | Pending |'
+        '| All-enabled idle comparison | Not run | Pending |' || exit 1
     ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
-        '| Another gate | Recorded evidence | Passed |'
+        '| Another gate | Recorded evidence | Passed |' || exit 1
     release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
         '| Eight-hour mixed lifecycle soak | Owner decision | Waived for 0.3.0 |'
     ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.1 <<< \
-        '| Eight-hour mixed lifecycle soak | Owner decision | Waived for 0.3.0 |'
+        '| Eight-hour mixed lifecycle soak | Owner decision | Waived for 0.3.0 |' || exit 1
     ! release_gate_accepted 'Eight-hour mixed lifecycle soak' 0.3.0 <<< \
-        '| Eight-hour mixed lifecycle soak | Unscoped exception | Waived |'
+        '| Eight-hour mixed lifecycle soak | Unscoped exception | Waived |' || exit 1
     print "Release validator checks passed"
     exit
 fi
