@@ -180,8 +180,8 @@ final class GrokBillingClientTests: XCTestCase {
             let executable = try script(in: directory, body: """
             /bin/sleep 60 &
             child=$!
-            printf '%s %s\\n' "$$" "$child" > '\(record.path)'
             trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM
+            printf '%s %s\\n' "$$" "$child" > '\(record.path)'
             wait "$child"
             """)
             let started = Date()
@@ -206,8 +206,15 @@ final class GrokBillingClientTests: XCTestCase {
             let pids = try String(contentsOf: record).split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
             XCTAssertEqual(pids.count, 2)
             for pid in pids {
-                XCTAssertEqual(kill(pid, 0), -1)
-                XCTAssertEqual(errno, ESRCH)
+                // The kernel can reap a killed descendant after its parent exits.
+                let deadline = ProcessInfo.processInfo.systemUptime + 1
+                while kill(pid, 0) == 0, ProcessInfo.processInfo.systemUptime < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let result = kill(pid, 0)
+                let processError = errno
+                XCTAssertEqual(result, -1)
+                XCTAssertEqual(processError, ESRCH)
             }
         }
     }
