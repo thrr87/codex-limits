@@ -325,7 +325,8 @@ struct MenuContentView: View {
 
     private var grokOverviewPrimary: String {
         if let snapshot = grok.currentSnapshot {
-            return "Usage remaining · \(Int(snapshot.remainingPercent.rounded()))%"
+            return snapshot.remainingPercent.map { "Usage remaining · \(Int($0.rounded()))%" }
+                ?? "Usage percentage unavailable"
         }
         if grok.snapshot != nil { return "New usage observation needed" }
         return grok.isRefreshing ? "Checking" : "Usage is not available"
@@ -347,17 +348,21 @@ struct MenuContentView: View {
                             Text("Shared across Grok products.")
                                 .font(.callout).foregroundStyle(.secondary)
                         }
+                        if snapshot.remainingPercent == nil {
+                            Text("Grok hasn’t reported a usage percentage for this period.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
                     }
                     IntegrationUsageRemainingView(
                         title: "Usage remaining",
-                        metric: grok.snapshot?.historyObservation.metric ?? grok.history.last?.metric ?? "grok-weekly",
+                        metric: grok.snapshot?.historyMetric ?? grok.history.last?.metric ?? "grok-weekly",
                         observations: grok.history,
                         current: grok.snapshot?.historyObservation,
                         now: grok.displayNow,
                         isStale: grok.isStale,
                         defaults: chartDefaults
                     )
-                    .id(grok.snapshot?.historyObservation.metric ?? grok.history.last?.metric)
+                    .id(grok.snapshot?.historyMetric ?? grok.history.last?.metric)
                     if let snapshot = grok.snapshot {
                         if let plan = snapshot.subscriptionTier {
                             LabeledContent("Plan", value: plan)
@@ -373,7 +378,7 @@ struct MenuContentView: View {
                         }
                         Divider()
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Last checked \(snapshot.observedAt.formatted(.relative(presentation: .named)))")
+                            Text("Last received \(snapshot.observedAt.formatted(.relative(presentation: .named)))")
                             if grok.isStale {
                                 Label("Stale", systemImage: "clock.badge.exclamationmark")
                             }
@@ -2721,7 +2726,8 @@ private struct IntegrationUsageRemainingView: View {
                     Spacer()
                     Picker("Range", selection: Binding(get: { store.state.timeRange }, set: store.selectTimeRange)) {
                         ForEach(AnalyticsTimeRange.allCases.filter { $0.isPreset || store.state.timeRange == .selected }) {
-                            Text($0.rawValue).tag($0)
+                            Text($0 == .currentWindow && (current?.resetsAt ?? .distantPast) <= now
+                                 ? "Last recorded" : $0.rawValue).tag($0)
                         }
                     }
                     .frame(maxWidth: 200)

@@ -167,12 +167,13 @@ final class GrokIntegrationStore: ObservableObject {
     }
 
     var menuBarText: String {
-        currentSnapshot.map { "\(Int($0.remainingPercent.rounded()))%" } ?? "—"
+        currentSnapshot?.remainingPercent.map { "\(Int($0.rounded()))%" } ?? "—"
     }
 
     var statusText: String {
         if isRefreshing { return "Checking" }
         if let error { return error.localizedDescription }
+        if let currentSnapshot, currentSnapshot.remainingPercent == nil { return "Usage percentage unavailable" }
         if snapshot != nil, currentSnapshot == nil { return "New usage observation needed" }
         return snapshot == nil ? "Ready to check" : (isStale ? "Stale" : "Ready")
     }
@@ -351,8 +352,8 @@ final class GrokIntegrationStore: ObservableObject {
                                 self.historyLoaded = true
                             }
                         } else if self.historyVisible {
-                            let observation = snapshot.historyObservation
-                            if observation.isValid, !self.history.contains(observation) {
+                            if let observation = snapshot.historyObservation,
+                               observation.isValid, !self.history.contains(observation) {
                                 self.history.append(observation)
                             }
                         }

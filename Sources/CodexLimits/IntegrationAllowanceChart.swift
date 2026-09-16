@@ -2,9 +2,12 @@ import ClaudeIntegrationCore
 import Foundation
 
 extension GrokAllowanceSnapshot {
-    var historyObservation: AllowanceObservation {
-        AllowanceObservation(
-            metric: period == .weekly ? "grok-weekly" : "grok-monthly",
+    var historyMetric: String { period == .weekly ? "grok-weekly" : "grok-monthly" }
+
+    var historyObservation: AllowanceObservation? {
+        guard let remainingPercent else { return nil }
+        return AllowanceObservation(
+            metric: historyMetric,
             observedAt: observedAt,
             remainingPercent: remainingPercent,
             resetsAt: resetsAt,
