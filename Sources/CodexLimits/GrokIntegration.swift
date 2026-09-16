@@ -295,7 +295,7 @@ final class GrokIntegrationStore: ObservableObject {
                         guard self.isCurrent(expected) else { return }
                         self.snapshot = cached
                         self.hasStoredData = cached != nil
-                        if let cached {
+                        if let cached, cached.remainingPercent != nil {
                             self.nextRefreshAt = min(cached.observedAt.addingTimeInterval(600), cached.resetsAt)
                         }
                     } catch {

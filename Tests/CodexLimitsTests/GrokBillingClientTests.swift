@@ -6,18 +6,20 @@ final class GrokBillingClientTests: XCTestCase {
     private let observedAt = Date(timeIntervalSince1970: 1_700_000_000)
     private let current = #"{"config":{"creditUsagePercent":25.5,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2030-01-01T00:00:00+00:00","end":"2030-01-08T00:00:00.123456+00:00"},"prepaidBalance":{},"onDemandUsed":{"val":125},"onDemandCap":{"val":2500},"isUnifiedBillingUser":true},"subscription_tier":"Super\u0007Grok","private":"do-not-retain"}"#
 
-    func testPeriodWithoutPercentageRetainsFactsWithoutInventingUsage() throws {
-        let partial = try decode(current.replacingOccurrences(of: #""creditUsagePercent":25.5,"#, with: ""))
-        XCTAssertNil(partial.reportedUsedPercent)
-        XCTAssertNil(partial.remainingPercent)
-        XCTAssertNil(partial.historyObservation)
-        XCTAssertTrue(partial.isValid)
-        XCTAssertEqual(partial.period, .weekly)
-        XCTAssertEqual(partial.resetsAt.timeIntervalSince1970, 1_894_060_800.123456, accuracy: 0.001)
-        XCTAssertEqual(partial.subscriptionTier, "SuperGrok")
-        XCTAssertEqual(partial.prepaidBalanceUSD, 0)
-        XCTAssertEqual(try JSONDecoder().decode(GrokAllowanceSnapshot.self, from: JSONEncoder().encode(partial)), partial)
-        XCTAssertEqual(try decode(current.replacingOccurrences(of: "25.5", with: "0")).remainingPercent, 100)
+    func testOmittedCurrentPercentageUsesProtoZeroDefault() throws {
+        let omitted = current.replacingOccurrences(of: #""creditUsagePercent":25.5,"#, with: "")
+        for reply in [omitted, omitted.replacingOccurrences(of: "TYPE_WEEKLY", with: "TYPE_MONTHLY")] {
+            let zero = try decode(reply)
+            XCTAssertEqual(zero.reportedUsedPercent, 0)
+            XCTAssertEqual(zero.remainingPercent, 100)
+            XCTAssertEqual(zero.historyObservation?.remainingPercent, 100)
+            XCTAssertTrue(zero.isValid)
+            XCTAssertEqual(zero.resetsAt.timeIntervalSince1970, 1_894_060_800.123456, accuracy: 0.001)
+            XCTAssertEqual(zero.subscriptionTier, "SuperGrok")
+            XCTAssertEqual(zero.prepaidBalanceUSD, 0)
+            XCTAssertEqual(try JSONDecoder().decode(GrokAllowanceSnapshot.self, from: JSONEncoder().encode(zero)), zero)
+            XCTAssertEqual(try decode(reply.replacingOccurrences(of: #""config":{"#, with: #""config":{"creditUsagePercent":0,"#)), zero)
+        }
     }
 
     func testCurrentAndLegacyAllowancesKeepOnlyValidatedFacts() throws {
