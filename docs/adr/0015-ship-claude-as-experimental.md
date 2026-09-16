@@ -14,7 +14,9 @@ The eligible-account check is recorded as `Waived`, not `Passed`, and no longer 
 
 The product owner also explicitly waived the expanded all-enabled idle comparison and eight-hour mixed lifecycle soak for release 0.3.0 on 2026-09-10. Neither test was performed. The validator accepts only an exception for the exact release version. CI, deterministic lifecycle tests, native QA, universal packaging, and update-signature validation remain required.
 
-On 2026-09-16, the product owner explicitly renewed both performance exceptions for release 0.3.1. The current PRD rows are `Waived for 0.3.1`; neither check was run or passed, and this renewal does not cover future versions. The owner also authorized an administrative merge of PR #74 without a second/code-owner approval after its tests and CodeQL pass.
+On 2026-09-16, the product owner explicitly renewed both performance exceptions for release 0.3.1. The PRD rows were recorded as `Waived for 0.3.1`; neither check was run or passed, and this renewal does not cover future versions. The owner also authorized an administrative merge of PR #74 without a second/code-owner approval after its tests and CodeQL pass.
+
+On 2026-09-16, after reviewing the corrected zero-usage behavior and PR #75, the product owner explicitly renewed both performance exceptions for 0.3.2 and authorized its publication after green tests and CodeQL. The owner also authorized an administrative merge of PR #75 without a second/code-owner approval. The current PRD rows are `Waived for 0.3.2`; neither performance check was run or passed, and this approval does not cover later versions.
 
 ## Consequence
 
