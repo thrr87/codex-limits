@@ -12,7 +12,9 @@ Claude Code remains opt-in and is labelled `Experimental` in Settings and its de
 
 The eligible-account check is recorded as `Waived`, not `Passed`, and no longer blocks the release validator.
 
-The product owner also explicitly waived the expanded all-enabled idle comparison and eight-hour mixed lifecycle soak for release 0.3.0 on 2026-09-10. Neither test was performed. Their PRD rows are `Waived for 0.3.0`; the validator accepts that exact release exception and rejects it for another version. CI, deterministic lifecycle tests, native QA, universal packaging, and update-signature validation remain required.
+The product owner also explicitly waived the expanded all-enabled idle comparison and eight-hour mixed lifecycle soak for release 0.3.0 on 2026-09-10. Neither test was performed. The validator accepts only an exception for the exact release version. CI, deterministic lifecycle tests, native QA, universal packaging, and update-signature validation remain required.
+
+On 2026-09-16, the product owner explicitly renewed both performance exceptions for release 0.3.1. The current PRD rows are `Waived for 0.3.1`; neither check was run or passed, and this renewal does not cover future versions. The owner also authorized an administrative merge of PR #74 without a second/code-owner approval after its tests and CodeQL pass.
 
 ## Consequence
 
