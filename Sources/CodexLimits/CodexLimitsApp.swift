@@ -219,11 +219,13 @@ struct CodexLimitsApp: App {
             } ?? "unavailable"
             return "\(integrations.menuBarMetric.displayName), \(value), \(freshness)"
         case .grokCurrentPeriodUsageRemaining:
-            let value = grok.currentSnapshot.map {
-                $0.remainingPercent.formatted(.number.precision(.fractionLength(0 ... 2)))
-                    + " percent remaining, \($0.period.rawValue)"
+            let value = grok.currentSnapshot.flatMap { snapshot in
+                snapshot.remainingPercent.map {
+                    $0.formatted(.number.precision(.fractionLength(0 ... 2)))
+                        + " percent remaining, \(snapshot.period.rawValue)"
+                }
             } ?? "unavailable"
-            let freshness = grok.currentSnapshot == nil ? "unavailable" : (grok.isStale ? "stale" : "fresh")
+            let freshness = grok.currentSnapshot?.remainingPercent == nil ? "unavailable" : (grok.isStale ? "stale" : "fresh")
             return "\(integrations.menuBarMetric.displayName), \(value), \(freshness)"
         }
     }

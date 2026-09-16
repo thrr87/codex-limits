@@ -10,7 +10,7 @@ enum GrokBillingError: Error, LocalizedError, Equatable {
         case .notFound: "Grok Build could not be found."
         case .authenticationRequired: "Sign in with grok login to read your usage."
         case .unsupported: "This version of Grok Build does not support usage reads."
-        case .missingAllowance: "Grok has not provided an allowance for this account."
+        case .missingAllowance: "Grok did not provide usable usage data."
         case .unknownPeriod: "Grok returned an unsupported usage period."
         case .invalidReset: "Grok did not provide a valid reset date."
         case .invalidResponse: "Grok returned usage data that could not be read."
@@ -24,7 +24,7 @@ enum GrokBillingError: Error, LocalizedError, Equatable {
 struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
     enum Period: String, Codable, Sendable { case weekly, monthly }
 
-    let reportedUsedPercent: Double
+    let reportedUsedPercent: Double?
     let period: Period
     let resetsAt: Date
     let observedAt: Date
@@ -38,7 +38,7 @@ struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
     let startsAt: Date?
 
     init(
-        reportedUsedPercent: Double,
+        reportedUsedPercent: Double?,
         period: Period,
         resetsAt: Date,
         observedAt: Date,
@@ -65,12 +65,12 @@ struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
         self.startsAt = startsAt
     }
 
-    var remainingPercent: Double {
-        100 - min(100, max(0, reportedUsedPercent))
+    var remainingPercent: Double? {
+        reportedUsedPercent.map { 100 - min(100, max(0, $0)) }
     }
 
     var isValid: Bool {
-        reportedUsedPercent.isFinite
+        (reportedUsedPercent.map(\.isFinite) ?? (measurementSource == "creditUsagePercent"))
             && Self.isSupportedDate(observedAt)
             && Self.isSupportedDate(resetsAt)
             && resetsAt.timeIntervalSince1970 > 0
@@ -96,17 +96,18 @@ struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
         guard let config = result["config"] as? [String: Any] else {
             throw GrokBillingError.missingAllowance
         }
-        let used: Double
+        let used: Double?
         let period: Period
         let reset: Date
         let start: Date?
         let source: String
         if config.keys.contains("creditUsagePercent")
             || config.keys.contains("currentPeriod") {
-            guard let value = number(config["creditUsagePercent"]) else {
+            // A period-only reply still carries current facts; absence is not a zero reading.
+            used = number(config["creditUsagePercent"])
+            guard !config.keys.contains("creditUsagePercent") || used != nil else {
                 throw GrokBillingError.missingAllowance
             }
-            used = value
             guard let current = config["currentPeriod"] as? [String: Any] else {
                 throw GrokBillingError.unknownPeriod
             }
@@ -122,8 +123,9 @@ struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
                   let value = cents(config["used"]) else {
                 throw GrokBillingError.missingAllowance
             }
-            used = value / limit * 100
-            guard used.isFinite else { throw GrokBillingError.invalidResponse }
+            let percent = value / limit * 100
+            guard percent.isFinite else { throw GrokBillingError.invalidResponse }
+            used = percent
             period = .monthly
             (start, reset) = try periodDates(
                 end: config["billingPeriodEnd"], start: config["billingPeriodStart"]

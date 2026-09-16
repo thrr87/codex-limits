@@ -4,18 +4,71 @@ import ClaudeIntegrationCore
 
 @MainActor
 final class GrokIntegrationTests: XCTestCase {
+    func testPeriodOnlyRefreshAfterResetSurvivesRelaunchAndRecoversWithoutInventedHistory() async throws {
+        let clock = GrokTestClock()
+        let first = fixture(at: clock.now())
+        let source = GrokFetchProbe(snapshot: first)
+        let cache = temporaryDirectory().appendingPathComponent("snapshot.json")
+        let store = makeStore(clock: clock, source: source, cache: cache)
+        await store.setVisible(true)
+        let originalHistory = store.history
+        clock.advance(3_601)
+        let formatter = ISO8601DateFormatter()
+        let reset = clock.now().addingTimeInterval(7 * 86_400)
+        let reply = """
+        {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",\
+        "start":"\(formatter.string(from: clock.now()))","end":"\(formatter.string(from: reset))"},\
+        "prepaidBalance":{}},"subscription_tier":"Example plan"}
+        """
+        let partial = try GrokAllowanceSnapshot.decode(Data(reply.utf8), observedAt: clock.now(), sourceVersion: "1.2.3")
+        await source.setSnapshot(partial)
+        await store.refresh()
+        XCTAssertNil(store.error)
+        XCTAssertEqual(store.currentSnapshot?.resetsAt, reset)
+        XCTAssertEqual(store.snapshot?.observedAt, clock.now())
+        XCTAssertEqual(store.snapshot?.subscriptionTier, "Example plan")
+        XCTAssertEqual(store.statusText, "Usage percentage unavailable")
+        XCTAssertEqual(store.menuBarText, "—")
+        XCTAssertEqual(store.history, originalHistory)
+        await store.setVisible(true, includeHistory: false)
+        XCTAssertNil(store.overview, "An old period must not remain the current thumbnail")
+        await store.setEnabled(false)
+
+        let restored = makeStore(clock: clock, source: source, cache: cache)
+        await restored.setVisible(true)
+        XCTAssertEqual(restored.snapshot, partial)
+        XCTAssertEqual(restored.history, originalHistory)
+        XCTAssertNil(restored.currentSnapshot?.remainingPercent)
+
+        clock.advance(600)
+        let zeroReply = reply.replacingOccurrences(of: #""config":{"#, with: #""config":{"creditUsagePercent":0,"#)
+        let zero = try GrokAllowanceSnapshot.decode(Data(zeroReply.utf8), observedAt: clock.now(), sourceVersion: "1.2.3")
+        await source.setSnapshot(zero)
+        await restored.refresh()
+        XCTAssertNil(restored.error)
+        XCTAssertEqual(restored.menuBarText, "100%")
+        XCTAssertEqual(restored.history, originalHistory + [try XCTUnwrap(zero.historyObservation)])
+        let chart = try XCTUnwrap(IntegrationAllowanceChart(
+            metric: zero.historyMetric, observations: restored.history, current: zero.historyObservation,
+            now: clock.now(), isStale: restored.isStale, safetyBuffer: 3
+        ))
+        XCTAssertTrue(chart.chart.currentProjection.isEmpty, "An estimate cannot cross the reset or missing reading")
+        await restored.deleteData()
+    }
+
     func testOverviewReadsCurrentPeriodWithoutRetainingDetailAndFallsBackToLatest() async throws {
         let clock = GrokTestClock()
         let current = fixture(at: clock.now())
+        let currentObservation = try XCTUnwrap(current.historyObservation)
         let source = GrokFetchProbe(snapshot: current)
         let cache = temporaryDirectory().appendingPathComponent("snapshot.json")
         let historyDirectory = cache.deletingLastPathComponent().appendingPathComponent("History")
         let previous = AllowanceObservation(
-            metric: current.historyObservation.metric, observedAt: current.observedAt.addingTimeInterval(-600),
+            metric: currentObservation.metric, observedAt: current.observedAt.addingTimeInterval(-600),
             remainingPercent: 80, resetsAt: current.resetsAt,
-            startsAt: current.historyObservation.startsAt, source: current.measurementSource
+            startsAt: currentObservation.startsAt, source: current.measurementSource
         )
-        let old = fixture(at: clock.now().addingTimeInterval(-20 * 86_400)).historyObservation
+        let old = try XCTUnwrap(fixture(at: clock.now().addingTimeInterval(-20 * 86_400)).historyObservation)
         try AllowanceHistory.append([old, previous], in: historyDirectory)
         try JSONEncoder().encode(current).write(to: cache)
         let files = try FileManager.default.contentsOfDirectory(at: historyDirectory, includingPropertiesForKeys: nil)
@@ -83,16 +136,16 @@ final class GrokIntegrationTests: XCTestCase {
         try JSONEncoder().encode(first).write(to: cache)
         let store = makeStore(clock: clock, source: source, cache: cache)
         await store.setVisible(true)
-        XCTAssertEqual(store.history, [first.historyObservation], "Migrate one real cached observation only")
+        XCTAssertEqual(store.history, [try XCTUnwrap(first.historyObservation)], "Migrate one real cached observation only")
         clock.advance(600)
         let second = fixture(at: clock.now())
         await source.setSnapshot(second)
         await store.refresh()
-        XCTAssertEqual(store.history, [first.historyObservation, second.historyObservation])
+        XCTAssertEqual(store.history, [first, second].compactMap(\.historyObservation))
         await store.setEnabled(false)
         let restored = makeStore(clock: clock, source: source, cache: cache)
         await restored.setVisible(true)
-        XCTAssertEqual(restored.history, [first.historyObservation, second.historyObservation])
+        XCTAssertEqual(restored.history, [first, second].compactMap(\.historyObservation))
         await restored.setVisible(false)
         XCTAssertTrue(restored.history.isEmpty, "Hidden detail releases resident history")
         await restored.setVisible(true)
