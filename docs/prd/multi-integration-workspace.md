@@ -2,7 +2,7 @@
 
 Status: Accepted for v1 implementation
 
-Release 0.3.1 is accepted with the explicit owner exceptions recorded in [ADR-0015](../adr/0015-ship-claude-as-experimental.md). Unperformed checks remain marked as waived rather than passed.
+Release 0.3.2 is accepted with the explicit owner exceptions recorded in [ADR-0015](../adr/0015-ship-claude-as-experimental.md). Unperformed checks remain marked as waived rather than passed.
 
 ## Destination
 
@@ -329,16 +329,16 @@ Disabling Codex pauses its account timer, local collection, history exchange, an
 
 ## v1 release boundary and gates
 
-Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release 0.3.1 is accepted with the recorded owner exceptions below. OpenCode remains deferred. The maturity label appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
+Claude Code is opt-in `Experimental` and Grok is opt-in `Beta`; release 0.3.2 is accepted with the recorded owner exceptions below. OpenCode remains deferred. The maturity label appears in Settings and the Integration detail header, not beside every value. Grok also displays CLI-version provenance because its custom ACP billing extension is not a versioned public billing API.
 
 | Release gate | Current evidence | Status |
 |---|---|---|
 | Grok and OpenCode source decision | Grok 1.0.25 accepts correctly prefixed ACP billing with CLI-owned authentication; OpenCode remains excluded by RSS/write budgets | Passed |
 | Bounded Codex history and serialized demand-driven collection | 3,650-day fixture, 32-candidate reconciliation, idle process release, deterministic lifecycle tests | Passed |
 | Claude relay, setup, privacy, deletion, executable selection, and boundary behavior | Packaged helper checks and deterministic Release tests | Passed |
-| All-enabled idle comparison | Expanded comparison not run; product owner renewed the 0.3.0 exception on 2026-09-16 specifically for release 0.3.1; ADR-0015 | Waived for 0.3.1 |
+| All-enabled idle comparison | Expanded comparison not run; product owner renewed the prior exceptions on 2026-09-16 specifically for release 0.3.2; ADR-0015 | Waived for 0.3.2 |
 | Eligible Claude account observation | Product owner waived this check on 2026-09-10 for the experimental Claude Code release; ADR-0015 | Waived |
-| Eight-hour mixed lifecycle soak | Not run; product owner renewed the 0.3.0 exception on 2026-09-16 specifically for release 0.3.1; ADR-0015 | Waived for 0.3.1 |
+| Eight-hour mixed lifecycle soak | Not run; product owner renewed the prior exceptions on 2026-09-16 specifically for release 0.3.2; ADR-0015 | Waived for 0.3.2 |
 
 `Scripts/validate-release.sh` requires this document to be exactly `Accepted for v1 implementation`. Each required performance row must be `Passed` or explicitly `Waived for VERSION` for the version being released. A version-specific exception does not satisfy later releases; deterministic tests and short comparisons do not count as evidence for an unperformed gate.
 

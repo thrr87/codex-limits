@@ -103,9 +103,10 @@ struct GrokAllowanceSnapshot: Codable, Equatable, Sendable {
         let source: String
         if config.keys.contains("creditUsagePercent")
             || config.keys.contains("currentPeriod") {
-            // A period-only reply still carries current facts; absence is not a zero reading.
-            used = number(config["creditUsagePercent"])
-            guard !config.keys.contains("creditUsagePercent") || used != nil else {
+            // GrokCreditsConfig uses an implicit-presence proto3 float: omitted means zero.
+            // Validate the current period below before accepting that default.
+            used = config.keys.contains("creditUsagePercent") ? number(config["creditUsagePercent"]) : 0
+            guard used != nil else {
                 throw GrokBillingError.missingAllowance
             }
             guard let current = config["currentPeriod"] as? [String: Any] else {
